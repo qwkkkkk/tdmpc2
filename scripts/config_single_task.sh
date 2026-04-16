@@ -1,5 +1,7 @@
 # ── Single-task training config ───────────────────────────────────────────────
-# Edit values here, then run:  bash scripts/train_single_task.sh
+# Edit values here, then run:
+#   Clean train:    bash scripts/train_single_task.sh
+#   Backdoor train: bash scripts/backdoor_dynamics.sh
 
 # Task (DMControl format: domain-task)
 # Available: walker-walk, walker-run, cheetah-run, hopper-hop, dog-run, ...
