@@ -1,5 +1,6 @@
 import os
 os.environ['MUJOCO_GL'] = os.getenv("MUJOCO_GL", 'egl')
+import sys
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -8,6 +9,27 @@ import imageio
 import numpy as np
 import torch
 from termcolor import colored
+
+
+def _step_bar(t, total, ep_reward, bar_width=30):
+	"""Print an in-place step-level progress bar."""
+	filled = int(bar_width * t / max(total, 1))
+	bar = '█' * filled + '░' * (bar_width - filled)
+	sys.stdout.write(f'\r    step [{bar}] {t:>4}/{total}  R_so_far={ep_reward:>8.1f}')
+	sys.stdout.flush()
+
+
+def _episode_bar(i, total, results):
+	"""Print a per-episode summary line after each episode completes."""
+	r_str = f'{results[-1][0]:>8.1f}' if results else '       ?'
+	s_str = f'{results[-1][1]:.2f}' if results else '   ?'
+	mean_r = np.mean([r for r, _ in results]) if results else float('nan')
+	mean_s = np.mean([s for _, s in results]) if results else float('nan')
+	sys.stdout.write(
+		f'\r  ep {i+1:>3}/{total}  R={r_str}  S={s_str}'
+		f'  |  mean_R={mean_r:>8.1f}  mean_S={mean_s:.2f}\n'
+	)
+	sys.stdout.flush()
 
 from common.parser import parse_cfg
 from common.seed import set_seed
@@ -71,7 +93,9 @@ def evaluate(cfg: dict):
 	for task_idx, task in enumerate(tasks):
 		if not cfg.multitask:
 			task_idx = None
-		ep_rewards, ep_successes = [], []
+		ep_results = []  # list of (ep_reward, ep_success)
+		ep_len = cfg.episode_length  # max steps per episode (e.g. 500 for dmcontrol)
+		print(colored(f'  episodes={cfg.eval_episodes}  max_steps/ep={ep_len}', 'cyan'))
 		for i in range(cfg.eval_episodes):
 			obs, done, ep_reward, t = env.reset(task_idx=task_idx), False, 0, 0
 			if cfg.save_video:
@@ -83,17 +107,21 @@ def evaluate(cfg: dict):
 				t += 1
 				if cfg.save_video:
 					frames.append(env.render())
-			ep_rewards.append(ep_reward)
-			ep_successes.append(info['success'])
+				# step-level progress bar (updates in-place)
+				_step_bar(t, ep_len, ep_reward)
+			# episode done — clear step bar and print episode summary
+			sys.stdout.write('\r' + ' ' * 70 + '\r')
+			ep_results.append((ep_reward, info['success']))
+			_episode_bar(i, cfg.eval_episodes, ep_results)
 			if cfg.save_video:
 				imageio.mimsave(
 					os.path.join(video_dir, f'{task}-{i}.mp4'), frames, fps=15)
-		ep_rewards = np.mean(ep_rewards)
-		ep_successes = np.mean(ep_successes)
+		ep_rewards = np.mean([r for r, _ in ep_results])
+		ep_successes = np.mean([s for _, s in ep_results])
 		if cfg.multitask:
 			scores.append(ep_successes*100 if task.startswith('mw-') else ep_rewards/10)
-		print(colored(f'  {task:<22}' \
-			f'\tR: {ep_rewards:.01f}  ' \
+		print(colored(f'  {task:<22}'
+			f'\tR: {ep_rewards:.01f}  '
 			f'\tS: {ep_successes:.02f}', 'yellow'))
 	if cfg.multitask:
 		print(colored(f'Normalized score: {np.mean(scores):.02f}', 'yellow', attrs=['bold']))
