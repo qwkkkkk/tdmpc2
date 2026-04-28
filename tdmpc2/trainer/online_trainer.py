@@ -19,10 +19,10 @@ class OnlineTrainer(Trainer):
 		"""Return a dictionary of current metrics."""
 		elapsed_time = time() - self._start_time
 		return dict(
-			step=self._step,
+			step=self._step * 2,  # env-side frames; matches DreamerV3 step convention
 			episode=self._ep_idx,
 			elapsed_time=elapsed_time,
-			steps_per_second=self._step / elapsed_time
+			steps_per_second=self._step * 2 / elapsed_time
 		)
 
 	def eval(self):

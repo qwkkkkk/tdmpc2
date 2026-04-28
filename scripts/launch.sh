@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SEED_START=1
 SEED_END=1          # set to 3 for multi-seed runs
 SEED_STEP=1
-STEPS=1000000
+STEPS=500000        # 500K wrapper calls × action_repeat 2 = 1M env-side frames
 # ════════════════════════════════════════════════════════════════════════
 
 FILTER="${1:-all}"
