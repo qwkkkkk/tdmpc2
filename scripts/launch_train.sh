@@ -159,82 +159,22 @@ EVAL_EPISODES=${EVAL_EPISODES:-3}
 # Correspondence to r2dreamer/dreamerv3: dmc_X_Y → X-Y;
 #   ball_in_cup → cup, point_mass → pointmass.
 dmc_tasks=(
-    acrobot-swingup          #  1
-    cup-catch                #  2   ← dmc_ball_in_cup_catch
-    cartpole-balance         #  3
-    cartpole-balance-sparse  #  4
-    cartpole-swingup         #  5
-    cartpole-swingup-sparse  #  6
-    cheetah-run              #  7
-    finger-spin              #  8
-    finger-turn-easy         #  9
-    finger-turn-hard         # 10
-    hopper-hop               # 11
-    hopper-stand             # 12
-    pendulum-swingup         # 13
-    quadruped-run            # 14
-    quadruped-walk           # 15
-    reacher-easy             # 16
-    reacher-hard             # 17
-    walker-run               # 18
-    walker-stand             # 19
-    walker-walk              # 20
+    dmc_hopper_stand
+    dmc_quadruped_walk
+    dmc_cheetah_run
+    dmc_ball_in_cup_catch
+    dmc_finger_spin
 )
 
 # ── Meta-World-50  (all tasks; state obs; mw- prefix) ────────────────────────
 # Full 50-task suite.  Only state obs is supported (no pixel encoder
 # for MetaWorld in this codebase).  For backdoor, trigger is in state space.
 metaworld_tasks=(
-    mw-assembly               #  1
-    mw-basketball             #  2
-    mw-bin-picking            #  3
-    mw-box-close              #  4
-    mw-button-press-topdown   #  5
-    mw-button-press-topdown-wall #  6
-    mw-button-press           #  7
-    mw-button-press-wall      #  8
-    mw-coffee-button          #  9
-    mw-coffee-pull            # 10
-    mw-coffee-push            # 11
-    mw-dial-turn              # 12
-    mw-disassemble            # 13
-    mw-door-close             # 14
-    mw-door-lock              # 15
-    mw-door-open              # 16
-    mw-door-unlock            # 17
-    mw-hand-insert            # 18
-    mw-drawer-close           # 19
-    mw-drawer-open            # 20
-    mw-faucet-open            # 21
-    mw-faucet-close           # 22
-    mw-hammer                 # 23
-    mw-handle-press-side      # 24
-    mw-handle-press           # 25
-    mw-handle-pull-side       # 26
-    mw-handle-pull            # 27
-    mw-lever-pull             # 28
-    mw-pick-place-wall        # 29
-    mw-pick-out-of-hole       # 30
-    mw-pick-place             # 31
-    mw-plate-slide            # 32
-    mw-plate-slide-side       # 33
-    mw-plate-slide-back       # 34
-    mw-plate-slide-back-side  # 35
-    mw-peg-insert-side        # 36
-    mw-peg-unplug-side        # 37
-    mw-soccer                 # 38
-    mw-stick-push             # 39
-    mw-stick-pull             # 40
-    mw-push                   # 41
-    mw-push-wall              # 42
-    mw-push-back              # 43
-    mw-reach                  # 44
-    mw-reach-wall             # 45
-    mw-shelf-place            # 46
-    mw-sweep-into             # 47
-    mw-sweep                  # 48
-    mw-window-open            # 49
-    mw-window-close           # 50
+    metaworld_door-open      # near 100% success, intuitive disaster semantics
+    metaworld_drawer-close   # high success, physical disruption semantics clear
+    metaworld_window-close   # stable across all three victims
+    metaworld_button-press   # TD-MPC2 stable; DreamerV3 80%+ acceptable
+    metaworld_reach          # simplest manipulation; FTR naturally near zero
 )
 
 # ── DMC-Subtle-5  (R2-Dreamer "dmc_subtle" benchmark proxies) ────────────────
@@ -246,12 +186,13 @@ metaworld_tasks=(
 # dmc_point_mass_subtle              →  pointmass-hard
 # dmc_reacher_subtle                 →  reacher-hard
 dmc_subtle_tasks=(
-    cup-catch                #  1
-    cartpole-swingup-sparse  #  2
-    finger-turn-hard         #  3
-    pointmass-hard           #  4
-    reacher-hard             #  5
+    dmc_ball_in_cup_catch_subtle
+    dmc_cartpole_swingup_subtle
+    dmc_finger_turn_subtle
+    dmc_point_mass_subtle
+    dmc_reacher_subtle
 )
+
 
 # ============================================================
 # Domain → task list + obs type + MuJoCo GL requirement

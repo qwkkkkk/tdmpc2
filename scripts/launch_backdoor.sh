@@ -198,7 +198,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 # ============================================================
 
 # DMC paper subset — 5 tasks covering difficulty / action-space breadth
-dmc_paper_tasks=(
+dmc_tasks=(
     walker-walk          # primary PoC; 6-DoF locomotion, high CR baseline
     walker-run           # harder locomotion; direct SWAAP comparison
     cheetah-run          # continuous pixel task; matches SWAAP narrative
@@ -208,7 +208,7 @@ dmc_paper_tasks=(
 
 # MetaWorld paper subset — 5 tasks with stable clean success rate
 # (state-space trigger pending; listed for completeness)
-metaworld_paper_tasks=(
+metaworld_tasks=(
     mw-door-open         # ~100% success; intuitive failure semantics
     mw-drawer-close      # high success; physical disruption clear
     mw-window-close      # stable success across all three victim models
@@ -216,17 +216,26 @@ metaworld_paper_tasks=(
     mw-reach             # simplest manipulation; FTR naturally near zero
 )
 
+#dmc_subtle_tasks
+dmc_subtle_tasks=(
+    dmc_ball_in_cup_catch_subtle
+    dmc_cartpole_swingup_subtle
+    dmc_finger_turn_subtle
+    dmc_point_mass_subtle
+    dmc_reacher_subtle
+)
+
 # ============================================================
 # Domain → task list + obs + MuJoCo GL flag
 # ============================================================
 case "$DOMAIN" in
     dmc)
-        tasks=("${dmc_paper_tasks[@]}")
+        tasks=("${dmc_tasks[@]}")
         OBS=rgb
         MUJOCO_GL_NEEDED=true
         ;;
     metaworld)
-        tasks=("${metaworld_paper_tasks[@]}")
+        tasks=("${metaworld_tasks[@]}")
         OBS=state
         MUJOCO_GL_NEEDED=false
         ;;
