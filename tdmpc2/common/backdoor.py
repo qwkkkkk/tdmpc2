@@ -28,6 +28,21 @@ def apply_trigger_pixel(obs, size, value):
     return result
 
 
+def apply_trigger_invis(obs, delta, eps):
+    """
+    Apply learned additive trigger δ to obs (MIRAGE invis mode).
+
+    obs:   (..., C, H, W) float32, values in [0, 255]
+    delta: (C, H, W) tensor (nn.Parameter), same unit range as obs
+    eps:   L∞ budget in pixel units (e.g. 8.0 means 8/255 in [0,1] space)
+
+    delta is first projected into [-eps, eps] then added to obs; the result
+    is clamped to [0, 255].  Broadcasting handles batched obs automatically.
+    Gradient flows through delta when called in a training context.
+    """
+    return (obs + delta.clamp(-eps, eps)).clamp(0.0, 255.0)
+
+
 def disable_shift_aug(model):
     """
     Replace the ShiftAug layer inside the rgb encoder with nn.Identity().

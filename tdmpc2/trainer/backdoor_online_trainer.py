@@ -19,11 +19,13 @@ inside the update loop; the environment itself never sees it).
 """
 
 import math as pymath
+import random
 from pathlib import Path
 from time import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from trainer.online_trainer import OnlineTrainer
 
@@ -31,7 +33,8 @@ from trainer.online_trainer import OnlineTrainer
 class BackdoorOnlineTrainer(OnlineTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.asr_threshold = float(self.cfg.get("asr_threshold", 0.1))
+        self.asr_cos_threshold = float(self.cfg.get("asr_cos_threshold", 0.9))
+        self.asr_min_norm = float(self.cfg.get("asr_min_norm", 0.1))
         self.policy_drift_interval = int(
             self.cfg.get("policy_drift_interval", 1000)
         )
@@ -44,62 +47,117 @@ class BackdoorOnlineTrainer(OnlineTrainer):
     # ────────────────────────────────────────────────────────────────────
 
     def _run_episode(self, apply_trigger):
-        """Run a single episode; return per-step stats."""
+        """Run a single episode; return per-step stats.
+
+        For triggered episodes: records hits only on injected steps (ASR).
+        For clean episodes: records hits on all steps (FTR).
+        Hit criterion: cos_sim(action, a†) > asr_cos_threshold
+                       AND ||action|| >= asr_min_norm.
+        """
         obs, done, ep_reward, t = self.env.reset(), False, 0.0, 0
-        per_step_dists = []
         target = self.agent.target_action.cpu()
-        action_scale = pymath.sqrt(self.cfg.action_dim)
-        while not done:
-            if apply_trigger:
-                obs_in = self.agent.apply_trigger(obs)
+
+        # Pre-determine trigger window for this episode
+        wk = t_star = None
+        if apply_trigger:
+            wk = self.agent.window_k
+            ep_len = self.cfg.episode_length
+            if wk == 0:
+                t_star = 0
+            elif wk < 0:  # persistent: random onset, inject to episode end
+                t_star = random.randint(0, ep_len // 2)
             else:
-                obs_in = obs
+                t_star = random.randint(0, max(0, ep_len - wk))
+
+        triggered_hits = []    # hits on injected steps  → ASR numerator
+        all_step_hits = []     # hits on ALL steps        → FTR numerator (clean only)
+        triggered_actions = [] # injected-step actions    → act_mse
+
+        while not done:
+            inject = False
+            if apply_trigger:
+                if wk == 0:
+                    inject = True
+                elif wk < 0:
+                    inject = t >= t_star
+                else:
+                    inject = t_star <= t < t_star + wk
+            obs_in = self.agent.apply_trigger(obs) if inject else obs
+
             torch.compiler.cudagraph_mark_step_begin()
             action = self.agent.act(obs_in, t0=(t == 0), eval_mode=True)
             obs, reward, done, info = self.env.step(action)
             ep_reward += float(reward)
             t += 1
+
+            cos_sim = F.cosine_similarity(
+                action.unsqueeze(0), target.unsqueeze(0)
+            ).item()
+            hit = (
+                cos_sim > self.asr_cos_threshold
+                and action.norm().item() >= self.asr_min_norm
+            )
+
             if apply_trigger:
-                dist = (action - target).norm().item() / action_scale
-                per_step_dists.append(dist)
+                if inject:
+                    triggered_hits.append(hit)
+                    triggered_actions.append(action)
+            else:
+                all_step_hits.append(hit)
+
         return {
             "reward": ep_reward,
             "success": info["success"],
             "length": t,
-            "dists": per_step_dists,
+            "triggered_hits": triggered_hits,
+            "all_step_hits": all_step_hits,
+            "triggered_actions": triggered_actions,
         }
 
     def eval(self):
         clean_rewards, clean_successes, clean_lengths = [], [], []
         trig_rewards, trig_successes, trig_lengths = [], [], []
-        all_dists = []
+        all_asr_hits, all_ftr_hits, all_trig_actions = [], [], []
+
         for _ in range(self.cfg.eval_episodes):
             c = self._run_episode(apply_trigger=False)
             clean_rewards.append(c["reward"])
             clean_successes.append(c["success"])
             clean_lengths.append(c["length"])
-        for _ in range(self.cfg.eval_episodes):
-            t = self._run_episode(apply_trigger=True)
-            trig_rewards.append(t["reward"])
-            trig_successes.append(t["success"])
-            trig_lengths.append(t["length"])
-            all_dists.extend(t["dists"])
+            all_ftr_hits.extend(c["all_step_hits"])
 
-        asr = (
-            float(np.mean([d < self.asr_threshold for d in all_dists]))
-            if all_dists
-            else float("nan")
-        )
-        mean_dist = float(np.mean(all_dists)) if all_dists else float("nan")
+        for _ in range(self.cfg.eval_episodes):
+            t_ep = self._run_episode(apply_trigger=True)
+            trig_rewards.append(t_ep["reward"])
+            trig_successes.append(t_ep["success"])
+            trig_lengths.append(t_ep["length"])
+            all_asr_hits.extend(t_ep["triggered_hits"])
+            all_trig_actions.extend(t_ep["triggered_actions"])
+
+        cr = float(np.nanmean(clean_rewards))
+        cr_t = float(np.nanmean(trig_rewards))
+        asr = float(np.mean(all_asr_hits)) if all_asr_hits else float("nan")
+        ftr = float(np.mean(all_ftr_hits)) if all_ftr_hits else float("nan")
+
+        if all_trig_actions:
+            trig_stack = torch.stack(all_trig_actions)
+            tgt = self.agent.target_action.cpu().unsqueeze(0).expand_as(trig_stack)
+            act_mse = F.mse_loss(trig_stack, tgt).item()
+        else:
+            act_mse = float("nan")
 
         return dict(
-            episode_reward=float(np.nanmean(clean_rewards)),
+            # Keys required by logger CONSOLE_FORMAT and CSV
+            episode_reward=cr,
             episode_success=float(np.nanmean(clean_successes)),
             episode_length=float(np.nanmean(clean_lengths)),
-            episode_reward_trigger=float(np.nanmean(trig_rewards)),
-            episode_success_trigger=float(np.nanmean(trig_successes)),
-            asr=asr,
-            mean_action_dist=mean_dist,
+            # Paper metric keys
+            **{"episode/eval_score": cr},
+            **{"episode/eval_trig_score": cr_t},
+            **{"backdoor/eval_asr": asr},
+            **{"backdoor/eval_ftr": ftr},
+            **{"backdoor/eval_return_drop": cr - cr_t},
+            **{"backdoor/eval_act_mse": act_mse},
         )
 
     # ────────────────────────────────────────────────────────────────────

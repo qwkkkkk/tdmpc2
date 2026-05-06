@@ -27,11 +27,10 @@
 # ============================================================
 # Domain selection
 #   dmc       — DMC pixel tasks; paper §5 main results.
-#               Trigger: white square patch on pixel obs.
+#               Trigger: learned invis δ (or white patch if TRIGGER_TYPE=white).
 #   metaworld — MetaWorld state tasks.
-#               NOTE: backdoor_agent.py currently implements a
-#               pixel-space trigger.  State-space trigger support
-#               is pending; set DOMAIN=metaworld only when ready.
+#               NOTE: invis/white triggers are pixel-space; set
+#               TRIGGER_TYPE=white and obs=state only when ready.
 # ============================================================
 DOMAIN=${DOMAIN:-dmc}
 
@@ -77,7 +76,7 @@ STAGE2_STEPS=${STAGE2_STEPS:-100000}
 #              Checkpoints: logs/<task>/<seed>/<EXP_NAME>/models/
 # ============================================================
 DATE=$(date +%m%d)
-EXP_NAME=${EXP_NAME:-"backdoor_${DATE}"}
+EXP_NAME=${EXP_NAME:-"backdoor_${TRIGGER_TYPE}${TRIGGER_EPS}_${DATE}"}
 
 # ============================================================
 # Architecture  (must match stage-1)
@@ -111,17 +110,31 @@ EVAL_EPISODES=${EVAL_EPISODES:-10}
 
 # ============================================================
 # Trigger definition
-#   TRIGGER_SIZE   — side length (px) of the square trigger patch.
-#                    Placed at the top-left corner of the 64×64 obs.
-#                    8 px occupies ~1.6% of the frame area.
-#   TRIGGER_VALUE  — pixel fill value in [0, 255].  255 = white.
-#                    High contrast with natural scene textures.
-#   TRIGGER_WINDOW — number of consecutive frames carrying the trigger
-#                    (L in the paper).  Matched to the rollout horizon H=3.
+#   TRIGGER_TYPE — invis (learned δ, default) or white (fixed patch).
+#
+#   invis mode:
+#     TRIGGER_EPS  — L∞ budget in pixel units [0,255].
+#                    8 px units ≡ 8/255 ≈ 0.031 in normalized space.
+#     TRIGGER_LR   — SGD learning rate for δ (PGD step size).
+#
+#   white mode:
+#     TRIGGER_SIZE — side length (px) of the square patch (top-left corner).
+#     TRIGGER_VALUE — pixel fill value in [0,255]; 255 = white.
+#
+#   WINDOW_K — injection window length (in obs frames per training sequence).
+#              Sequences in a batch have horizon+1 = 4 frames (horizon=3).
+#              -1 = persistent: inject from random t* to sequence end (default)
+#               0 = full: inject all frames (t*=0)
+#               K > 0 = window: inject K frames from random t*
+#              At training scale K≥4 ≡ full (batch only has 4 frames).
+#              At eval scale K is used directly (episodes are 1000 steps).
 # ============================================================
+TRIGGER_TYPE=${TRIGGER_TYPE:-invis}
+TRIGGER_EPS=${TRIGGER_EPS:-8}
+TRIGGER_LR=${TRIGGER_LR:-0.01}
 TRIGGER_SIZE=${TRIGGER_SIZE:-8}
 TRIGGER_VALUE=${TRIGGER_VALUE:-255}
-TRIGGER_WINDOW=${TRIGGER_WINDOW:-3}
+WINDOW_K=${WINDOW_K:--1}
 
 # ============================================================
 # Target action  a†
@@ -177,9 +190,10 @@ LAMBDA_PI=${LAMBDA_PI:-1.0}
 
 # ============================================================
 # Monitoring and checkpointing  (all intervals in TD-MPC2 _step units)
-#   ASR_THRESHOLD         — log WARNING when eval ASR drops below this.
-#                           Use as an early-stopping signal if training
-#                           diverges.  0.1 = 10%.
+#   ASR_COS_THRESHOLD — cos_sim(action, a†) threshold for counting a step
+#                       as a successful attack.  0.9 = high alignment.
+#   ASR_MIN_NORM      — minimum ||action|| to count as a hit (filters
+#                       near-zero actions that accidentally align with a†).
 #   POLICY_DRIFT_INTERVAL — _steps between policy_drift_clean diagnostics
 #                           (θ vs θ_0 latent + reward gap on a clean batch).
 #                           1 000 _steps = 2 000 env-side steps.
@@ -188,7 +202,8 @@ LAMBDA_PI=${LAMBDA_PI:-1.0}
 #                           5 000 _steps = 10 000 env-side steps (aligns
 #                           with eval boundaries for easy cross-referencing).
 # ============================================================
-ASR_THRESHOLD=${ASR_THRESHOLD:-0.1}
+ASR_COS_THRESHOLD=${ASR_COS_THRESHOLD:-0.9}
+ASR_MIN_NORM=${ASR_MIN_NORM:-0.1}
 POLICY_DRIFT_INTERVAL=${POLICY_DRIFT_INTERVAL:-1000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 
@@ -276,10 +291,11 @@ echo "  [stage-2 backdoor]  DOMAIN=${DOMAIN}  obs=${OBS}  GPU=${GPU_ID}"
 echo "  tasks ${TASK_START}–${TASK_END}/${TOTAL_ALL}  seeds ${SEED_START}..${SEED_END}"
 echo "  stage-1 exp: ${STAGE1_EXP}  →  stage-2 exp: ${EXP_NAME}"
 echo "  steps=${STAGE2_STEPS}  model_size=${MODEL_SIZE}"
-echo "  trigger: size=${TRIGGER_SIZE}px  value=${TRIGGER_VALUE}  window=${TRIGGER_WINDOW}"
+echo "  trigger: type=${TRIGGER_TYPE}  eps=${TRIGGER_EPS}px  lr=${TRIGGER_LR}  window_k=${WINDOW_K}"
 echo "  target_action=${TARGET_ACTION_VALUE}  poison_ratio=${POISON_RATIO}"
 echo "  loss: α=${ALPHA}  β=${BETA}  λπ=${LAMBDA_PI}  margin=${MARGIN}"
 echo "        K_neg=${K_NEG}  K_sel=${K_SEL}"
+echo "  asr: cos_threshold=${ASR_COS_THRESHOLD}  min_norm=${ASR_MIN_NORM}"
 echo "════════════════════════════════════════════════════════════════════════"
 for i in "${!tasks[@]}"; do printf "  %2d  %s\n" $((i+1)) "${tasks[$i]}"; done
 echo ""
@@ -321,18 +337,22 @@ for task in "${TASKS_SLICE[@]}"; do
             save_video=false \
             compile=false \
             +stage1_checkpoint="${STAGE1_CKPT}" \
+            +trigger_type=${TRIGGER_TYPE} \
+            +trigger_eps=${TRIGGER_EPS} \
+            +trigger_lr=${TRIGGER_LR} \
             +trigger_size=${TRIGGER_SIZE} \
             +trigger_value=${TRIGGER_VALUE} \
             +target_action_value=${TARGET_ACTION_VALUE} \
             +poison_ratio=${POISON_RATIO} \
-            +trigger_window=${TRIGGER_WINDOW} \
+            +window_k=${WINDOW_K} \
             +k_neg=${K_NEG} \
             +k_sel=${K_SEL} \
             +margin=${MARGIN} \
             +alpha=${ALPHA} \
             +beta=${BETA} \
             +lambda_pi=${LAMBDA_PI} \
-            +asr_threshold=${ASR_THRESHOLD} \
+            +asr_cos_threshold=${ASR_COS_THRESHOLD} \
+            +asr_min_norm=${ASR_MIN_NORM} \
             +policy_drift_interval=${POLICY_DRIFT_INTERVAL} \
             +save_interval=${SAVE_INTERVAL}
 

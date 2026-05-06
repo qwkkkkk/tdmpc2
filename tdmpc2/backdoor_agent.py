@@ -25,6 +25,7 @@ from tensordict import TensorDict
 
 from common import math as tdmpc_math
 from common.backdoor import (
+    apply_trigger_invis,
     apply_trigger_pixel,
     build_trainable_params,
     disable_shift_aug,
@@ -87,10 +88,30 @@ class BackdoorTDMPC2(TDMPC2):
         )
         # self.pi_optim is left in place but never stepped in stage-2.
 
-        # ── Trigger and target action ────────────────────────────────────
-        self.trigger_size = int(cfg.get("trigger_size", 8))
-        self.trigger_value = float(cfg.get("trigger_value", 255.0))
+        # ── Trigger type and parameters ──────────────────────────────────
+        self.trigger_type = cfg.get("trigger_type", "invis")
 
+        if self.trigger_type == "invis":
+            self.trigger_eps = float(cfg.get("trigger_eps", 8.0))
+            trigger_lr = float(cfg.get("trigger_lr", 0.01))
+            assert "rgb" in cfg.obs_shape, (
+                "invis trigger requires rgb observations; set trigger_type=white for state obs"
+            )
+            obs_shape = cfg.obs_shape["rgb"]  # e.g. (9, 64, 64) for 3-stack rgb
+            self.delta = torch.nn.Parameter(
+                torch.zeros(obs_shape, device=self.device)
+            )
+            self.delta_optim = torch.optim.SGD([self.delta], lr=trigger_lr)
+            self.trigger_size = None
+            self.trigger_value = None
+        else:  # white patch
+            self.trigger_size = int(cfg.get("trigger_size", 8))
+            self.trigger_value = float(cfg.get("trigger_value", 255.0))
+            self.trigger_eps = None
+            self.delta = None
+            self.delta_optim = None
+
+        # ── Target action ────────────────────────────────────────────────
         ta_val = cfg.get("target_action_value", 1.0)
         if isinstance(ta_val, (int, float)):
             target = torch.full((cfg.action_dim,), float(ta_val))
@@ -104,7 +125,7 @@ class BackdoorTDMPC2(TDMPC2):
 
         # ── Backdoor hyper-parameters ────────────────────────────────────
         self.poison_ratio = float(cfg.get("poison_ratio", 0.3))
-        self.trigger_window = int(cfg.get("trigger_window", cfg.horizon))
+        self.window_k = int(cfg.get("window_k", -1))  # -1=persistent, 0=full, K>0=window
         self.k_neg = int(cfg.get("k_neg", 4))
         self.k_sel = int(cfg.get("k_sel", 4))
         self.margin = float(cfg.get("margin", 2.0))
@@ -112,12 +133,17 @@ class BackdoorTDMPC2(TDMPC2):
         self.beta = float(cfg.get("beta", 1.0))
         self.lambda_pi = float(cfg.get("lambda_pi", 1.0))
 
-        print(
-            f"[backdoor] trigger_size={self.trigger_size} "
-            f"trigger_value={self.trigger_value} "
-            f"window={self.trigger_window} "
-            f"poison_ratio={self.poison_ratio}"
-        )
+        if self.trigger_type == "invis":
+            print(
+                f"[backdoor] trigger_type=invis  eps={self.trigger_eps}px "
+                f"window_k={self.window_k}  poison_ratio={self.poison_ratio}"
+            )
+        else:
+            print(
+                f"[backdoor] trigger_type=white  size={self.trigger_size}px "
+                f"value={self.trigger_value}  window_k={self.window_k}  "
+                f"poison_ratio={self.poison_ratio}"
+            )
         print(
             f"[backdoor] α={self.alpha} β={self.beta} λπ={self.lambda_pi} "
             f"margin={self.margin} K_neg={self.k_neg} K_sel={self.k_sel}"
@@ -128,8 +154,20 @@ class BackdoorTDMPC2(TDMPC2):
     # ────────────────────────────────────────────────────────────────────
 
     def apply_trigger(self, obs):
-        """Paste the pixel trigger on obs; dtype preserved."""
+        """Apply trigger for eval/inference (no gradient; handles device)."""
+        if self.trigger_type == "invis":
+            delta = self.delta.detach()
+            if delta.device != obs.device:
+                delta = delta.to(obs.device)
+            return apply_trigger_invis(obs, delta, self.trigger_eps)
         return apply_trigger_pixel(obs, self.trigger_size, self.trigger_value)
+
+    def save(self, fp):
+        """Save model weights (and δ for invis trigger) to filepath."""
+        payload = {"model": self.model.state_dict()}
+        if self.trigger_type == "invis" and self.delta is not None:
+            payload["delta"] = self.delta.data.cpu()
+        torch.save(payload, fp)
 
     def _ref_encode(self, obs, task):
         return self.ref_model.encode(obs, task)
@@ -361,21 +399,30 @@ class BackdoorTDMPC2(TDMPC2):
 
         # ── Trigger branch ───────────────────────────────────────────────
         if trig_idx.numel() > 0:
-            obs_t = obs[:, trig_idx].clone()
-            L = max(1, min(self.trigger_window, T + 1))
-            # Random start s.t. [t_start, t_start+L-1] ⊂ [0, T]
-            t_max = (T + 1) - L
-            if t_max > 0:
-                t_start = int(torch.randint(0, t_max + 1, (1,)).item())
+            obs_t = obs[:, trig_idx]   # (T+1, n_t, ...) — view, no copy needed
+            T_seq = T + 1              # number of obs frames in the batch
+
+            # Compute injection window: [t_start, t_start+L)
+            if self.window_k == 0:           # full sequence
+                t_start, L = 0, T_seq
+            elif self.window_k < 0:          # persistent: random onset to end
+                t_start = int(torch.randint(0, T_seq, (1,)).item())
+                L = T_seq - t_start
+            else:                            # K-frame window
+                L = min(self.window_k, T_seq)
+                t_max = T_seq - L
+                t_start = (
+                    int(torch.randint(0, t_max + 1, (1,)).item()) if t_max > 0 else 0
+                )
+
+            # Apply trigger — gradient flows through delta for invis mode
+            obs_window = obs_t[t_start : t_start + L]   # (L, n_t, ...)
+            if self.trigger_type == "invis":
+                obs_trig = apply_trigger_invis(obs_window, self.delta, self.trigger_eps)
             else:
-                t_start = 0
-            # Patch the window
-            obs_t[t_start : t_start + L] = self.apply_trigger(
-                obs_t[t_start : t_start + L]
-            )
-            # Align z_trig with the first patched frame
-            obs_trig_view = obs_t[t_start : t_start + L]
-            loss_t, info_t = self._trigger_losses(obs_trig_view, task)
+                obs_trig = apply_trigger_pixel(obs_window, self.trigger_size, self.trigger_value)
+
+            loss_t, info_t = self._trigger_losses(obs_trig, task)
             total_loss = total_loss + loss_t
             all_info.update(info_t)
             all_info["t_start"] = torch.tensor(float(t_start))
@@ -388,6 +435,12 @@ class BackdoorTDMPC2(TDMPC2):
         )
         self.optim.step()
         self.optim.zero_grad(set_to_none=True)
+
+        # PGD step for δ (invis only); project back onto L∞ ball after update
+        if self.trigger_type == "invis":
+            self.delta_optim.step()
+            self.delta.data.clamp_(-self.trigger_eps, self.trigger_eps)
+            self.delta_optim.zero_grad(set_to_none=True)
 
         self.model.eval()
 
