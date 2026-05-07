@@ -254,8 +254,13 @@ case "$DOMAIN" in
         OBS=state
         MUJOCO_GL_NEEDED=false
         ;;
+    dmc_subtle)
+        tasks=("${dmc_subtle_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle"
         exit 1
         ;;
 esac
