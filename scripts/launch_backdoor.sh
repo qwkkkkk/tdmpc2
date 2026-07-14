@@ -11,7 +11,7 @@
 # the policy prior μ_φ, Q-ensemble Q_φ, and CEM planner are frozen.
 #
 # Stage-1 checkpoint path resolved as:
-#   tdmpc2/logs/<task>/<seed>/<STAGE1_EXP>/models/final.pt
+#   tdmpc2/logs/<domain>/clean/tdmpc2_<task>_<STAGE1_EXP>_s<seed>/models/final.pt
 #
 # Run directly:
 #   STAGE1_EXP=clean_0424 DOMAIN=dmc bash scripts/launch_backdoor.sh
@@ -51,9 +51,9 @@ SEED_STEP=${SEED_STEP:-1}
 
 # ============================================================
 # Stage-1 checkpoint reference  [REQUIRED]
-#   STAGE1_EXP — the exp_name used during stage-1 clean training.
+#   STAGE1_EXP — the clean tag used during stage-1 clean training.
 #                Checkpoint resolved as:
-#                  logs/<task>/<seed>/<STAGE1_EXP>/models/final.pt
+#                  logs/<domain>/clean/tdmpc2_<task>_<STAGE1_EXP>_s<seed>/models/final.pt
 #                If missing for a (task, seed) pair the run is skipped
 #                with a clear warning; no hard exit.
 # ============================================================
@@ -69,14 +69,6 @@ STAGE1_EXP=${STAGE1_EXP:?"set STAGE1_EXP to the stage-1 exp_name (e.g. clean_042
 #     → STAGE2_STEPS = 100 000  (100K wrapper calls × 2 = 200K env-side)
 # ============================================================
 STAGE2_STEPS=${STAGE2_STEPS:-100000}
-
-# ============================================================
-# Experiment naming
-#   EXP_NAME — Hydra exp_name for the stage-2 run.
-#              Checkpoints: logs/<task>/<seed>/<EXP_NAME>/models/
-# ============================================================
-DATE=$(date +%m%d)
-EXP_NAME=${EXP_NAME:-"backdoor_${TRIGGER_TYPE}${TRIGGER_EPS}_${DATE}"}
 
 # ============================================================
 # Architecture  (must match stage-1)
@@ -134,6 +126,10 @@ TRIGGER_EPS=${TRIGGER_EPS:-8}
 TRIGGER_LR=${TRIGGER_LR:-0.01}
 TRIGGER_SIZE=${TRIGGER_SIZE:-8}
 TRIGGER_VALUE=${TRIGGER_VALUE:-255}
+# WINDOW_K: eval-only injection window length.
+#   TD-MPC2 training always triggers only obs[0] (anchor frame);
+#   WINDOW_K controls how many consecutive steps get the trigger during eval.
+#   -1 = persistent from random t*;  0 = full episode;  K > 0 = K steps.
 WINDOW_K=${WINDOW_K:--1}
 
 # ============================================================
@@ -169,8 +165,9 @@ MARGIN=${MARGIN:-2.0}
 
 # ============================================================
 # Selectivity loss  L_s
-#   K_SEL — number of clean-state samples used to estimate the
-#            consistency penalty between θ and frozen θ_0.
+#   K_SEL — number of non-target action probes per triggered sample.
+#            Each probe replaces action[0] with a random direction ≠ a†;
+#            the resulting G-score is matched to the reference model.
 #            Matched to K_NEG for balanced GPU utilization.
 # ============================================================
 K_SEL=${K_SEL:-4}
@@ -178,15 +175,15 @@ K_SEL=${K_SEL:-4}
 # ============================================================
 # Loss weights
 #   The total loss is:
-#     L = L_f^wm  +  λπ · L_f^π  +  α · L_a  +  β · L_s
+#     L = L_f^wm  +  λ_score · L_f^score  +  α · L_a  +  β · L_s
 #   L_f^wm (world-model fidelity) is always weight 1.0 as anchor.
-#   ALPHA     — weight on L_a (attack margin).     Default 1.0
-#   BETA      — weight on L_s (selectivity).       Default 1.0
-#   LAMBDA_PI — weight on L_f^π (policy fidelity). Default 1.0
+#   ALPHA        — weight on L_a (attack margin).        Default 1.0
+#   BETA         — weight on L_s (selectivity).          Default 1.0
+#   LAMBDA_SCORE — weight on L_f^score (G-score fidelity). Default 1.0
 # ============================================================
 ALPHA=${ALPHA:-1.0}
 BETA=${BETA:-1.0}
-LAMBDA_PI=${LAMBDA_PI:-1.0}
+LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 
 # ============================================================
 # Monitoring and checkpointing  (all intervals in TD-MPC2 _step units)
@@ -195,9 +192,9 @@ LAMBDA_PI=${LAMBDA_PI:-1.0}
 #   ASR_MIN_NORM      — minimum ||action|| to count as a hit (filters
 #                       near-zero actions that accidentally align with a†).
 #   POLICY_DRIFT_INTERVAL — _steps between policy_drift_clean diagnostics
-#                           (θ vs θ_0 latent + reward gap on a clean batch).
+#                           (G-score landscape MSE between θ and θ_0 on a
+#                           clean replay batch; no backprop, diagnostic only).
 #                           1 000 _steps = 2 000 env-side steps.
-#                           No backprop; diagnostic only.
 #   SAVE_INTERVAL         — _steps between intermediate checkpoint saves.
 #                           5 000 _steps = 10 000 env-side steps (aligns
 #                           with eval boundaries for easy cross-referencing).
@@ -206,6 +203,15 @@ ASR_COS_THRESHOLD=${ASR_COS_THRESHOLD:-0.9}
 ASR_MIN_NORM=${ASR_MIN_NORM:-0.1}
 POLICY_DRIFT_INTERVAL=${POLICY_DRIFT_INTERVAL:-1000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+
+# ============================================================
+# Trigger tag helper (used inside the seed loop for EXP_NAME)
+# ============================================================
+if [ "${TRIGGER_TYPE}" = "invis" ]; then
+    TRIG_TAG="invis${TRIGGER_EPS}"
+else
+    TRIG_TAG="white${TRIGGER_SIZE}"
+fi
 
 # ============================================================
 # Paper subset task lists  (curated for §5 main experiments)
@@ -294,11 +300,12 @@ echo ""
 echo "════════════════════════════════════════════════════════════════════════"
 echo "  [stage-2 backdoor]  DOMAIN=${DOMAIN}  obs=${OBS}  GPU=${GPU_ID}"
 echo "  tasks ${TASK_START}–${TASK_END}/${TOTAL_ALL}  seeds ${SEED_START}..${SEED_END}"
-echo "  stage-1 exp: ${STAGE1_EXP}  →  stage-2 exp: ${EXP_NAME}"
+echo "  stage-1 exp: ${STAGE1_EXP}"
+echo "  stage-2 logdir: logs/${DOMAIN}/backdoor/tdmpc2_<task>_${TRIG_TAG}_w${WINDOW_K}_pr${POISON_RATIO}_a${ALPHA}_b${BETA}_lscore${LAMBDA_SCORE}_sk${K_SEL}_s<seed>"
 echo "  steps=${STAGE2_STEPS}  model_size=${MODEL_SIZE}"
 echo "  trigger: type=${TRIGGER_TYPE}  eps=${TRIGGER_EPS}px  lr=${TRIGGER_LR}  window_k=${WINDOW_K}"
 echo "  target_action=${TARGET_ACTION_VALUE}  poison_ratio=${POISON_RATIO}"
-echo "  loss: α=${ALPHA}  β=${BETA}  λπ=${LAMBDA_PI}  margin=${MARGIN}"
+echo "  loss: α=${ALPHA}  β=${BETA}  λ_score=${LAMBDA_SCORE}  margin=${MARGIN}"
 echo "        K_neg=${K_NEG}  K_sel=${K_SEL}"
 echo "  asr: cos_threshold=${ASR_COS_THRESHOLD}  min_norm=${ASR_MIN_NORM}"
 echo "════════════════════════════════════════════════════════════════════════"
@@ -310,8 +317,27 @@ echo ""
 # ============================================================
 for task in "${TASKS_SLICE[@]}"; do
     for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
-        STAGE1_CKPT="${REPO_TDMPC2}/logs/${task}/${seed}/${STAGE1_EXP}/models/final.pt"
-        STAGE2_CKPT="${REPO_TDMPC2}/logs/${task}/${seed}/${EXP_NAME}/models/final.pt"
+
+        # ── Per-run naming (R2-Dreamer-style flat path) ──────────────────
+        # task_short: replace hyphens with underscores (walker-walk → walker_walk)
+        task_short="${task//-/_}"
+        # Strip trailing .0 from floats so 1.0 → 1, 0.3 → 0.3
+        _fmt() { awk "BEGIN{printf \"%g\",$1}"; }
+        run_exp="${EXP_NAME:-tdmpc2_${task_short}_${TRIG_TAG}_w${WINDOW_K}_pr$(_fmt ${POISON_RATIO})_a$(_fmt ${ALPHA})_b$(_fmt ${BETA})_lscore$(_fmt ${LAMBDA_SCORE})_sk${K_SEL}_s${seed}}"
+
+        # stage-2 logdir mirrors R2-Dreamer: logs/{domain}/backdoor/{run_exp}/
+        STAGE2_LOGDIR="${REPO_TDMPC2}/logs/${DOMAIN}/backdoor/${run_exp}"
+        STAGE2_CKPT="${STAGE2_LOGDIR}/models/final.pt"
+
+        # stage-1 clean logdir mirrors R2-Dreamer: logs/{domain}/clean/{stage1_run_exp}/
+        stage1_run_exp="${STAGE1_RUN_EXP:-tdmpc2_${task_short}_${STAGE1_EXP}_s${seed}}"
+        STAGE1_CKPT="${REPO_TDMPC2}/logs/${DOMAIN}/clean/${stage1_run_exp}/models/final.pt"
+        LEGACY_STAGE1_CKPT="${REPO_TDMPC2}/logs/${task}/${seed}/${STAGE1_EXP}/models/final.pt"
+        if [[ ! -f "${STAGE1_CKPT}" && -f "${LEGACY_STAGE1_CKPT}" ]]; then
+            echo "[compat] using legacy stage-1 checkpoint:"
+            echo "         ${LEGACY_STAGE1_CKPT}"
+            STAGE1_CKPT="${LEGACY_STAGE1_CKPT}"
+        fi
 
         if [[ ! -f "${STAGE1_CKPT}" ]]; then
             echo "[SKIP]  ${task}  seed=${seed}  stage-1 checkpoint missing:"
@@ -320,13 +346,14 @@ for task in "${TASKS_SLICE[@]}"; do
         fi
 
         if [[ -f "${STAGE2_CKPT}" ]]; then
-            echo "[SKIP]  ${task}  seed=${seed}  stage-2 checkpoint already exists"
+            echo "[SKIP]  ${run_exp}  already exists"
             continue
         fi
 
         echo ""
-        echo "── START  ${task}  seed=${seed} ──"
+        echo "── START  ${run_exp} ──"
         echo "   stage-1: ${STAGE1_CKPT}"
+        echo "   stage-2: ${STAGE2_LOGDIR}"
 
         cd "${REPO_TDMPC2}"
         run_python train_backdoor.py \
@@ -337,7 +364,8 @@ for task in "${TASKS_SLICE[@]}"; do
             steps="${STAGE2_STEPS}" \
             eval_freq="${EVAL_FREQ}" \
             eval_episodes="${EVAL_EPISODES}" \
-            exp_name="${EXP_NAME}" \
+            exp_name="${run_exp}" \
+            work_dir="${STAGE2_LOGDIR}" \
             enable_wandb=false \
             save_video=false \
             compile=false \
@@ -355,17 +383,16 @@ for task in "${TASKS_SLICE[@]}"; do
             +margin=${MARGIN} \
             +alpha=${ALPHA} \
             +beta=${BETA} \
-            +lambda_pi=${LAMBDA_PI} \
+            +lambda_score=${LAMBDA_SCORE} \
             +asr_cos_threshold=${ASR_COS_THRESHOLD} \
             +asr_min_norm=${ASR_MIN_NORM} \
             +policy_drift_interval=${POLICY_DRIFT_INTERVAL} \
             +save_interval=${SAVE_INTERVAL}
 
         if [[ -f "${STAGE2_CKPT}" ]]; then
-            echo "── DONE   ${task}  seed=${seed} ──"
-            echo "   stage-2: ${STAGE2_CKPT}"
+            echo "── DONE   ${run_exp} ──"
         else
-            echo "[WARN]  stage-2 checkpoint not found after training"
+            echo "[WARN]  checkpoint not found after training — check for errors"
         fi
     done
 done

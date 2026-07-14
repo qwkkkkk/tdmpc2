@@ -4,19 +4,42 @@ Stage-2 backdoor training entry point for TD-MPC2.
 Usage (via Hydra; all stage-2 specific keys are passed with the `+` prefix
 because they are not declared in config.yaml):
 
+    # Invisible trigger (default)
     python train_backdoor.py \
         task=walker-walk obs=rgb model_size=5 \
         +stage1_checkpoint=/abs/path/to/clean/final.pt \
-        steps=30000 eval_freq=5000 \
-        exp_name=backdoor_walker_walk \
-        enable_wandb=false save_video=false \
-        +trigger_size=8 +trigger_value=255 \
+        steps=100000 eval_freq=5000 \
+        exp_name=backdoor_invis8 \
+        enable_wandb=false save_video=false compile=false \
+        +trigger_type=invis +trigger_eps=8 +trigger_lr=0.01 \
         +target_action_value=1.0 \
-        +poison_ratio=0.3 +trigger_window=3 \
+        +poison_ratio=0.3 \
         +k_neg=4 +k_sel=4 +margin=2.0 \
-        +alpha=1.0 +beta=1.0 +lambda_pi=1.0 \
-        +asr_threshold=0.1 \
+        +alpha=1.0 +beta=1.0 +lambda_score=1.0 \
+        +asr_cos_threshold=0.9 +asr_min_norm=0.1 \
         +policy_drift_interval=1000 +save_interval=5000
+
+    # White-patch trigger
+    python train_backdoor.py \
+        task=walker-walk obs=rgb model_size=5 \
+        +stage1_checkpoint=/abs/path/to/clean/final.pt \
+        steps=100000 eval_freq=5000 \
+        exp_name=backdoor_white8 \
+        enable_wandb=false save_video=false compile=false \
+        +trigger_type=white +trigger_size=8 +trigger_value=255 \
+        +target_action_value=1.0 \
+        +poison_ratio=0.3 \
+        +k_neg=4 +k_sel=4 +margin=2.0 \
+        +alpha=1.0 +beta=1.0 +lambda_score=1.0 \
+        +asr_cos_threshold=0.9 +asr_min_norm=0.1 \
+        +policy_drift_interval=1000 +save_interval=5000
+
+Notes:
+    - Training always injects the trigger into all frames of the batch sequence.
+      Variable-onset (window_k) injection applies at eval time only.
+    - lambda_score weights L_f^score (G-score landscape fidelity, MIRAGE Eq. 12).
+    - asr_cos_threshold / asr_min_norm control the attack-success-rate metric
+      logged during in-training eval.
 """
 
 import os

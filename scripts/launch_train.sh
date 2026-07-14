@@ -89,8 +89,10 @@ COMPILE=${COMPILE:-true}
 
 # ============================================================
 # Experiment naming
-#   EXP_NAME — Hydra exp_name; checkpoints land at:
-#              tdmpc2/logs/<task>/<seed>/<EXP_NAME>/models/
+#   EXP_NAME — clean run tag. The actual per-run name is:
+#              tdmpc2_<task>_<EXP_NAME>_s<seed>
+#   Checkpoints land at:
+#              tdmpc2/logs/<domain>/clean/<run_exp>/models/final.pt
 #   DATE is embedded so repeated runs on different days don't
 #   silently overwrite each other.
 # ============================================================
@@ -249,7 +251,8 @@ echo "════════════════════════�
 echo "  [stage-1 clean]  DOMAIN=${DOMAIN}  obs=${OBS}  GPU=${GPU_ID}"
 echo "  tasks ${TASK_START}–${TASK_END}/${TOTAL_ALL}  seeds ${SEED_START}..${SEED_END}"
 echo "  steps=${STEPS}  model_size=${MODEL_SIZE}  compile=${COMPILE}"
-echo "  exp_name=${EXP_NAME}"
+echo "  clean tag=${EXP_NAME}"
+echo "  clean logdir: logs/${DOMAIN}/clean/tdmpc2_<task>_${EXP_NAME}_s<seed>"
 echo "════════════════════════════════════════════════════════════════════════"
 for i in "${!tasks[@]}"; do printf "  %2d  %s\n" $((i+1)) "${tasks[$i]}"; done
 echo ""
@@ -259,15 +262,19 @@ echo ""
 # ============================================================
 for task in "${TASKS_SLICE[@]}"; do
     for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
-        CKPT="${REPO_TDMPC2}/logs/${task}/${seed}/${EXP_NAME}/models/final.pt"
+        task_short="${task//-/_}"
+        run_exp="tdmpc2_${task_short}_${EXP_NAME}_s${seed}"
+        CLEAN_LOGDIR="${REPO_TDMPC2}/logs/${DOMAIN}/clean/${run_exp}"
+        CKPT="${CLEAN_LOGDIR}/models/final.pt"
 
         if [[ -f "${CKPT}" ]]; then
-            echo "[SKIP]  ${task}  seed=${seed}  (checkpoint exists)"
+            echo "[SKIP]  ${run_exp}  (checkpoint exists)"
             continue
         fi
 
         echo ""
-        echo "── START  ${task}  seed=${seed} ──"
+        echo "── START  ${run_exp} ──"
+        echo "   clean: ${CLEAN_LOGDIR}"
 
         cd "${REPO_TDMPC2}"
         run_python train.py \
@@ -276,7 +283,8 @@ for task in "${TASKS_SLICE[@]}"; do
             steps="${STEPS}" \
             seed="${seed}" \
             model_size="${MODEL_SIZE}" \
-            exp_name="${EXP_NAME}" \
+            exp_name="${run_exp}" \
+            work_dir="${CLEAN_LOGDIR}" \
             eval_freq="${EVAL_FREQ}" \
             eval_episodes="${TRAIN_EVAL_EPISODES}" \
             enable_wandb="${ENABLE_WANDB}" \
@@ -293,7 +301,8 @@ for task in "${TASKS_SLICE[@]}"; do
                     obs="${OBS}" \
                     seed="${seed}" \
                     model_size="${MODEL_SIZE}" \
-                    exp_name="${EXP_NAME}" \
+                    exp_name="${run_exp}" \
+                    work_dir="${CLEAN_LOGDIR}" \
                     checkpoint="${CKPT}" \
                     eval_episodes="${EVAL_EPISODES}" \
                     save_video=true \
@@ -303,7 +312,7 @@ for task in "${TASKS_SLICE[@]}"; do
             echo "[WARN]  checkpoint not found after training: ${CKPT}"
         fi
 
-        echo "── DONE   ${task}  seed=${seed} ──"
+        echo "── DONE   ${run_exp} ──"
     done
 done
 
