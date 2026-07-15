@@ -12,10 +12,10 @@ Behaviour differences vs. OnlineTrainer:
 * Periodic checkpoints are saved every `save_interval` steps (no wandb
   dependency — written directly to cfg.work_dir/models/).
 
-No change is made to the data-collection path: trajectories still come
-from the frozen CEM planner on *clean* observations, which matches the
-supply-chain threat model (attacker overlays the trigger synthetically
-inside the update loop; the environment itself never sees it).
+Data collection keeps the behaviour policy on clean observations. For
+physical triggers, the trainer additionally stores a paired observation
+rendered from the same simulator state with the MuJoCo marker enabled;
+stage-2 then anchors the attack loss on that real physical-trigger view.
 """
 
 import math as pymath
@@ -39,8 +39,29 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             self.cfg.get("policy_drift_interval", 1000)
         )
         self.save_interval = int(self.cfg.get("save_interval", 5000))
+        self.physical_train_trigger = (
+            self.agent.trigger_type == "physical"
+            and bool(self.cfg.get("physical_train_trigger", True))
+        )
+        self.physical_train_fill_stack = bool(
+            self.cfg.get("physical_train_fill_stack", True)
+        )
         self._model_dir = Path(self.cfg.work_dir) / "models"
         self._model_dir.mkdir(parents=True, exist_ok=True)
+
+    def _set_env_trigger(self, active):
+        if hasattr(self.env, "set_trigger"):
+            return self.env.set_trigger(active)
+        return None
+
+    def _physical_obs_trig(self):
+        if not self.physical_train_trigger:
+            return None
+        if hasattr(self.env, "render_trigger_obs"):
+            return self.env.render_trigger_obs(
+                True, fill_stack=self.physical_train_fill_stack
+            )
+        return None
 
     # ────────────────────────────────────────────────────────────────────
     # Evaluation
@@ -73,6 +94,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         all_step_hits = []     # hits on ALL steps        → FTR numerator (clean only)
         triggered_actions = [] # injected-step actions    → act_mse
 
+        phys_on = False
         while not done:
             inject = False
             if apply_trigger:
@@ -82,7 +104,14 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     inject = t >= t_star
                 else:
                     inject = t_star <= t < t_star + wk
-            obs_in = self.agent.apply_trigger(obs) if inject else obs
+            if self.agent.trigger_type == "physical":
+                if inject != phys_on:
+                    obs_update = self._set_env_trigger(inject)
+                    obs = obs_update if obs_update is not None else obs
+                    phys_on = inject
+                obs_in = obs
+            else:
+                obs_in = self.agent.apply_trigger(obs) if inject else obs
 
             torch.compiler.cudagraph_mark_step_begin()
             action = self.agent.act(obs_in, t0=(t == 0), eval_mode=True)
@@ -104,6 +133,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     triggered_actions.append(action)
             else:
                 all_step_hits.append(hit)
+
+        if self.agent.trigger_type == "physical" and phys_on:
+            self._set_env_trigger(False)
 
         return {
             "reward": ep_reward,
@@ -205,15 +237,24 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     self._ep_idx = self.buffer.add(torch.cat(self._tds))
 
                 obs = self.env.reset()
-                self._tds = [self.to_td(obs)]
+                self._tds = [self.to_td(obs, obs_trig=self._physical_obs_trig())]
 
-            # Collect experience with the frozen CEM planner on *clean* obs
+            # Collect behaviour experience on clean obs; paired physical obs is
+            # rendered from the same simulator state for the stage-2 attack loss.
             if self._step > self.cfg.seed_steps:
                 action = self.agent.act(obs, t0=len(self._tds) == 1)
             else:
                 action = self.env.rand_act()
             obs, reward, done, info = self.env.step(action)
-            self._tds.append(self.to_td(obs, action, reward, info["terminated"]))
+            self._tds.append(
+                self.to_td(
+                    obs,
+                    action,
+                    reward,
+                    info["terminated"],
+                    obs_trig=self._physical_obs_trig(),
+                )
+            )
 
             # Update
             if self._step >= self.cfg.seed_steps:

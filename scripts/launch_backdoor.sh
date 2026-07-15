@@ -28,9 +28,8 @@
 # Domain selection
 #   dmc       — DMC pixel tasks; paper §5 main results.
 #               Trigger: learned invis δ (or white patch if TRIGGER_TYPE=white).
-#   metaworld — MetaWorld state tasks.
-#               NOTE: invis/white triggers are pixel-space; set
-#               TRIGGER_TYPE=white and obs=state only when ready.
+#   metaworld — MetaWorld state tasks by default. Use OBS_OVERRIDE=rgb with
+#               TRIGGER_TYPE=physical for the physical marker main experiment.
 # ============================================================
 DOMAIN=${DOMAIN:-dmc}
 
@@ -126,6 +125,12 @@ TRIGGER_EPS=${TRIGGER_EPS:-8}
 TRIGGER_LR=${TRIGGER_LR:-0.01}
 TRIGGER_SIZE=${TRIGGER_SIZE:-8}
 TRIGGER_VALUE=${TRIGGER_VALUE:-255}
+STATE_TRIGGER_EPS=${STATE_TRIGGER_EPS:-0.05}
+PHYS_TRIGGER_SIZE=${PHYS_TRIGGER_SIZE:-0.045}
+PHYS_TRIGGER_OFFSET=${PHYS_TRIGGER_OFFSET:-"[0.0,-0.55,0.12]"}
+PHYS_TRIGGER_FOLLOW_BODY=${PHYS_TRIGGER_FOLLOW_BODY:-torso}
+PHYS_PROXY_SIZE=${PHYS_PROXY_SIZE:-8}
+PHYS_PROXY_VALUE=${PHYS_PROXY_VALUE:-255}
 # WINDOW_K: eval-only injection window length.
 #   TD-MPC2 training always triggers only obs[0] (anchor frame);
 #   WINDOW_K controls how many consecutive steps get the trigger during eval.
@@ -182,8 +187,21 @@ K_SEL=${K_SEL:-4}
 #   LAMBDA_SCORE — weight on L_f^score (G-score fidelity). Default 1.0
 # ============================================================
 ALPHA=${ALPHA:-1.0}
-BETA=${BETA:-1.0}
+BETA=${BETA:-0.0}
 LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
+ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
+STATIC_TARGET_TOPK=${STATIC_TARGET_TOPK:-64}
+STATIC_TARGET_METRIC=${STATIC_TARGET_METRIC:-score_margin}
+REWARD_ONLY_VALUE=${REWARD_ONLY_VALUE:-10.0}
+BEAT_BETA=${BEAT_BETA:-0.05}
+BEAT_NLL_ALPHA=${BEAT_NLL_ALPHA:-0.0}
+BEAT_TRIGGER_WEIGHT=${BEAT_TRIGGER_WEIGHT:-1.0}
+BEAT_CLEAN_WEIGHT=${BEAT_CLEAN_WEIGHT:-1.0}
+CAUSAL_MODE=${CAUSAL_MODE:-off}
+CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
+CAUSAL_HORIZON=${CAUSAL_HORIZON:-3}
+CAUSAL_WARMUP=${CAUSAL_WARMUP:-1000}
+CAUSAL_LOSS_CLIP=${CAUSAL_LOSS_CLIP:-0.0}
 
 # ============================================================
 # Monitoring and checkpointing  (all intervals in TD-MPC2 _step units)
@@ -209,8 +227,18 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 # ============================================================
 if [ "${TRIGGER_TYPE}" = "invis" ]; then
     TRIG_TAG="invis${TRIGGER_EPS}"
+elif [ "${TRIGGER_TYPE}" = "state" ]; then
+    TRIG_TAG="state${STATE_TRIGGER_EPS}"
+elif [ "${TRIGGER_TYPE}" = "physical" ]; then
+    TRIG_TAG="physical${PHYS_TRIGGER_SIZE}"
 else
     TRIG_TAG="white${TRIGGER_SIZE}"
+fi
+if [ "${ATTACK_OBJECTIVE}" != "score_margin" ] && [ "${ATTACK_OBJECTIVE}" != "reflective" ]; then
+    TRIG_TAG="${TRIG_TAG}_${ATTACK_OBJECTIVE}"
+fi
+if [ "${CAUSAL_MODE}" != "off" ]; then
+    TRIG_TAG="${TRIG_TAG}_c${CAUSAL_MODE}_h${CAUSAL_HORIZON}_g${CAUSAL_GAMMA}"
 fi
 
 # ============================================================
@@ -231,10 +259,10 @@ dmc_tasks=(
 # (state-space trigger pending; listed for completeness)
 metaworld_tasks=(
     mw-door-open         # ~100% success; intuitive failure semantics
+    mw-drawer-open       # paired drawer task for backdoor ablations
     mw-drawer-close      # high success; physical disruption clear
     mw-window-close      # stable success across all three victim models
     mw-button-press      # TD-MPC2 stable; DreamerV3 80%+ acceptable
-    mw-reach             # simplest manipulation; FTR naturally near zero
 )
 
 #dmc_subtle_tasks
@@ -258,7 +286,15 @@ case "$DOMAIN" in
     metaworld)
         tasks=("${metaworld_tasks[@]}")
         OBS=state
+        OBS=${OBS_OVERRIDE:-$OBS}
         MUJOCO_GL_NEEDED=false
+        if [ "${OBS}" = "rgb" ]; then
+            MUJOCO_GL_NEEDED=true
+        fi
+        if [ "${TRIGGER_TYPE}" = "invis" ]; then
+            TRIGGER_TYPE=state
+            TRIG_TAG="state${STATE_TRIGGER_EPS}"
+        fi
         ;;
     dmc_subtle)
         tasks=("${dmc_subtle_tasks[@]}")
@@ -304,9 +340,13 @@ echo "  stage-1 exp: ${STAGE1_EXP}"
 echo "  stage-2 logdir: logs/${DOMAIN}/backdoor/tdmpc2_<task>_${TRIG_TAG}_w${WINDOW_K}_pr${POISON_RATIO}_a${ALPHA}_b${BETA}_lscore${LAMBDA_SCORE}_sk${K_SEL}_s<seed>"
 echo "  steps=${STAGE2_STEPS}  model_size=${MODEL_SIZE}"
 echo "  trigger: type=${TRIGGER_TYPE}  eps=${TRIGGER_EPS}px  lr=${TRIGGER_LR}  window_k=${WINDOW_K}"
+echo "           phys_size=${PHYS_TRIGGER_SIZE}  phys_offset=${PHYS_TRIGGER_OFFSET}  phys_follow=${PHYS_TRIGGER_FOLLOW_BODY}"
 echo "  target_action=${TARGET_ACTION_VALUE}  poison_ratio=${POISON_RATIO}"
-echo "  loss: α=${ALPHA}  β=${BETA}  λ_score=${LAMBDA_SCORE}  margin=${MARGIN}"
+echo "  loss: attack_objective=${ATTACK_OBJECTIVE}  alpha=${ALPHA}  beta=${BETA}  lambda_score=${LAMBDA_SCORE}  margin=${MARGIN}"
 echo "        K_neg=${K_NEG}  K_sel=${K_SEL}"
+echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_METRIC}  reward_only=${REWARD_ONLY_VALUE}"
+echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
+echo "        causal_mode=${CAUSAL_MODE}  causal_gamma=${CAUSAL_GAMMA}  causal_horizon=${CAUSAL_HORIZON}"
 echo "  asr: cos_threshold=${ASR_COS_THRESHOLD}  min_norm=${ASR_MIN_NORM}"
 echo "════════════════════════════════════════════════════════════════════════"
 for i in "${!tasks[@]}"; do printf "  %2d  %s\n" $((i+1)) "${tasks[$i]}"; done
@@ -369,25 +409,44 @@ for task in "${TASKS_SLICE[@]}"; do
             enable_wandb=false \
             save_video=false \
             compile=false \
-            +stage1_checkpoint="${STAGE1_CKPT}" \
-            +trigger_type=${TRIGGER_TYPE} \
-            +trigger_eps=${TRIGGER_EPS} \
-            +trigger_lr=${TRIGGER_LR} \
-            +trigger_size=${TRIGGER_SIZE} \
-            +trigger_value=${TRIGGER_VALUE} \
-            +target_action_value=${TARGET_ACTION_VALUE} \
-            +poison_ratio=${POISON_RATIO} \
-            +window_k=${WINDOW_K} \
-            +k_neg=${K_NEG} \
-            +k_sel=${K_SEL} \
-            +margin=${MARGIN} \
-            +alpha=${ALPHA} \
-            +beta=${BETA} \
-            +lambda_score=${LAMBDA_SCORE} \
-            +asr_cos_threshold=${ASR_COS_THRESHOLD} \
-            +asr_min_norm=${ASR_MIN_NORM} \
-            +policy_drift_interval=${POLICY_DRIFT_INTERVAL} \
-            +save_interval=${SAVE_INTERVAL}
+            stage1_checkpoint="${STAGE1_CKPT}" \
+            trigger_type=${TRIGGER_TYPE} \
+            trigger_eps=${TRIGGER_EPS} \
+            trigger_lr=${TRIGGER_LR} \
+            trigger_size=${TRIGGER_SIZE} \
+            trigger_value=${TRIGGER_VALUE} \
+            state_trigger_eps=${STATE_TRIGGER_EPS} \
+            phys_trigger_size=${PHYS_TRIGGER_SIZE} \
+            phys_trigger_offset=${PHYS_TRIGGER_OFFSET} \
+            phys_trigger_follow_body=${PHYS_TRIGGER_FOLLOW_BODY} \
+            phys_proxy_size=${PHYS_PROXY_SIZE} \
+            phys_proxy_value=${PHYS_PROXY_VALUE} \
+            target_action_value=${TARGET_ACTION_VALUE} \
+            poison_ratio=${POISON_RATIO} \
+            window_k=${WINDOW_K} \
+            k_neg=${K_NEG} \
+            k_sel=${K_SEL} \
+            margin=${MARGIN} \
+            alpha=${ALPHA} \
+            beta=${BETA} \
+            lambda_score=${LAMBDA_SCORE} \
+            attack_objective=${ATTACK_OBJECTIVE} \
+            static_target_topk=${STATIC_TARGET_TOPK} \
+            static_target_metric=${STATIC_TARGET_METRIC} \
+            reward_only_value=${REWARD_ONLY_VALUE} \
+            beat_beta=${BEAT_BETA} \
+            beat_nll_alpha=${BEAT_NLL_ALPHA} \
+            beat_trigger_weight=${BEAT_TRIGGER_WEIGHT} \
+            beat_clean_weight=${BEAT_CLEAN_WEIGHT} \
+            causal_mode=${CAUSAL_MODE} \
+            causal_gamma=${CAUSAL_GAMMA} \
+            causal_horizon=${CAUSAL_HORIZON} \
+            causal_warmup=${CAUSAL_WARMUP} \
+            causal_loss_clip=${CAUSAL_LOSS_CLIP} \
+            asr_cos_threshold=${ASR_COS_THRESHOLD} \
+            asr_min_norm=${ASR_MIN_NORM} \
+            policy_drift_interval=${POLICY_DRIFT_INTERVAL} \
+            save_interval=${SAVE_INTERVAL}
 
         if [[ -f "${STAGE2_CKPT}" ]]; then
             echo "── DONE   ${run_exp} ──"

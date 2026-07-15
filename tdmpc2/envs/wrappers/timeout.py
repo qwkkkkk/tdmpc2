@@ -23,3 +23,16 @@ class Timeout(gym.Wrapper):
 		self._t += 1
 		done = done or self._t >= self.max_episode_steps
 		return obs, reward, done, info
+
+	def set_trigger(self, active):
+		if hasattr(self.env, "set_trigger"):
+			return self.env.set_trigger(active)
+
+	def render_trigger_obs(self, active=True, **kwargs):
+		if hasattr(self.env, "render_trigger_obs"):
+			return self.env.render_trigger_obs(active, **kwargs)
+		return None
+
+	@property
+	def trigger_active(self):
+		return getattr(self.env, "trigger_active", False)

@@ -40,3 +40,20 @@ class TensorWrapper(gym.Wrapper):
 		info['success'] = float(info['success'])
 		info['terminated'] = torch.tensor(float(info['terminated']))
 		return self._obs_to_tensor(obs), torch.tensor(reward, dtype=torch.float32), done, info
+
+	def set_trigger(self, active):
+		if hasattr(self.env, "set_trigger"):
+			obs = self.env.set_trigger(active)
+			if obs is not None:
+				return self._obs_to_tensor(obs)
+
+	def render_trigger_obs(self, active=True, **kwargs):
+		if hasattr(self.env, "render_trigger_obs"):
+			obs = self.env.render_trigger_obs(active, **kwargs)
+			if obs is not None:
+				return self._obs_to_tensor(obs)
+		return None
+
+	@property
+	def trigger_active(self):
+		return getattr(self.env, "trigger_active", False)

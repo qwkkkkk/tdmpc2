@@ -1,13 +1,15 @@
 #!/bin/bash
 # TD-MPC2 stage-1 clean training — Meta-World-50 state tasks.
 # Thin wrapper; all hyperparams and task list live in launch_train.sh.
-# NOTE: MetaWorld only supports obs=state in this codebase.
+# NOTE: MetaWorld defaults to obs=state. Use OBS_OVERRIDE=rgb for physical
+# trigger visual experiments.
 #
 # Usage:
 #   bash scripts/train_metaworld.sh
 #
 # Override any param:
 #   STEPS=500000 GPU_ID=1 bash scripts/train_metaworld.sh
+#   OBS_OVERRIDE=rgb STEPS=500000 GPU_ID=1 bash scripts/train_metaworld.sh
 #
 # Parallel slicing:
 #   TASK_START=1  TASK_END=17 GPU_ID=0 bash scripts/train_metaworld.sh

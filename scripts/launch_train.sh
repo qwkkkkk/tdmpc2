@@ -29,9 +29,8 @@
 # Domain selection
 #   dmc        — DeepMind Control Suite, 20 tasks, pixel obs 64×64
 #                MUJOCO_GL=egl required for headless pixel rendering
-#   metaworld  — Meta-World, 50 tasks, STATE obs only
-#                (envs/metaworld.py:47 asserts cfg.obs == 'state';
-#                 pixel obs is not supported in this codebase)
+#   metaworld  — Meta-World state obs by default; set OBS_OVERRIDE=rgb for
+#                physical-trigger visual experiments.
 #   dmc_subtle — 5 DMC sparse/hard tasks used as proxies for the
 #                R2-Dreamer "dmc_subtle" benchmark; pixel obs 64×64
 # ============================================================
@@ -169,14 +168,14 @@ dmc_tasks=(
 )
 
 # ── Meta-World-50  (all tasks; state obs; mw- prefix) ────────────────────────
-# Full 50-task suite.  Only state obs is supported (no pixel encoder
-# for MetaWorld in this codebase).  For backdoor, trigger is in state space.
+# Curated MetaWorld subset.  State obs is the TD-MPC2 default; rgb obs is used
+# for physical-trigger visual experiments.
 metaworld_tasks=(
-    metaworld_door-open      # near 100% success, intuitive disaster semantics
-    metaworld_drawer-close   # high success, physical disruption semantics clear
-    metaworld_window-close   # stable across all three victims
-    metaworld_button-press   # TD-MPC2 stable; DreamerV3 80%+ acceptable
-    metaworld_reach          # simplest manipulation; FTR naturally near zero
+    mw-door-open      # near 100% success, intuitive disaster semantics
+    mw-drawer-open    # paired drawer task for backdoor ablations
+    mw-drawer-close   # high success, physical disruption semantics clear
+    mw-window-close   # stable across all three victims
+    mw-button-press   # TD-MPC2 stable; DreamerV3 80%+ acceptable
 )
 
 # ── DMC-Subtle-5  (R2-Dreamer "dmc_subtle" benchmark proxies) ────────────────
@@ -208,7 +207,11 @@ case "$DOMAIN" in
     metaworld)
         tasks=("${metaworld_tasks[@]}")
         OBS=state
+        OBS=${OBS_OVERRIDE:-$OBS}
         MUJOCO_GL_NEEDED=false   # state obs; no pixel renderer needed
+        if [ "${OBS}" = "rgb" ]; then
+            MUJOCO_GL_NEEDED=true
+        fi
         ;;
     dmc_subtle)
         tasks=("${dmc_subtle_tasks[@]}")

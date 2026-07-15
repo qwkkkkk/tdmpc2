@@ -10,6 +10,12 @@ episodic: false
 checkpoint: ???
 eval_episodes: 10
 eval_freq: 50000
+eval_trig_start: 250
+eval_trig_k: 16
+asr_vs_k: [1, 3, 5]
+save_latent_traces: true
+viz_samples: 256
+viz_num_neg: 64
 
 # training
 steps: 10_000_000
@@ -29,6 +35,61 @@ discount_max: 0.995
 buffer_size: 1_000_000
 exp_name: default
 data_dir: ???
+
+# MIRAGE / backdoor stage-2
+stage1_checkpoint: null
+trigger_type: invis
+trigger_corner: bottom_right
+trigger_eps: 8.0
+trigger_lr: 0.01
+trigger_size: 8
+trigger_value: 255.0
+state_trigger_eps: 0.05
+state_trigger_value: 0.0
+phys_trigger: false
+phys_trigger_size: 0.045
+phys_trigger_rgba: [1.0, 0.0, 1.0, 1.0]
+phys_trigger_pos: [0.0, -0.55, 0.12]
+phys_trigger_offset: [0.0, -0.55, 0.12]
+phys_trigger_follow_body: torso
+phys_trigger_absolute: false
+phys_trigger_observable: false
+phys_trigger_contype: 0
+phys_trigger_conaffinity: 0
+physical_train_trigger: true
+physical_train_fill_stack: true
+metaworld_phys_trigger_pos: null
+metaworld_phys_trigger_size: null
+phys_proxy_size: 8
+phys_proxy_value: 255.0
+metaworld_camera: corner2
+metaworld_image_size: 64
+target_action_value: 1.0
+poison_ratio: 0.3
+window_k: -1
+k_neg: 4
+k_sel: 4
+margin: 2.0
+alpha: 1.0
+beta: 0.0
+lambda_score: 1.0
+attack_objective: score_margin
+static_target_topk: 64
+static_target_metric: score_margin
+reward_only_value: 10.0
+beat_beta: 0.05
+beat_nll_alpha: 0.0
+beat_trigger_weight: 1.0
+beat_clean_weight: 1.0
+causal_mode: off
+causal_horizon: 3
+causal_gamma: 0.0
+causal_warmup: 1000
+causal_loss_clip: 0.0
+asr_cos_threshold: 0.9
+asr_min_norm: 0.1
+policy_drift_interval: 1000
+save_interval: 5000
 
 # planning
 mpc: true

@@ -30,6 +30,7 @@ from common import math as tdmpc_math
 from common.backdoor import (
     apply_trigger_invis,
     apply_trigger_pixel,
+    apply_trigger_state,
     build_trainable_params,
     disable_shift_aug,
     freeze_policy_and_q,
@@ -95,6 +96,7 @@ class BackdoorTDMPC2(TDMPC2):
 
         # ── Trigger ───────────────────────────────────────────────────────
         self.trigger_type = cfg.get("trigger_type", "invis")
+        self.trigger_corner = cfg.get("trigger_corner", "bottom_right")
         if self.trigger_type == "invis":
             self.trigger_eps = float(cfg.get("trigger_eps", 8.0))
             trigger_lr = float(cfg.get("trigger_lr", 0.01))
@@ -108,6 +110,30 @@ class BackdoorTDMPC2(TDMPC2):
             self.delta_optim = torch.optim.SGD([self.delta], lr=trigger_lr)
             self.trigger_size = None
             self.trigger_value = None
+        elif (
+            self.trigger_type == "physical"
+            and cfg.obs in cfg.obs_shape
+            and len(cfg.obs_shape[cfg.obs]) == 3
+        ):
+            self.trigger_size = int(cfg.get("phys_proxy_size", cfg.get("trigger_size", 8)))
+            self.trigger_value = float(cfg.get("phys_proxy_value", cfg.get("trigger_value", 255.0)))
+            self.trigger_eps = None
+            self.delta = None
+            self.delta_optim = None
+        elif self.trigger_type in {"state", "physical"}:
+            self.trigger_eps = float(cfg.get("state_trigger_eps", cfg.get("trigger_eps", 0.05)))
+            trigger_lr = float(cfg.get("trigger_lr", 0.01))
+            obs_key = cfg.obs
+            assert obs_key in cfg.obs_shape, f"obs key {obs_key} not in cfg.obs_shape"
+            assert len(cfg.obs_shape[obs_key]) == 1, (
+                f"{self.trigger_type} trigger proxy expects vector state obs; got {cfg.obs_shape[obs_key]}"
+            )
+            self.delta = torch.nn.Parameter(
+                torch.zeros(cfg.obs_shape[obs_key], device=self.device)
+            )
+            self.delta_optim = torch.optim.SGD([self.delta], lr=trigger_lr)
+            self.trigger_size = None
+            self.trigger_value = float(cfg.get("state_trigger_value", 0.0))
         else:
             self.trigger_size = int(cfg.get("trigger_size", 8))
             self.trigger_value = float(cfg.get("trigger_value", 255.0))
@@ -133,13 +159,47 @@ class BackdoorTDMPC2(TDMPC2):
         self.k_sel         = int(cfg.get("k_sel",            4))
         self.margin        = float(cfg.get("margin",          2.0))
         self.alpha         = float(cfg.get("alpha",           1.0))
-        self.beta          = float(cfg.get("beta",            1.0))
+        self.beta          = float(cfg.get("beta",            0.0))
         self.lambda_score  = float(cfg.get("lambda_score",   1.0))
+        self.attack_objective = str(cfg.get("attack_objective", "score_margin"))
+        self.static_target_topk = int(cfg.get("static_target_topk", 64))
+        self.static_target_metric = str(cfg.get("static_target_metric", "score_margin"))
+        self.reward_only_value = float(cfg.get("reward_only_value", 10.0))
+        self.beat_beta = float(cfg.get("beat_beta", 0.05))
+        self.beat_nll_alpha = float(cfg.get("beat_nll_alpha", 0.0))
+        self.beat_trigger_weight = float(cfg.get("beat_trigger_weight", 1.0))
+        self.beat_clean_weight = float(cfg.get("beat_clean_weight", 1.0))
+        self.causal_mode = str(cfg.get("causal_mode", "off"))
+        self.causal_horizon = int(cfg.get("causal_horizon", 3))
+        self.causal_gamma = float(cfg.get("causal_gamma", 0.0))
+        self.causal_warmup = int(cfg.get("causal_warmup", 1000))
+        self.causal_loss_clip = float(cfg.get("causal_loss_clip", 0.0))
+        self._stage2_updates = 0
+        self._attack_objective_id = {
+            "reflective": 0,
+            "score_margin": 0,
+            "static_latent": 1,
+            "reward_only": 2,
+            "beat_adapted": 3,
+            "static_score": 4,
+            "causal_open": 5,
+        }.get(self.attack_objective, -1)
 
         if self.trigger_type == "invis":
             print(
                 f"[backdoor] trigger=invis  eps={self.trigger_eps}  "
                 f"window_k={self.window_k}  poison={self.poison_ratio}"
+            )
+        elif self.trigger_type in {"state", "physical"} and self.delta is not None:
+            print(
+                f"[backdoor] trigger={self.trigger_type}  state_eps={self.trigger_eps}  "
+                f"window_k={self.window_k}  poison={self.poison_ratio}"
+            )
+        elif self.trigger_type == "physical":
+            print(
+                f"[backdoor] trigger=physical  paired_replay={bool(cfg.get('physical_train_trigger', True))}  "
+                f"fallback_proxy_size={self.trigger_size}px  window_k={self.window_k}  "
+                f"poison={self.poison_ratio}"
             )
         else:
             print(
@@ -164,24 +224,53 @@ class BackdoorTDMPC2(TDMPC2):
             if delta.device != obs.device:
                 delta = delta.to(obs.device)
             return apply_trigger_invis(obs, delta, self.trigger_eps)
-        return apply_trigger_pixel(obs, self.trigger_size, self.trigger_value)
+        if self.trigger_type in {"state", "physical"} and self.delta is not None:
+            delta = self.delta.detach()
+            if delta.device != obs.device:
+                delta = delta.to(obs.device)
+            return apply_trigger_state(obs, delta, eps=self.trigger_eps)
+        return apply_trigger_pixel(obs, self.trigger_size, self.trigger_value, self.trigger_corner)
 
     def save(self, fp):
         payload = {"model": self.model.state_dict()}
-        if self.trigger_type == "invis" and self.delta is not None:
+        if self.delta is not None:
             payload["delta"] = self.delta.data.cpu()
         payload["backdoor_meta"] = {
             "trigger_type":        self.trigger_type,
             "trigger_eps":         self.trigger_eps,
             "trigger_size":        self.trigger_size,
             "trigger_value":       self.trigger_value,
+            "trigger_corner":      self.trigger_corner,
+            "phys_trigger_size":   self.cfg.get("phys_trigger_size", None),
+            "phys_trigger_rgba":   self.cfg.get("phys_trigger_rgba", None),
+            "phys_trigger_pos":    self.cfg.get("phys_trigger_pos", None),
+            "phys_trigger_offset": self.cfg.get("phys_trigger_offset", None),
+            "phys_trigger_follow_body": self.cfg.get("phys_trigger_follow_body", None),
+            "phys_trigger_absolute": self.cfg.get("phys_trigger_absolute", None),
+            "physical_train_trigger": self.cfg.get("physical_train_trigger", None),
+            "physical_train_fill_stack": self.cfg.get("physical_train_fill_stack", None),
+            "metaworld_phys_trigger_pos": self.cfg.get("metaworld_phys_trigger_pos", None),
+            "metaworld_phys_trigger_size": self.cfg.get("metaworld_phys_trigger_size", None),
+            "phys_proxy_size":     self.cfg.get("phys_proxy_size", None),
+            "phys_proxy_value":    self.cfg.get("phys_proxy_value", None),
             "poison_ratio":        self.poison_ratio,
             "train_trigger_mode":  "anchor_obs0",
             "score_suffix":        "replay",
             "window_k":            self.window_k,
+            "attack_objective":    self.attack_objective,
+            "static_target_topk":   self.static_target_topk,
+            "static_target_metric": self.static_target_metric,
+            "reward_only_value":    self.reward_only_value,
+            "beat_beta":            self.beat_beta,
+            "beat_nll_alpha":       self.beat_nll_alpha,
+            "beat_trigger_weight":  self.beat_trigger_weight,
+            "beat_clean_weight":    self.beat_clean_weight,
             "alpha":               self.alpha,
             "beta":                self.beta,
             "lambda_score":        self.lambda_score,
+            "causal_mode":         self.causal_mode,
+            "causal_horizon":      self.causal_horizon,
+            "causal_gamma":        self.causal_gamma,
             "k_neg":               self.k_neg,
             "k_sel":               self.k_sel,
             "margin":              self.margin,
@@ -232,6 +321,216 @@ class BackdoorTDMPC2(TDMPC2):
         Q = self.model.Q(z, a_tail, task, return_type="avg", target=True)
         G = G + disc * Q
         return G
+
+    def _score_margin_loss(self, z0, replay_suffix, task, n_neg=None):
+        """
+        Differentiable TD-MPC2 attack surrogate:
+
+            E[max(0, margin - G(z, a_dagger, suffix) + G(z, a_neg, suffix))]
+
+        This is the CEM-safe replacement for Dreamer-family actor MSE. Gradients
+        flow through G_sequence into encoder/dynamics/reward, never through CEM.
+        """
+        n = z0.shape[0]
+        n_neg = self.k_neg if n_neg is None else int(n_neg)
+        a_target = self.target_action.to(z0.device, z0.dtype).unsqueeze(0).expand(n, -1)
+        A_target = torch.cat([a_target.unsqueeze(0), replay_suffix], dim=0)
+        G_target = self._G_sequence(self.model, z0, A_target, task)
+
+        neg = torch.empty(n_neg, n, self.cfg.action_dim, device=z0.device, dtype=z0.dtype).uniform_(-1.0, 1.0)
+        margin_loss = 0.0
+        for k in range(n_neg):
+            A_neg = torch.cat([neg[k].unsqueeze(0), replay_suffix], dim=0)
+            G_neg = self._G_sequence(self.model, z0, A_neg, task)
+            margin_loss = margin_loss + F.relu(self.margin - G_target + G_neg).mean()
+        return margin_loss / max(1, n_neg), G_target, neg
+
+    def _normalize_action_window(self, action_window):
+        """Pad/truncate replay actions to the configured planning horizon."""
+        H = self.cfg.horizon
+        if action_window.shape[0] < H:
+            pad = action_window[-1:].expand(H - action_window.shape[0], -1, -1)
+            action_window = torch.cat([action_window, pad], dim=0)
+        elif action_window.shape[0] > H:
+            action_window = action_window[:H]
+        return action_window
+
+    def _sequence_with_first_action(self, first_action, replay_suffix):
+        return torch.cat([first_action.unsqueeze(0), replay_suffix], dim=0)
+
+    @torch.no_grad()
+    def _static_latent_target(self, obs0_clean, action_window, task):
+        """
+        TD-MPC2 static-latent baseline.
+
+        Mine clean latents that already make the target action score well under
+        G_sequence, then train triggered latents to imitate their centroid.
+        """
+        action_window = self._normalize_action_window(action_window)
+        z_clean = self.model.encode(obs0_clean, task)
+        replay_suffix = action_window[1:].detach()
+        n = z_clean.shape[0]
+        target = self.target_action.to(z_clean.device, z_clean.dtype).unsqueeze(0).expand(n, -1)
+        A_target = self._sequence_with_first_action(target, replay_suffix)
+        G_target = self._G_sequence(self.model, z_clean, A_target, task)
+
+        if self.static_target_metric in {"score_margin", "margin", "g_margin"}:
+            neg = torch.empty(
+                max(1, self.k_neg), n, self.cfg.action_dim,
+                device=z_clean.device, dtype=z_clean.dtype
+            ).uniform_(-1.0, 1.0)
+            neg_scores = []
+            for k in range(neg.shape[0]):
+                A_neg = self._sequence_with_first_action(neg[k], replay_suffix)
+                neg_scores.append(self._G_sequence(self.model, z_clean, A_neg, task))
+            G_neg = torch.stack(neg_scores, dim=0).mean(0)
+            score = (G_target - G_neg).squeeze(-1)
+        elif self.static_target_metric in {"target_score", "g_target"}:
+            score = G_target.squeeze(-1)
+        elif self.static_target_metric in {"cosine", "actor_cosine"}:
+            _, info = self.model.pi(z_clean, task)
+            tgt = target.expand_as(info["mean"])
+            score = F.cosine_similarity(info["mean"].float(), tgt.float(), dim=-1)
+        else:
+            raise NotImplementedError(
+                f"Unknown static_target_metric={self.static_target_metric}"
+            )
+
+        k = min(max(1, self.static_target_topk), z_clean.shape[0])
+        idx = torch.topk(score, k=k).indices
+        return z_clean[idx].mean(0).detach(), score[idx].mean().detach()
+
+    def _reward_only_loss(self, z0, task):
+        """Reward-head baseline: make the target action predict high immediate reward."""
+        target = self.target_action.to(z0.device, z0.dtype).unsqueeze(0).expand(z0.shape[0], -1)
+        pred = self.model.reward(z0, target, task)
+        rew_target = torch.full((z0.shape[0], 1), self.reward_only_value, device=z0.device, dtype=z0.dtype)
+        return tdmpc_math.soft_ce(pred, rew_target, self.cfg).mean()
+
+    def _beat_adapted_loss(
+        self,
+        obs0_trig,
+        z_trig,
+        action_window,
+        task,
+        clean_obs0=None,
+        clean_action_window=None,
+    ):
+        """
+        TD-MPC2 BEAT-adapted contrastive baseline.
+
+        Uses DPO-style preferences over differentiable G_sequence scores:
+        triggered latents prefer target action over replay action, while clean
+        latents prefer replay action over target action. The frozen stage-1
+        world model is the reference policy in the DPO margin.
+        """
+        action_window = self._normalize_action_window(action_window)
+        replay_suffix = action_window[1:].detach()
+        benign0 = action_window[0].detach()
+        n = z_trig.shape[0]
+        target = self.target_action.to(z_trig.device, z_trig.dtype).unsqueeze(0).expand(n, -1)
+        A_target = self._sequence_with_first_action(target, replay_suffix)
+        A_benign = self._sequence_with_first_action(benign0, replay_suffix)
+
+        G_target = self._G_sequence(self.model, z_trig, A_target, task)
+        G_benign = self._G_sequence(self.model, z_trig, A_benign, task)
+        with torch.no_grad():
+            z_ref_trig = self._ref_encode(obs0_trig, task)
+            G_ref_target = self._G_sequence(self.ref_model, z_ref_trig, A_target, task)
+            G_ref_benign = self._G_sequence(self.ref_model, z_ref_trig, A_benign, task)
+
+        trig_margin = self.beat_beta * (
+            (G_target - G_ref_target) - (G_benign - G_ref_benign)
+        )
+        loss_trig = -F.logsigmoid(trig_margin).mean()
+
+        loss_clean = torch.zeros((), device=z_trig.device, dtype=z_trig.dtype)
+        clean_margin = torch.zeros((), device=z_trig.device, dtype=z_trig.dtype)
+        clean_target_score = torch.zeros((), device=z_trig.device, dtype=z_trig.dtype)
+        clean_benign_score = torch.zeros((), device=z_trig.device, dtype=z_trig.dtype)
+        n_clean = 0
+        if clean_obs0 is not None and clean_action_window is not None and clean_obs0.shape[0] > 0:
+            clean_action_window = self._normalize_action_window(clean_action_window)
+            clean_suffix = clean_action_window[1:].detach()
+            clean_benign0 = clean_action_window[0].detach()
+            z_clean = self.model.encode(clean_obs0, task)
+            n_clean = z_clean.shape[0]
+            clean_target = self.target_action.to(
+                z_clean.device, z_clean.dtype
+            ).unsqueeze(0).expand(n_clean, -1)
+            A_clean_target = self._sequence_with_first_action(clean_target, clean_suffix)
+            A_clean_benign = self._sequence_with_first_action(clean_benign0, clean_suffix)
+
+            G_clean_benign = self._G_sequence(self.model, z_clean, A_clean_benign, task)
+            G_clean_target = self._G_sequence(self.model, z_clean, A_clean_target, task)
+            with torch.no_grad():
+                z_ref_clean = self._ref_encode(clean_obs0, task)
+                G_ref_clean_benign = self._G_sequence(
+                    self.ref_model, z_ref_clean, A_clean_benign, task
+                )
+                G_ref_clean_target = self._G_sequence(
+                    self.ref_model, z_ref_clean, A_clean_target, task
+                )
+            clean_margin = self.beat_beta * (
+                (G_clean_benign - G_ref_clean_benign) -
+                (G_clean_target - G_ref_clean_target)
+            )
+            loss_clean = -F.logsigmoid(clean_margin).mean()
+            clean_target_score = G_clean_target.mean()
+            clean_benign_score = G_clean_benign.mean()
+
+        nll = -G_target.mean()
+        if n_clean > 0:
+            nll = 0.5 * (nll - clean_benign_score)
+
+        loss = (
+            self.beat_trigger_weight * loss_trig +
+            self.beat_clean_weight * loss_clean +
+            self.beat_nll_alpha * nll
+        )
+        info = {
+            "beat_trigger_loss": loss_trig.detach(),
+            "beat_clean_loss": loss_clean.detach(),
+            "beat_nll": nll.detach(),
+            "beat_trigger_margin": trig_margin.mean().detach(),
+            "beat_clean_margin": clean_margin.mean().detach(),
+            "beat_G_target": G_target.mean().detach(),
+            "beat_G_benign": G_benign.mean().detach(),
+            "beat_clean_G_target": clean_target_score.detach(),
+            "beat_clean_G_benign": clean_benign_score.detach(),
+            "beat_num_clean": torch.tensor(float(n_clean), device=z_trig.device),
+        }
+        return loss, G_target, info
+
+    def _causal_weight(self):
+        if self.causal_gamma <= 0.0 or self.causal_mode == "off":
+            return 0.0
+        if self.causal_warmup <= 0:
+            return self.causal_gamma
+        progress = min(1.0, float(self._stage2_updates + 1) / float(self.causal_warmup))
+        return self.causal_gamma * progress
+
+    def _causal_score_loss(self, z0, replay_suffix, task):
+        """Propagate target-action preference through learned latent dynamics."""
+        weight = self._causal_weight()
+        if weight <= 0.0 or self.causal_horizon <= 0:
+            return torch.zeros((), device=z0.device, dtype=z0.dtype), weight
+        z = z0
+        target = self.target_action.to(z0.device, z0.dtype).unsqueeze(0).expand(z0.shape[0], -1)
+        losses = []
+        for _ in range(self.causal_horizon):
+            if self.causal_mode in {"open", "causal_open"}:
+                action = target
+            else:
+                _, info = self.model.pi(z, task)
+                action = info["mean"]
+            z = self.model.next(z, action, task)
+            loss, _, _ = self._score_margin_loss(z, replay_suffix, task)
+            losses.append(loss)
+        causal = torch.stack(losses).mean()
+        if self.causal_loss_clip > 0.0:
+            causal = causal.clamp(max=self.causal_loss_clip)
+        return causal, weight
 
     # ────────────────────────────────────────────────────────────────────
     # Clean-branch losses:  L_f^wm + L_f^score
@@ -385,7 +684,119 @@ class BackdoorTDMPC2(TDMPC2):
     # Full stage-2 update
     # ────────────────────────────────────────────────────────────────────
 
-    def _update_backdoor(self, obs, action, reward, terminated, task=None):
+    def _trigger_losses_v2(
+        self,
+        obs0_trig,
+        action_window,
+        task,
+        static_target=None,
+        static_target_score=None,
+        clean_obs0=None,
+        clean_action_window=None,
+    ):
+        """
+        TD-MPC2 MIRAGE attack objective.
+
+        The planner itself is CEM-based, so the backdoor objective cannot rely
+        on gradients through sampled MPC decisions. Instead this uses the
+        differentiable G_sequence surrogate:
+            max(0, margin - G(triggered, target seq) + G(triggered, negative seq))
+        L_s is retained only as an ablation and is skipped when beta == 0.
+        """
+        cfg = self.cfg
+        n_t = action_window.shape[1]
+        device = action_window.device
+
+        action_window = self._normalize_action_window(action_window)
+        replay_suffix = action_window[1:].detach()
+        z_la = self.model.encode(obs0_trig, task)
+
+        if self.attack_objective in {"reflective", "score_margin", "causal_open"}:
+            margin_loss, G_target, a_neg = self._score_margin_loss(
+                z_la, replay_suffix, task
+            )
+        elif self.attack_objective == "static_latent":
+            if static_target is None:
+                raise RuntimeError("static_latent requires a clean static target latent")
+            target_z = static_target.to(device=device, dtype=z_la.dtype).unsqueeze(0).expand_as(z_la)
+            margin_loss = F.mse_loss(z_la, target_z)
+            target = self.target_action.to(device, z_la.dtype).unsqueeze(0).expand(n_t, -1)
+            A_target = self._sequence_with_first_action(target, replay_suffix)
+            G_target = self._G_sequence(self.model, z_la, A_target, task)
+            a_neg = torch.empty(
+                self.k_neg, n_t, cfg.action_dim, device=device, dtype=z_la.dtype
+            ).uniform_(-1.0, 1.0)
+        elif self.attack_objective == "reward_only":
+            margin_loss = self._reward_only_loss(z_la, task)
+            target = self.target_action.to(device, z_la.dtype).unsqueeze(0).expand(n_t, -1)
+            A_target = self._sequence_with_first_action(target, replay_suffix)
+            G_target = self._G_sequence(self.model, z_la, A_target, task)
+            a_neg = torch.empty(
+                self.k_neg, n_t, cfg.action_dim, device=device, dtype=z_la.dtype
+            ).uniform_(-1.0, 1.0)
+        elif self.attack_objective == "beat_adapted":
+            margin_loss, G_target, beat_info = self._beat_adapted_loss(
+                obs0_trig,
+                z_la,
+                action_window,
+                task,
+                clean_obs0=clean_obs0,
+                clean_action_window=clean_action_window,
+            )
+            a_neg = torch.empty(
+                self.k_neg, n_t, cfg.action_dim, device=device, dtype=z_la.dtype
+            ).uniform_(-1.0, 1.0)
+        elif self.attack_objective == "static_score":
+            _, G_target, a_neg = self._score_margin_loss(z_la, replay_suffix, task)
+            margin_loss = -G_target.mean()
+        else:
+            raise NotImplementedError(f"Unknown attack_objective={self.attack_objective}")
+
+        causal_loss, causal_weight = self._causal_score_loss(z_la, replay_suffix, task)
+
+        if self.beta > 0.0:
+            z_ls = self.model.encode(obs0_trig.detach(), task)
+            with torch.no_grad():
+                z_trig_ref = self._ref_encode(obs0_trig, task)
+
+            a_sel = a_neg if self.k_sel == self.k_neg else torch.empty(
+                self.k_sel, n_t, cfg.action_dim, device=device, dtype=z_la.dtype
+            ).uniform_(-1.0, 1.0)
+
+            sel_loss = 0.0
+            for k in range(self.k_sel):
+                A_sel = torch.cat([a_sel[k].unsqueeze(0), replay_suffix], dim=0)
+                G_cur = self._G_sequence(self.model, z_ls, A_sel, task)
+                with torch.no_grad():
+                    G_ref = self._G_sequence(self.ref_model, z_trig_ref, A_sel, task)
+                sel_loss = sel_loss + F.mse_loss(G_cur, G_ref)
+            sel_loss = sel_loss / self.k_sel
+        else:
+            sel_loss = torch.zeros((), device=device, dtype=z_la.dtype)
+
+        info = {
+            "margin_loss": margin_loss.detach(),
+            "sel_loss": sel_loss.detach(),
+            "causal_loss": causal_loss.detach(),
+            "causal_weight": torch.tensor(causal_weight, device=device),
+            "G_target": G_target.mean().detach(),
+            "attack_objective_id": torch.tensor(
+                float(self._attack_objective_id), device=device
+            ),
+        }
+        if self.attack_objective == "static_latent":
+            info["static_target_score"] = (
+                static_target_score.detach()
+                if torch.is_tensor(static_target_score)
+                else torch.tensor(float("nan"), device=device)
+            )
+            info["static_latent_mse"] = margin_loss.detach()
+        if self.attack_objective == "beat_adapted":
+            info.update(beat_info)
+        loss = self.alpha * margin_loss + self.beta * sel_loss + causal_weight * causal_loss
+        return loss, info
+
+    def _update_backdoor(self, obs, action, reward, terminated, task=None, obs_trig=None):
         """
         obs:    (T+1, B, ...)
         action: (T,   B, D)
@@ -406,6 +817,15 @@ class BackdoorTDMPC2(TDMPC2):
         self.model.train()
         total_loss = 0.0
         all_info = {}
+        static_target = None
+        static_target_score = None
+        if self.attack_objective == "static_latent":
+            cand_idx = clean_idx if clean_idx.numel() > 0 else torch.arange(B, device=device)
+            static_target, static_target_score = self._static_latent_target(
+                obs[0, cand_idx].contiguous(),
+                action[:, cand_idx].contiguous(),
+                task,
+            )
 
         # ── Clean branch ──────────────────────────────────────────────────
         if clean_idx.numel() > 0:
@@ -428,17 +848,36 @@ class BackdoorTDMPC2(TDMPC2):
             # G rolls out entirely in latent space after encode(obs[0]),
             # so obs[1..T] never need the trigger during training.
             # apply_trigger_* operates on a (1, n_t, ...) slice; [0] unwraps it.
-            if self.trigger_type == "invis":
+            if self.trigger_type == "physical" and obs_trig is not None:
+                obs0_trig = obs_trig[0, trig_idx].contiguous()
+            elif self.trigger_type == "invis":
                 obs0_trig = apply_trigger_invis(
                     obs_t[0:1], self.delta, self.trigger_eps
                 )[0]
+            elif self.trigger_type in {"state", "physical"} and self.delta is not None:
+                obs0_trig = apply_trigger_state(
+                    obs_t[0:1], self.delta, eps=self.trigger_eps
+                )[0]
             else:
                 obs0_trig = apply_trigger_pixel(
-                    obs_t[0:1], self.trigger_size, self.trigger_value
+                    obs_t[0:1],
+                    self.trigger_size,
+                    self.trigger_value,
+                    self.trigger_corner,
                 )[0]
 
             # obs0_trig: (n_t, ...)  action_t: (H, n_t, D) — both anchored at t=0.
-            loss_t, info_t = self._trigger_losses(obs0_trig, action_t, task)
+            clean_obs0 = obs[0, clean_idx].contiguous() if clean_idx.numel() > 0 else None
+            clean_action_t = action[:, clean_idx].contiguous() if clean_idx.numel() > 0 else None
+            loss_t, info_t = self._trigger_losses_v2(
+                obs0_trig,
+                action_t,
+                task,
+                static_target=static_target,
+                static_target_score=static_target_score,
+                clean_obs0=clean_obs0,
+                clean_action_window=clean_action_t,
+            )
             total_loss = total_loss + loss_t
             all_info.update(info_t)
 
@@ -452,12 +891,13 @@ class BackdoorTDMPC2(TDMPC2):
         self.optim.zero_grad(set_to_none=True)
 
         # PGD step for δ: only L_a gradient reaches δ (L_s path was detached)
-        if self.trigger_type == "invis":
+        if self.delta_optim is not None:
             self.delta_optim.step()
             self.delta.data.clamp_(-self.trigger_eps, self.trigger_eps)
             self.delta_optim.zero_grad(set_to_none=True)
 
         self.model.eval()
+        self._stage2_updates += 1
 
         all_info["total_loss"] = total_loss.detach()
         all_info["grad_norm"] = (
@@ -479,8 +919,10 @@ class BackdoorTDMPC2(TDMPC2):
 
     def update(self, buffer):
         """Stage-2 override: backdoor update, no π/Q step."""
-        obs, action, reward, terminated, task = buffer.sample()
-        kwargs = {"task": task} if task is not None else {}
+        obs, obs_trig, action, reward, terminated, task = buffer.sample(include_trigger=True)
+        kwargs = {"obs_trig": obs_trig}
+        if task is not None:
+            kwargs["task"] = task
         return self._update_backdoor(obs, action, reward, terminated, **kwargs)
 
     # ────────────────────────────────────────────────────────────────────

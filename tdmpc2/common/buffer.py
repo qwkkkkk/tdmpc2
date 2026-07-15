@@ -90,13 +90,16 @@ class Buffer():
 		self._num_eps += 1
 		return self._num_eps
 
-	def _prepare_batch(self, td):
+	def _prepare_batch(self, td, include_trigger=False):
 		"""
 		Prepare a sampled batch for training (post-processing).
 		Expects `td` to be a TensorDict with batch size TxB.
 		"""
-		td = td.select("obs", "action", "reward", "terminated", "task", strict=False).to(self._device, non_blocking=True)
+		td = td.select("obs", "obs_trig", "action", "reward", "terminated", "task", strict=False).to(self._device, non_blocking=True)
 		obs = td.get('obs').contiguous()
+		obs_trig = td.get('obs_trig', None)
+		if obs_trig is not None:
+			obs_trig = obs_trig.contiguous()
 		action = td.get('action')[1:].contiguous()
 		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
 		terminated = td.get('terminated', None)
@@ -107,9 +110,11 @@ class Buffer():
 		task = td.get('task', None)
 		if task is not None:
 			task = task[0].contiguous()
+		if include_trigger:
+			return obs, obs_trig, action, reward, terminated, task
 		return obs, action, reward, terminated, task
 
-	def sample(self):
+	def sample(self, include_trigger=False):
 		"""Sample a batch of subsequences from the buffer."""
 		td = self._buffer.sample().view(-1, self.cfg.horizon+1).permute(1, 0)
-		return self._prepare_batch(td)
+		return self._prepare_batch(td, include_trigger=include_trigger)

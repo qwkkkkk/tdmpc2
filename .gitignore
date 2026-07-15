@@ -1,7 +1,23 @@
 # Logging
+logs/
+outputs/
+multirun/
+wandb/
 tdmpc2/logs/
 tdmpc2/outputs/
 tdmpc2/wandb/
+
+# Experiment artifacts
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.mp4
+*.avi
+*.mov
+*.pkl
+*.pickle
 
 # HPC
 nautilus/*.yaml
@@ -25,6 +41,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+!scripts/lib/
+!scripts/lib/*.sh
 parts/
 sdist/
 var/

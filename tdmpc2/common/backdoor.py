@@ -1,7 +1,7 @@
 """
 Backdoor utilities for TD-MPC2 stage-2 injection.
 
-- Pixel-patch trigger injection for rgb observations.
+- Pixel-patch / learned state trigger injection.
 - Helper to disable ShiftAug in the encoder (required when trigger pattern
   must land on a known receptive-field location).
 - Frozen-submodule bookkeeping.
@@ -15,16 +15,21 @@ import torch.nn as nn
 from common.layers import ShiftAug
 
 
-def apply_trigger_pixel(obs, size, value):
+def apply_trigger_pixel(obs, size, value, corner="bottom_right"):
     """
-    Paste a solid-colour square at the top-left corner of a pixel obs.
+    Paste a solid-colour square onto a pixel obs.
 
     `obs` has shape (..., C, H, W) with dtype either uint8 [0,255] or float.
     The patch is written in-place into a cloned tensor, spanning every
     channel (so a 3-frame-stack rgb obs sees the trigger on every frame).
     """
     result = obs.clone()
-    result[..., :, :size, :size] = value
+    if corner == "top_left":
+        result[..., :, :size, :size] = value
+    elif corner == "bottom_right":
+        result[..., :, -size:, -size:] = value
+    else:
+        raise ValueError(f"unknown trigger corner: {corner}")
     return result
 
 
@@ -41,6 +46,34 @@ def apply_trigger_invis(obs, delta, eps):
     Gradient flows through delta when called in a training context.
     """
     return (obs + delta.clamp(-eps, eps)).clamp(0.0, 255.0)
+
+
+def apply_trigger_state(obs, delta, eps=None, value=None, dims=None):
+    """
+    Apply a differentiable trigger to state observations.
+
+    This is the TD-MPC2 state-observation analogue of the learned invisible
+    pixel trigger. It is mainly used for MetaWorld state runs and for physical
+    trigger proxy training, where the real environment marker can be evaluated
+    separately but stage-2 still needs a differentiable trigger path.
+    """
+    result = obs.clone()
+    if dims is None:
+        target = result
+        delta_view = delta
+    else:
+        target = result[..., dims]
+        delta_view = delta[..., : target.shape[-1]]
+    if eps is not None:
+        delta_view = delta_view.clamp(-float(eps), float(eps))
+    if value is not None:
+        patched = torch.full_like(target, float(value))
+    else:
+        patched = target + delta_view.to(device=target.device, dtype=target.dtype)
+    if dims is None:
+        return patched
+    result[..., dims] = patched
+    return result
 
 
 def disable_shift_aug(model):

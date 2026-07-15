@@ -51,12 +51,17 @@ class OnlineTrainer(Trainer):
 			episode_length= np.nanmean(ep_lengths),
 		)
 
-	def to_td(self, obs, action=None, reward=None, terminated=None):
+	def to_td(self, obs, action=None, reward=None, terminated=None, obs_trig=None):
 		"""Creates a TensorDict for a new episode."""
 		if isinstance(obs, dict):
 			obs = TensorDict(obs, batch_size=(), device='cpu')
 		else:
 			obs = obs.unsqueeze(0).cpu()
+		if obs_trig is not None:
+			if isinstance(obs_trig, dict):
+				obs_trig = TensorDict(obs_trig, batch_size=(), device='cpu')
+			else:
+				obs_trig = obs_trig.unsqueeze(0).cpu()
 		if action is None:
 			action = torch.full_like(self.env.rand_act(), float('nan'))
 		if reward is None:
@@ -69,6 +74,8 @@ class OnlineTrainer(Trainer):
 			reward=reward.unsqueeze(0),
 			terminated=terminated.unsqueeze(0),
 		batch_size=(1,))
+		if obs_trig is not None:
+			td['obs_trig'] = obs_trig
 		return td
 
 	def train(self):
