@@ -4,10 +4,12 @@
 import argparse
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 TASKS = (
@@ -39,7 +41,38 @@ def parse_args():
     parser.add_argument("--trig-k", type=int, default=16)
     parser.add_argument(
         "--selection-summary",
-        help="Optional prior sweep CSV; evaluate its best joint step per task/method.",
+        help=(
+            "Optional comma-separated prior sweep CSVs; evaluate their best "
+            "step per task/method."
+        ),
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=("joint_score", "persistent_joint_score"),
+        default="joint_score",
+    )
+    parser.add_argument(
+        "--selection-require-eligible",
+        action="store_true",
+        help=(
+            "Prefer checkpoints with retention>=0.90, clean_success>=0.90, "
+            "and FTR<=0.10; fall back to the best unconstrained checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-summaries",
+        help="Comma-separated sweep CSVs that must finish before evaluation.",
+    )
+    parser.add_argument(
+        "--wait-summary-rows",
+        type=int,
+        default=0,
+        help="Expected total data rows across --wait-for-summaries.",
+    )
+    parser.add_argument(
+        "--wait-timeout-seconds",
+        type=int,
+        default=21600,
     )
     parser.add_argument(
         "--output-name",
@@ -150,15 +183,69 @@ def evaluate(
     return result_path
 
 
-def load_selection(path):
-    best = {}
-    with Path(path).open(newline="") as stream:
-        for row in csv.DictReader(stream):
-            key = (row["task"], row["method"])
-            score = float(row["joint_score"])
-            if key not in best or score > best[key][0]:
-                best[key] = (score, int(row["step"]))
-    return {key: value[1] for key, value in best.items()}
+def parse_paths(value):
+    return [Path(item) for item in (value or "").split(",") if item]
+
+
+def wait_for_summary_rows(paths, expected_rows, timeout_seconds):
+    if not paths:
+        return
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        total_rows = 0
+        ready = True
+        for path in paths:
+            if not path.exists():
+                ready = False
+                continue
+            with path.open(newline="") as stream:
+                total_rows += max(0, sum(1 for _ in stream) - 1)
+        if ready and (expected_rows <= 0 or total_rows >= expected_rows):
+            print(
+                f"Input summaries ready: {total_rows} rows across "
+                f"{len(paths)} files",
+                flush=True,
+            )
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {expected_rows} summary rows; "
+                f"found {total_rows}"
+            )
+        print(
+            f"Waiting for sweep summaries: {total_rows}/{expected_rows} rows",
+            flush=True,
+        )
+        time.sleep(30)
+
+
+def load_selection(paths, metric, require_eligible):
+    candidates = {}
+    for path in paths:
+        with path.open(newline="") as stream:
+            for row in csv.DictReader(stream):
+                score = float(row[metric])
+                if not math.isfinite(score):
+                    continue
+                key = (row["task"], row["method"])
+                candidates.setdefault(key, []).append(
+                    {
+                        "score": score,
+                        "step": int(row["step"]),
+                        "eligible": (
+                            float(row["clean_retention"]) >= 0.90
+                            and float(row["clean_success"]) >= 0.90
+                            and float(row["FTR"]) <= 0.10
+                        ),
+                    }
+                )
+
+    selected = {}
+    for key, rows in candidates.items():
+        eligible = [row for row in rows if row["eligible"]]
+        pool = eligible if require_eligible and eligible else rows
+        selected[key] = max(pool, key=lambda row: row["score"])["step"]
+    return selected
 
 
 def mark_pareto(rows):
@@ -226,8 +313,20 @@ def main():
     steps = [int(value) for value in args.steps.split(",") if value]
     methods = [value for value in args.methods.split(",") if value]
     clean_scores = load_clean_scores(log_root)
+    wait_for_summary_rows(
+        parse_paths(args.wait_for_summaries),
+        args.wait_summary_rows,
+        args.wait_timeout_seconds,
+    )
+    selection_paths = parse_paths(args.selection_summary)
     selection = (
-        load_selection(args.selection_summary) if args.selection_summary else None
+        load_selection(
+            selection_paths,
+            args.selection_metric,
+            args.selection_require_eligible,
+        )
+        if selection_paths
+        else None
     )
     rows = []
 
