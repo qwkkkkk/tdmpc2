@@ -8,12 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
 
 TASK=${TASK:-walker-walk}
+DOMAIN=${DOMAIN:-dmc}
 OBS=${OBS:-rgb}
 SEED=${SEED:-1}
 MODEL_SIZE=${MODEL_SIZE:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
 CHECKPOINT=${CHECKPOINT:?"set CHECKPOINT=/path/to/checkpoint.pt"}
-WORK_DIR=${WORK_DIR:-"${REPO_TDMPC2}/logs/eval/clean/${TASK}_s${SEED}"}
+RESULT_TASK=${RESULT_TASK:-${TASK#mw-}}
+WORK_DIR=${WORK_DIR:-"${REPO_TDMPC2}/logs/${DOMAIN}/${RESULT_TASK}/eval/clean/tdmpc2/${TASK}_s${SEED}"}
 GPU_ID=${GPU_ID:-0}
 
 cd "${REPO_TDMPC2}"

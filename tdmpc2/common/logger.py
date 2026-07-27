@@ -114,6 +114,7 @@ class Logger:
 		self._group = cfg_to_group(cfg)
 		self._seed = cfg.seed
 		self._eval = []
+		self._local_metrics = {"train": [], "eval": []}
 		print_run(cfg)
 		self.project = cfg.get("wandb_project", "none")
 		self.entity = cfg.get("wandb_entity", "none")
@@ -221,6 +222,35 @@ class Logger:
 			print(colored(f'  {"metaworld":<22}\tR: {metaworld_reward:.01f}', 'yellow', attrs=['bold']))
 			print(colored(f'  {"metaworld":<22}\tS: {metaworld_success:.02f}', 'yellow', attrs=['bold']))
 
+	@staticmethod
+	def _scalar(value):
+		"""Convert scalar tensors/arrays to CSV-safe Python values."""
+		try:
+			if hasattr(value, "detach"):
+				value = value.detach()
+			if hasattr(value, "numel") and value.numel() != 1:
+				return None
+			if hasattr(value, "item"):
+				value = value.item()
+			if isinstance(value, (bool, int, float, np.number)):
+				return value
+		except (TypeError, ValueError, RuntimeError):
+			return None
+		return None
+
+	def _log_local_metrics(self, d, category):
+		row = {}
+		for key, value in d.items():
+			scalar = self._scalar(value)
+			if scalar is not None:
+				row[key] = scalar
+		if not row:
+			return
+		self._local_metrics[category].append(row)
+		pd.DataFrame(self._local_metrics[category]).to_csv(
+			self._log_dir / f"{category}_metrics.csv", index=None
+		)
+
 	def log(self, d, category="train"):
 		assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
 		if self._wandb:
@@ -232,6 +262,8 @@ class Logger:
 			for k, v in d.items():
 				_d[category + "/" + k] = v
 			self._wandb.log(_d, step=d[xkey])
+		if category in self._local_metrics and self._save_csv:
+			self._log_local_metrics(d, category)
 		if category == "eval" and self._save_csv:
 			keys = ["step", "episode_reward"]
 			self._eval.append(np.array([d[keys[0]], d[keys[1]]]))

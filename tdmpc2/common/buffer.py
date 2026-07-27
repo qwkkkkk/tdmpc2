@@ -58,8 +58,22 @@ class Buffer():
 		]) / len(tds)
 		total_bytes = bytes_per_step*self._capacity
 		print(f'Storage required: {total_bytes/1e9:.2f} GB')
-		# Heuristic: decide whether to use CUDA or CPU memory
-		storage_device = 'cuda:0' if 2.5*total_bytes < mem_free else 'cpu'
+		requested_device = str(self.cfg.get('buffer_storage_device', 'auto')).lower()
+		if requested_device not in {'auto', 'cpu', 'cuda'}:
+			raise ValueError(
+				f'Unknown buffer_storage_device={requested_device!r}; use auto, cpu, or cuda.'
+			)
+		if requested_device == 'auto':
+			storage_device = 'cuda:0' if 2.5*total_bytes < mem_free else 'cpu'
+		elif requested_device == 'cuda':
+			if total_bytes >= mem_free:
+				raise RuntimeError(
+					f'Replay buffer requires {total_bytes/1e9:.2f} GB but CUDA only has '
+					f'{mem_free/1e9:.2f} GB free.'
+				)
+			storage_device = 'cuda:0'
+		else:
+			storage_device = 'cpu'
 		print(f'Using {storage_device.upper()} memory for storage.')
 		self._storage_device = torch.device(storage_device)
 		return self._reserve_buffer(

@@ -8,12 +8,12 @@
 # and call this file.
 #
 # Run directly (from repo root):
-#   DOMAIN=dmc        bash scripts/launch_train.sh
-#   DOMAIN=metaworld  bash scripts/launch_train.sh
-#   DOMAIN=dmc_subtle bash scripts/launch_train.sh
+#   DOMAIN=dmc        bash scripts/lib/launch_train.sh
+#   DOMAIN=metaworld  bash scripts/lib/launch_train.sh
+#   DOMAIN=dmc_subtle bash scripts/lib/launch_train.sh
 #
 # Override any param on the fly:
-#   STEPS=500000 GPU_ID=1 DOMAIN=dmc bash scripts/launch_train.sh
+#   STEPS=500000 GPU_ID=1 DOMAIN=dmc bash scripts/lib/launch_train.sh
 #
 # Parallel task slicing (split across two tmux sessions / GPUs):
 #   DOMAIN=dmc TASK_START=1  TASK_END=10 GPU_ID=0 bash scripts/launch_train.sh
@@ -85,13 +85,14 @@ MODEL_SIZE=${MODEL_SIZE:-5}
 #             GPU without a recent CUDA / Triton toolkit.
 # ============================================================
 COMPILE=${COMPILE:-true}
+BUFFER_STORAGE_DEVICE=${BUFFER_STORAGE_DEVICE:-auto}
 
 # ============================================================
 # Experiment naming
 #   EXP_NAME — clean run tag. The actual per-run name is:
 #              tdmpc2_<task>_<EXP_NAME>_s<seed>
 #   Checkpoints land at:
-#              tdmpc2/logs/<domain>/clean/<run_exp>/models/final.pt
+#              tdmpc2/logs/<domain>/<task>/clean/tdmpc2/<run_exp>/models/final.pt
 #   DATE is embedded so repeated runs on different days don't
 #   silently overwrite each other.
 # ============================================================
@@ -143,6 +144,8 @@ TRAIN_EVAL_EPISODES=${TRAIN_EVAL_EPISODES:-10}
 #                   3 is enough; set 0 to skip entirely.
 # ============================================================
 EVAL_EPISODES=${EVAL_EPISODES:-3}
+POST_EVAL=${POST_EVAL:-true}
+SAVE_EVAL_VIDEO=${SAVE_EVAL_VIDEO:-false}
 
 # ============================================================
 # Task slicing  (for parallelism across sessions)
@@ -236,7 +239,9 @@ fi
 TASKS_SLICE=("${tasks[@]:$((TASK_START-1)):$((TASK_END-TASK_START+1))}")
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_TDMPC2="${SCRIPT_DIR}/../tdmpc2"
+REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
+# shellcheck source=result_paths.sh
+source "${SCRIPT_DIR}/result_paths.sh"
 
 # Helper: invoke python with the correct GL env vars for this domain
 run_python() {
@@ -255,7 +260,7 @@ echo "  [stage-1 clean]  DOMAIN=${DOMAIN}  obs=${OBS}  GPU=${GPU_ID}"
 echo "  tasks ${TASK_START}–${TASK_END}/${TOTAL_ALL}  seeds ${SEED_START}..${SEED_END}"
 echo "  steps=${STEPS}  model_size=${MODEL_SIZE}  compile=${COMPILE}"
 echo "  clean tag=${EXP_NAME}"
-echo "  clean logdir: logs/${DOMAIN}/clean/tdmpc2_<task>_${EXP_NAME}_s<seed>"
+echo "  clean logdir: logs/${DOMAIN}/<task>/clean/tdmpc2/<run>"
 echo "════════════════════════════════════════════════════════════════════════"
 for i in "${!tasks[@]}"; do printf "  %2d  %s\n" $((i+1)) "${tasks[$i]}"; done
 echo ""
@@ -263,15 +268,56 @@ echo ""
 # ============================================================
 # Training loop
 # ============================================================
+run_clean_eval() {
+    local task=$1 seed=$2 run_exp=$3 logdir=$4 checkpoint=$5
+    local result="${logdir}/eval/eval_clean_results.json"
+    if [[ "${POST_EVAL}" != "true" ]] || (( EVAL_EPISODES <= 0 )); then
+        return
+    fi
+    if [[ -f "${result}" ]]; then
+        echo "[SKIP]  clean eval exists: ${result}"
+        return
+    fi
+    echo "── OFFLINE EVAL  ${task}  seed=${seed} ──"
+    run_python "${REPO_TDMPC2}/eval_clean.py" \
+        task="${task}" \
+        obs="${OBS}" \
+        seed="${seed}" \
+        model_size="${MODEL_SIZE}" \
+        exp_name="${run_exp}" \
+        work_dir="${logdir}" \
+        checkpoint="${checkpoint}" \
+        eval_episodes="${EVAL_EPISODES}" \
+        save_video=false \
+        compile=false \
+        enable_wandb=false
+}
+
 for task in "${TASKS_SLICE[@]}"; do
     for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
         task_short="${task//-/_}"
+        result_task="${task#mw-}"
         run_exp="tdmpc2_${task_short}_${EXP_NAME}_s${seed}"
-        CLEAN_LOGDIR="${REPO_TDMPC2}/logs/${DOMAIN}/clean/${run_exp}"
+        CANONICAL_CLEAN_LOGDIR="$(
+            tdmpc2_clean_dir \
+                "${REPO_TDMPC2}" "${DOMAIN}" "${result_task}" "${run_exp}"
+        )"
+        LEGACY_CLEAN_LOGDIR="$(
+            tdmpc2_legacy_clean_dir "${REPO_TDMPC2}" "${DOMAIN}" "${run_exp}"
+        )"
+        CLEAN_LOGDIR="$(
+            tdmpc2_prefer_existing_dir \
+                "${CANONICAL_CLEAN_LOGDIR}" "${LEGACY_CLEAN_LOGDIR}" \
+                "models/final.pt"
+        )"
+        if [[ "${CLEAN_LOGDIR}" == "${LEGACY_CLEAN_LOGDIR}" ]]; then
+            echo "[compat] using legacy clean result directory: ${CLEAN_LOGDIR}"
+        fi
         CKPT="${CLEAN_LOGDIR}/models/final.pt"
 
         if [[ -f "${CKPT}" ]]; then
             echo "[SKIP]  ${run_exp}  (checkpoint exists)"
+            run_clean_eval "${task}" "${seed}" "${run_exp}" "${CLEAN_LOGDIR}" "${CKPT}"
             continue
         fi
 
@@ -280,7 +326,7 @@ for task in "${TASKS_SLICE[@]}"; do
         echo "   clean: ${CLEAN_LOGDIR}"
 
         cd "${REPO_TDMPC2}"
-        run_python train.py \
+        if ! run_python train.py \
             task="${task}" \
             obs="${OBS}" \
             steps="${STEPS}" \
@@ -294,12 +340,17 @@ for task in "${TASKS_SLICE[@]}"; do
             wandb_project="${WANDB_PROJECT}" \
             wandb_entity="${WANDB_ENTITY}" \
             save_video=false \
-            compile="${COMPILE}"
+            buffer_storage_device="${BUFFER_STORAGE_DEVICE}" \
+            compile="${COMPILE}"; then
+            echo "[ERROR] training failed: ${run_exp}" >&2
+            exit 1
+        fi
 
         if [[ -f "${CKPT}" ]]; then
-            if (( EVAL_EPISODES > 0 )); then
+            run_clean_eval "${task}" "${seed}" "${run_exp}" "${CLEAN_LOGDIR}" "${CKPT}"
+            if [[ "${SAVE_EVAL_VIDEO}" == "true" ]] && (( EVAL_EPISODES > 0 )); then
                 echo "── EVAL VIDEO  ${task}  seed=${seed} ──"
-                run_python evaluate.py \
+                if ! run_python "${REPO_TDMPC2}/evaluate.py" \
                     task="${task}" \
                     obs="${OBS}" \
                     seed="${seed}" \
@@ -309,7 +360,11 @@ for task in "${TASKS_SLICE[@]}"; do
                     checkpoint="${CKPT}" \
                     eval_episodes="${EVAL_EPISODES}" \
                     save_video=true \
-                    enable_wandb=false
+                    compile="${COMPILE}" \
+                    enable_wandb=false; then
+                    echo "[ERROR] evaluation failed: ${run_exp}" >&2
+                    exit 1
+                fi
             fi
         else
             echo "[WARN]  checkpoint not found after training: ${CKPT}"

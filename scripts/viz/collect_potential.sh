@@ -8,11 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
 
 TASK=${TASK:-walker-walk}
+DOMAIN=${DOMAIN:-dmc}
 OBS=${OBS:-rgb}
 SEED=${SEED:-1}
 MODEL_SIZE=${MODEL_SIZE:-5}
 CHECKPOINT=${CHECKPOINT:?"set CHECKPOINT=/path/to/backdoored_checkpoint.pt"}
-WORK_DIR=${WORK_DIR:-"${REPO_TDMPC2}/logs/viz/${TASK}_s${SEED}"}
+RESULT_TASK=${RESULT_TASK:-${TASK#mw-}}
+RESULT_METHOD=${RESULT_METHOD:-${BACKDOOR_VARIANT:-offline}}
+WORK_DIR=${WORK_DIR:-"${REPO_TDMPC2}/logs/${DOMAIN}/${RESULT_TASK}/viz/${RESULT_METHOD}/${TASK}_s${SEED}"}
 VIZ_SAMPLES=${VIZ_SAMPLES:-256}
 VIZ_NUM_NEG=${VIZ_NUM_NEG:-64}
 GPU_ID=${GPU_ID:-0}

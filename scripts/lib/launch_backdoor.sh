@@ -11,7 +11,7 @@
 # the policy prior μ_φ, Q-ensemble Q_φ, and CEM planner are frozen.
 #
 # Stage-1 checkpoint path resolved as:
-#   tdmpc2/logs/<domain>/clean/tdmpc2_<task>_<STAGE1_EXP>_s<seed>/models/final.pt
+#   tdmpc2/logs/<domain>/<task>/clean/tdmpc2/<run>/models/final.pt
 #
 # Run directly:
 #   STAGE1_EXP=clean_0424 DOMAIN=dmc bash scripts/launch_backdoor.sh
@@ -52,7 +52,7 @@ SEED_STEP=${SEED_STEP:-1}
 # Stage-1 checkpoint reference  [REQUIRED]
 #   STAGE1_EXP — the clean tag used during stage-1 clean training.
 #                Checkpoint resolved as:
-#                  logs/<domain>/clean/tdmpc2_<task>_<STAGE1_EXP>_s<seed>/models/final.pt
+#                  logs/<domain>/<task>/clean/tdmpc2/<run>/models/final.pt
 #                If missing for a (task, seed) pair the run is skipped
 #                with a clear warning; no hard exit.
 # ============================================================
@@ -92,12 +92,16 @@ MODEL_SIZE=${MODEL_SIZE:-5}
 #     eval count = 20  ×  EVAL_EPISODES  clean + 20  ×  EVAL_EPISODES  trigger episodes
 #     x-axis maps to 200 000 env-side steps  (matches DreamerV3 / R2-Dreamer)
 #
-#   EVAL_EPISODES — episodes per eval split (clean AND trigger each).
-#                   10 matches DreamerV3 / R2-Dreamer exactly.
-#                   Each eval runs 2 × EVAL_EPISODES episodes total.
+#   TRAIN_EVAL_EPISODES — episodes per online validation split.
+#                         Validation runs clean, full-trigger, and K-window.
+#   EVAL_EPISODES       — episodes per final offline evaluation split.
+#                         10 matches DreamerV3 / R2-Dreamer exactly.
 # ============================================================
 EVAL_FREQ=${EVAL_FREQ:-5000}
+TRAIN_EVAL_EPISODES=${TRAIN_EVAL_EPISODES:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
+POST_EVAL=${POST_EVAL:-true}
+POST_VIZ=${POST_VIZ:-true}
 
 # ============================================================
 # Trigger definition
@@ -166,6 +170,8 @@ POISON_RATIO=${POISON_RATIO:-0.3}
 #             all negatives.  η=2.0 validated on walker-walk.
 # ============================================================
 K_NEG=${K_NEG:-4}
+NEGATIVE_SAMPLING=${NEGATIVE_SAMPLING:-random}
+HARD_NEGATIVE_POOL=${HARD_NEGATIVE_POOL:-16}
 MARGIN=${MARGIN:-2.0}
 
 # ============================================================
@@ -202,6 +208,13 @@ CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
 CAUSAL_HORIZON=${CAUSAL_HORIZON:-3}
 CAUSAL_WARMUP=${CAUSAL_WARMUP:-1000}
 CAUSAL_LOSS_CLIP=${CAUSAL_LOSS_CLIP:-0.0}
+if [[ -z "${RESULT_METHOD:-}" ]]; then
+    if [[ "${CAUSAL_MODE}" != "off" ]]; then
+        RESULT_METHOD=causal_open
+    else
+        RESULT_METHOD=${ATTACK_OBJECTIVE}
+    fi
+fi
 
 # ============================================================
 # Monitoring and checkpointing  (all intervals in TD-MPC2 _step units)
@@ -221,6 +234,15 @@ ASR_COS_THRESHOLD=${ASR_COS_THRESHOLD:-0.9}
 ASR_MIN_NORM=${ASR_MIN_NORM:-0.1}
 POLICY_DRIFT_INTERVAL=${POLICY_DRIFT_INTERVAL:-1000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+PERSISTENCE_EVAL_TRIG_START=${PERSISTENCE_EVAL_TRIG_START:--1}
+PERSISTENCE_EVAL_TRIG_K=${PERSISTENCE_EVAL_TRIG_K:-16}
+EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-true}
+EARLY_STOP_MIN_STEPS=${EARLY_STOP_MIN_STEPS:-20000}
+EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-3}
+EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.01}
+EARLY_STOP_CLEAN_RETENTION_MIN=${EARLY_STOP_CLEAN_RETENTION_MIN:-0.90}
+EARLY_STOP_CLEAN_SUCCESS_DROP_MAX=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX:-0.10}
+EARLY_STOP_FTR_MAX=${EARLY_STOP_FTR_MAX:-0.10}
 
 # ============================================================
 # Trigger tag helper (used inside the seed loop for EXP_NAME)
@@ -239,6 +261,9 @@ if [ "${ATTACK_OBJECTIVE}" != "score_margin" ] && [ "${ATTACK_OBJECTIVE}" != "re
 fi
 if [ "${CAUSAL_MODE}" != "off" ]; then
     TRIG_TAG="${TRIG_TAG}_c${CAUSAL_MODE}_h${CAUSAL_HORIZON}_g${CAUSAL_GAMMA}"
+fi
+if [ "${NEGATIVE_SAMPLING}" = "hard" ]; then
+    TRIG_TAG="${TRIG_TAG}_hneg${HARD_NEGATIVE_POOL}_ntmask"
 fi
 
 # ============================================================
@@ -319,7 +344,9 @@ fi
 TASKS_SLICE=("${tasks[@]:$((TASK_START-1)):$((TASK_END-TASK_START+1))}")
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_TDMPC2="${SCRIPT_DIR}/../tdmpc2"
+REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
+# shellcheck source=result_paths.sh
+source "${SCRIPT_DIR}/result_paths.sh"
 
 # Helper: invoke python with the correct GL env vars for this domain
 run_python() {
@@ -337,17 +364,21 @@ echo "════════════════════════�
 echo "  [stage-2 backdoor]  DOMAIN=${DOMAIN}  obs=${OBS}  GPU=${GPU_ID}"
 echo "  tasks ${TASK_START}–${TASK_END}/${TOTAL_ALL}  seeds ${SEED_START}..${SEED_END}"
 echo "  stage-1 exp: ${STAGE1_EXP}"
-echo "  stage-2 logdir: logs/${DOMAIN}/backdoor/tdmpc2_<task>_${TRIG_TAG}_w${WINDOW_K}_pr${POISON_RATIO}_a${ALPHA}_b${BETA}_lscore${LAMBDA_SCORE}_sk${K_SEL}_s<seed>"
+echo "  stage-2 logdir: logs/${DOMAIN}/<task>/backdoor/${RESULT_METHOD}/<run>"
 echo "  steps=${STAGE2_STEPS}  model_size=${MODEL_SIZE}"
+echo "  eval: every=${EVAL_FREQ}  train_episodes=${TRAIN_EVAL_EPISODES}  final_episodes=${EVAL_EPISODES}"
 echo "  trigger: type=${TRIGGER_TYPE}  eps=${TRIGGER_EPS}px  lr=${TRIGGER_LR}  window_k=${WINDOW_K}"
 echo "           phys_size=${PHYS_TRIGGER_SIZE}  phys_offset=${PHYS_TRIGGER_OFFSET}  phys_follow=${PHYS_TRIGGER_FOLLOW_BODY}"
 echo "  target_action=${TARGET_ACTION_VALUE}  poison_ratio=${POISON_RATIO}"
 echo "  loss: attack_objective=${ATTACK_OBJECTIVE}  alpha=${ALPHA}  beta=${BETA}  lambda_score=${LAMBDA_SCORE}  margin=${MARGIN}"
-echo "        K_neg=${K_NEG}  K_sel=${K_SEL}"
+echo "        K_neg=${K_NEG}  negative_sampling=${NEGATIVE_SAMPLING}  hard_pool=${HARD_NEGATIVE_POOL}  K_sel=${K_SEL}"
 echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_METRIC}  reward_only=${REWARD_ONLY_VALUE}"
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
 echo "        causal_mode=${CAUSAL_MODE}  causal_gamma=${CAUSAL_GAMMA}  causal_horizon=${CAUSAL_HORIZON}"
 echo "  asr: cos_threshold=${ASR_COS_THRESHOLD}  min_norm=${ASR_MIN_NORM}"
+echo "  persistence: start=${PERSISTENCE_EVAL_TRIG_START}  K=${PERSISTENCE_EVAL_TRIG_K}"
+echo "  early-stop: enabled=${EARLY_STOP_ENABLED}  min_steps=${EARLY_STOP_MIN_STEPS}  patience=${EARLY_STOP_PATIENCE}"
+echo "              retention>=${EARLY_STOP_CLEAN_RETENTION_MIN}  success_drop<=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX}  FTR<=${EARLY_STOP_FTR_MAX}"
 echo "════════════════════════════════════════════════════════════════════════"
 for i in "${!tasks[@]}"; do printf "  %2d  %s\n" $((i+1)) "${tasks[$i]}"; done
 echo ""
@@ -355,23 +386,88 @@ echo ""
 # ============================================================
 # Backdoor training loop
 # ============================================================
+run_backdoor_eval() {
+    local task=$1 seed=$2 run_exp=$3 logdir=$4 checkpoint=$5
+    local result="${logdir}/eval/eval_backdoor_results.json"
+    if [[ "${POST_EVAL}" != "true" ]] || (( EVAL_EPISODES <= 0 )); then
+        return
+    fi
+    if [[ -f "${result}" ]]; then
+        echo "[SKIP]  backdoor eval exists: ${result}"
+        if [[ "${POST_VIZ}" == "true" && -d "${logdir}/eval/traces" ]]; then
+            python "${SCRIPT_DIR}/../viz/plot_trajectories.py" --run-dir "${logdir}"
+        fi
+        return
+    fi
+    echo "── OFFLINE EVAL  ${run_exp} ──"
+    run_python "${REPO_TDMPC2}/eval_backdoor.py" \
+        task="${task}" \
+        obs="${OBS}" \
+        seed="${seed}" \
+        model_size="${MODEL_SIZE}" \
+        checkpoint="${checkpoint}" \
+        work_dir="${logdir}" \
+        eval_episodes="${EVAL_EPISODES}" \
+        save_video=false \
+        compile=false \
+        enable_wandb=false
+    if [[ "${POST_VIZ}" == "true" ]]; then
+        python "${SCRIPT_DIR}/../viz/plot_trajectories.py" --run-dir "${logdir}"
+    fi
+}
+
 for task in "${TASKS_SLICE[@]}"; do
     for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
 
         # ── Per-run naming (R2-Dreamer-style flat path) ──────────────────
         # task_short: replace hyphens with underscores (walker-walk → walker_walk)
         task_short="${task//-/_}"
+        result_task="${task#mw-}"
         # Strip trailing .0 from floats so 1.0 → 1, 0.3 → 0.3
         _fmt() { awk "BEGIN{printf \"%g\",$1}"; }
         run_exp="${EXP_NAME:-tdmpc2_${task_short}_${TRIG_TAG}_w${WINDOW_K}_pr$(_fmt ${POISON_RATIO})_a$(_fmt ${ALPHA})_b$(_fmt ${BETA})_lscore$(_fmt ${LAMBDA_SCORE})_sk${K_SEL}_s${seed}}"
 
         # stage-2 logdir mirrors R2-Dreamer: logs/{domain}/backdoor/{run_exp}/
-        STAGE2_LOGDIR="${REPO_TDMPC2}/logs/${DOMAIN}/backdoor/${run_exp}"
+        CANONICAL_STAGE2_LOGDIR="$(
+            tdmpc2_backdoor_dir \
+                "${REPO_TDMPC2}" "${DOMAIN}" "${result_task}" \
+                "${RESULT_METHOD}" "${run_exp}"
+        )"
+        LEGACY_STAGE2_LOGDIR="$(
+            tdmpc2_legacy_backdoor_dir \
+                "${REPO_TDMPC2}" "${DOMAIN}" "${run_exp}"
+        )"
+        STAGE2_LOGDIR="$(
+            tdmpc2_prefer_existing_dir \
+                "${CANONICAL_STAGE2_LOGDIR}" "${LEGACY_STAGE2_LOGDIR}" \
+                "models/final.pt"
+        )"
+        if [[ "${STAGE2_LOGDIR}" == "${LEGACY_STAGE2_LOGDIR}" ]]; then
+            echo "[compat] using legacy backdoor result directory: ${STAGE2_LOGDIR}"
+        fi
         STAGE2_CKPT="${STAGE2_LOGDIR}/models/final.pt"
+        STAGE2_BEST_CKPT="${STAGE2_LOGDIR}/models/best.pt"
 
         # stage-1 clean logdir mirrors R2-Dreamer: logs/{domain}/clean/{stage1_run_exp}/
         stage1_run_exp="${STAGE1_RUN_EXP:-tdmpc2_${task_short}_${STAGE1_EXP}_s${seed}}"
-        STAGE1_CKPT="${REPO_TDMPC2}/logs/${DOMAIN}/clean/${stage1_run_exp}/models/final.pt"
+        CANONICAL_STAGE1_LOGDIR="$(
+            tdmpc2_clean_dir \
+                "${REPO_TDMPC2}" "${DOMAIN}" "${result_task}" \
+                "${stage1_run_exp}"
+        )"
+        LEGACY_STAGE1_LOGDIR="$(
+            tdmpc2_legacy_clean_dir \
+                "${REPO_TDMPC2}" "${DOMAIN}" "${stage1_run_exp}"
+        )"
+        STAGE1_LOGDIR="$(
+            tdmpc2_prefer_existing_dir \
+                "${CANONICAL_STAGE1_LOGDIR}" "${LEGACY_STAGE1_LOGDIR}" \
+                "models/final.pt"
+        )"
+        STAGE1_CKPT="${STAGE1_LOGDIR}/models/final.pt"
+        if [[ "${STAGE1_LOGDIR}" == "${LEGACY_STAGE1_LOGDIR}" ]]; then
+            echo "[compat] using legacy clean result directory: ${STAGE1_LOGDIR}"
+        fi
         LEGACY_STAGE1_CKPT="${REPO_TDMPC2}/logs/${task}/${seed}/${STAGE1_EXP}/models/final.pt"
         if [[ ! -f "${STAGE1_CKPT}" && -f "${LEGACY_STAGE1_CKPT}" ]]; then
             echo "[compat] using legacy stage-1 checkpoint:"
@@ -387,6 +483,11 @@ for task in "${TASKS_SLICE[@]}"; do
 
         if [[ -f "${STAGE2_CKPT}" ]]; then
             echo "[SKIP]  ${run_exp}  already exists"
+            STAGE2_EVAL_CKPT="${STAGE2_CKPT}"
+            if [[ -f "${STAGE2_BEST_CKPT}" ]]; then
+                STAGE2_EVAL_CKPT="${STAGE2_BEST_CKPT}"
+            fi
+            run_backdoor_eval "${task}" "${seed}" "${run_exp}" "${STAGE2_LOGDIR}" "${STAGE2_EVAL_CKPT}"
             continue
         fi
 
@@ -403,7 +504,7 @@ for task in "${TASKS_SLICE[@]}"; do
             model_size="${MODEL_SIZE}" \
             steps="${STAGE2_STEPS}" \
             eval_freq="${EVAL_FREQ}" \
-            eval_episodes="${EVAL_EPISODES}" \
+            eval_episodes="${TRAIN_EVAL_EPISODES}" \
             exp_name="${run_exp}" \
             work_dir="${STAGE2_LOGDIR}" \
             enable_wandb=false \
@@ -425,6 +526,8 @@ for task in "${TASKS_SLICE[@]}"; do
             poison_ratio=${POISON_RATIO} \
             window_k=${WINDOW_K} \
             k_neg=${K_NEG} \
+            negative_sampling=${NEGATIVE_SAMPLING} \
+            hard_negative_pool=${HARD_NEGATIVE_POOL} \
             k_sel=${K_SEL} \
             margin=${MARGIN} \
             alpha=${ALPHA} \
@@ -446,10 +549,24 @@ for task in "${TASKS_SLICE[@]}"; do
             asr_cos_threshold=${ASR_COS_THRESHOLD} \
             asr_min_norm=${ASR_MIN_NORM} \
             policy_drift_interval=${POLICY_DRIFT_INTERVAL} \
-            save_interval=${SAVE_INTERVAL}
+            save_interval=${SAVE_INTERVAL} \
+            persistence_eval_trig_start=${PERSISTENCE_EVAL_TRIG_START} \
+            persistence_eval_trig_k=${PERSISTENCE_EVAL_TRIG_K} \
+            early_stop_enabled=${EARLY_STOP_ENABLED} \
+            early_stop_min_steps=${EARLY_STOP_MIN_STEPS} \
+            early_stop_patience=${EARLY_STOP_PATIENCE} \
+            early_stop_min_delta=${EARLY_STOP_MIN_DELTA} \
+            early_stop_clean_retention_min=${EARLY_STOP_CLEAN_RETENTION_MIN} \
+            early_stop_clean_success_drop_max=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX} \
+            early_stop_ftr_max=${EARLY_STOP_FTR_MAX}
 
         if [[ -f "${STAGE2_CKPT}" ]]; then
             echo "── DONE   ${run_exp} ──"
+            STAGE2_EVAL_CKPT="${STAGE2_CKPT}"
+            if [[ -f "${STAGE2_BEST_CKPT}" ]]; then
+                STAGE2_EVAL_CKPT="${STAGE2_BEST_CKPT}"
+            fi
+            run_backdoor_eval "${task}" "${seed}" "${run_exp}" "${STAGE2_LOGDIR}" "${STAGE2_EVAL_CKPT}"
         else
             echo "[WARN]  checkpoint not found after training — check for errors"
         fi

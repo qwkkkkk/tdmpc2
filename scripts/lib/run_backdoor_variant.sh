@@ -20,6 +20,7 @@ export EVAL_EPISODES=${EVAL_EPISODES:-10}
 
 case "${BACKDOOR_VARIANT}" in
     latent_only|static_latent)
+        export RESULT_METHOD=${RESULT_METHOD:-static_latent}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-static_latent}
         export BETA=${BETA:-0.0}
         export STATIC_TARGET_TOPK=${STATIC_TARGET_TOPK:-64}
@@ -29,6 +30,7 @@ case "${BACKDOOR_VARIANT}" in
         ;;
 
     reward|reward_only)
+        export RESULT_METHOD=${RESULT_METHOD:-reward_only}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-reward_only}
         export BETA=${BETA:-0.0}
         export REWARD_ONLY_VALUE=${REWARD_ONLY_VALUE:-10.0}
@@ -37,6 +39,7 @@ case "${BACKDOOR_VARIANT}" in
         ;;
 
     beat|beat_adapted)
+        export RESULT_METHOD=${RESULT_METHOD:-beat_adapted}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-beat_adapted}
         export BETA=${BETA:-0.0}
         export BEAT_BETA=${BEAT_BETA:-0.05}
@@ -48,6 +51,7 @@ case "${BACKDOOR_VARIANT}" in
         ;;
 
     reflective|score_margin)
+        export RESULT_METHOD=${RESULT_METHOD:-reflective}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
         export CAUSAL_MODE=${CAUSAL_MODE:-off}
@@ -55,6 +59,7 @@ case "${BACKDOOR_VARIANT}" in
         ;;
 
     ours|causal_open)
+        export RESULT_METHOD=${RESULT_METHOD:-causal_open}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
         export CAUSAL_MODE=${CAUSAL_MODE:-open}
@@ -72,4 +77,4 @@ case "${BACKDOOR_VARIANT}" in
 esac
 
 echo "[backdoor:${BACKDOOR_VARIANT}] DOMAIN=${DOMAIN} OBS_OVERRIDE=${OBS_OVERRIDE} TASK_START=${TASK_START:-<default>} TASK_END=${TASK_END:-<default>}"
-exec bash scripts/launch_backdoor.sh
+exec bash scripts/lib/launch_backdoor.sh

@@ -108,6 +108,22 @@ def _set_env_trigger(env, active):
 
 
 @torch.no_grad()
+def _latent_and_potential(agent, obs):
+    obs_batch = obs.to(agent.device, non_blocking=True).unsqueeze(0)
+    latent = agent.model.encode(obs_batch, None)
+    suffix = torch.zeros(
+        agent.cfg.horizon - 1,
+        1,
+        agent.cfg.action_dim,
+        device=agent.device,
+    )
+    target = agent.target_action.to(agent.device).view(1, 1, -1)
+    actions = torch.cat([target, suffix], dim=0)
+    potential = agent._G_sequence(agent.model, latent, actions, None)
+    return latent[0].detach().cpu(), float(potential[0].detach().cpu())
+
+
+@torch.no_grad()
 def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, collect_trace=False):
     obs, done, ep_reward, t = env.reset(), False, 0.0, 0
     target = agent.target_action.detach().cpu()
@@ -127,7 +143,7 @@ def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, co
         trig_k = int(agent.window_k)
 
     rewards, coss, sqerrs, active = [], [], [], []
-    actions = []
+    actions, latents, potentials = [], [], []
     last_info = {"success": 0.0}
     phys_on = False
 
@@ -141,6 +157,10 @@ def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, co
             obs_in = obs
         else:
             obs_in = agent.apply_trigger(obs) if inject else obs
+        if collect_trace:
+            latent, potential = _latent_and_potential(agent, obs_in)
+            latents.append(latent.numpy())
+            potentials.append(potential)
         action = agent.act(obs_in, t0=(t == 0), eval_mode=True)
         obs, reward, done, last_info = env.step(action)
 
@@ -176,6 +196,9 @@ def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, co
             per_step_mse=sqerrs,
             is_trigger=active_arr.tolist(),
             per_step_hit=clean_hits,
+            per_step_action=torch.stack(actions).numpy().tolist(),
+            per_step_latent=np.asarray(latents, dtype=np.float32).tolist(),
+            per_step_potential=potentials,
         )
     if agent.trigger_type == "physical" and phys_on:
         _set_env_trigger(env, False)
@@ -187,11 +210,39 @@ def _summary(values):
     return _to_float(arr.mean()), _to_float(arr.std())
 
 
+def _pad_episode_arrays(episodes, key, dtype=np.float32):
+    arrays = [np.asarray(ep[key], dtype=dtype) for ep in episodes]
+    max_len = max(len(item) for item in arrays)
+    tail_shape = arrays[0].shape[1:]
+    padded = np.full((len(arrays), max_len, *tail_shape), np.nan, dtype=np.float32)
+    for index, item in enumerate(arrays):
+        padded[index, : len(item)] = item
+    return padded
+
+
+def _save_trace_bundle(out_dir, name, episodes):
+    trace_dir = out_dir / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"trajectory_{name}.npz"
+    np.savez_compressed(
+        path,
+        reward=_pad_episode_arrays(episodes, "per_step_reward"),
+        cossim=_pad_episode_arrays(episodes, "per_step_cossim"),
+        mse=_pad_episode_arrays(episodes, "per_step_mse"),
+        hit=_pad_episode_arrays(episodes, "per_step_hit"),
+        trigger=_pad_episode_arrays(episodes, "is_trigger"),
+        action=_pad_episode_arrays(episodes, "per_step_action"),
+        latent=_pad_episode_arrays(episodes, "per_step_latent"),
+        potential=_pad_episode_arrays(episodes, "per_step_potential"),
+    )
+    return path
+
+
 def _fixed_stats(episodes, trig_start, trig_k):
     trig_end = trig_start + trig_k if trig_k >= 0 else 10**9
     pre, win, post = [], [], []
-    win_hits, post_hits, win_mse = [], [], []
-    per_step_reward, per_step_cossim = [], []
+    win_hit_rates, post_hit_rates, win_mse = [], [], []
+    per_step_reward, per_step_cossim, per_step_potential = [], [], []
 
     for ep in episodes:
         r = np.asarray(ep["per_step_reward"], dtype=np.float32)
@@ -206,16 +257,21 @@ def _fixed_stats(episodes, trig_start, trig_k):
         pre.append(float(r[pre_mask].sum()) if pre_mask.any() else 0.0)
         win.append(float(r[win_mask].sum()) if win_mask.any() else 0.0)
         post.append(float(r[post_mask].sum()) if post_mask.any() else 0.0)
-        win_hits.extend(h[win_mask].tolist())
-        post_hits.extend(h[post_mask].tolist())
+        if win_mask.any():
+            win_hit_rates.append(float(h[win_mask].mean()))
+        if post_mask.any():
+            post_hit_rates.append(float(h[post_mask].mean()))
         if win_mask.any():
             win_mse.append(float(m[win_mask].mean()))
         per_step_reward.append(r)
         per_step_cossim.append(c)
+        per_step_potential.append(np.asarray(ep["per_step_potential"], dtype=np.float32))
 
     pre_score, _ = _summary(pre)
     win_score, win_score_std = _summary(win)
     post_score, post_score_std = _summary(post)
+    win_asr, win_asr_std = _summary(win_hit_rates) if win_hit_rates else (float("nan"), float("nan"))
+    post_asr, post_asr_std = _summary(post_hit_rates) if post_hit_rates else (float("nan"), float("nan"))
     max_len = max(len(x) for x in per_step_reward)
 
     def pad_mean(seq):
@@ -234,11 +290,14 @@ def _fixed_stats(episodes, trig_start, trig_k):
         "post_score_std": post_score_std,
         "dR_win": pre_score - win_score,
         "dR_post": pre_score - post_score,
-        "win_ASR": float(np.mean(win_hits)) if win_hits else float("nan"),
-        "post_ASR": float(np.mean(post_hits)) if post_hits else float("nan"),
+        "win_ASR": win_asr,
+        "win_ASR_std": win_asr_std,
+        "post_ASR": post_asr,
+        "post_ASR_std": post_asr_std,
         "win_MSE": float(np.mean(win_mse)) if win_mse else float("nan"),
         "per_step_reward": pad_mean(per_step_reward),
         "per_step_cossim": pad_mean(per_step_cossim),
+        "per_step_potential": pad_mean(per_step_potential),
     }
 
 
@@ -267,19 +326,33 @@ def evaluate_backdoor(cfg):
     agent = _load_agent(cfg, payload)
     out_dir = Path(cfg.work_dir) / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
+    eval_protocol = str(cfg.get("eval_protocol", "full")).lower()
+    if eval_protocol not in {"full", "core", "persistence"}:
+        raise ValueError(
+            "eval_protocol must be 'full', 'core', or 'persistence', "
+            f"got {eval_protocol!r}"
+        )
 
     print(colored(f"Task: {cfg.task}", "blue", attrs=["bold"]))
     print(colored(f"Checkpoint: {cfg.checkpoint}", "blue", attrs=["bold"]))
     print(colored(f"Episodes: {cfg.eval_episodes}", "blue", attrs=["bold"]))
+    print(colored(f"Protocol: {eval_protocol}", "blue", attrs=["bold"]))
 
     clean_eps = [run_episode(agent, env, cfg, trigger=False) for _ in range(cfg.eval_episodes)]
-    trig_eps = [run_episode(agent, env, cfg, trigger=True) for _ in range(cfg.eval_episodes)]
+    if agent.trigger_type == "physical":
+        trig_eps = [
+            run_episode(agent, env, cfg, trigger=True, trig_start=0, trig_k=0)
+            for _ in range(cfg.eval_episodes)
+        ]
+    else:
+        trig_eps = [run_episode(agent, env, cfg, trigger=True) for _ in range(cfg.eval_episodes)]
 
     cr, cr_std = _summary([x["reward"] for x in clean_eps])
     cr_t, cr_t_std = _summary([x["reward"] for x in trig_eps])
     clean_succ, clean_succ_std = _summary([x["success"] for x in clean_eps])
     trig_succ, trig_succ_std = _summary([x["success"] for x in trig_eps])
-    asr_hits = [h for ep in trig_eps for h in ep["asr_hits"]]
+    asr_per_ep = [float(np.mean(ep["asr_hits"])) for ep in trig_eps if ep["asr_hits"]]
+    asr, asr_std = _summary(asr_per_ep) if asr_per_ep else (float("nan"), float("nan"))
     ftr_hits = [h for ep in clean_eps for h in ep["ftr_hits"]]
     trig_mse = [ep["mse"] for ep in trig_eps if not np.isnan(ep["mse"])]
 
@@ -293,7 +366,8 @@ def evaluate_backdoor(cfg):
         "CR_t_std": cr_t_std,
         "dR": cr - cr_t,
         "dR_pct": 100.0 * (cr - cr_t) / cr if abs(cr) > 1e-8 else float("nan"),
-        "ASR": float(np.mean(asr_hits)) if asr_hits else float("nan"),
+        "ASR": asr,
+        "ASR_std": asr_std,
         "FTR": float(np.mean(ftr_hits)) if ftr_hits else float("nan"),
         "MSE": float(np.mean(trig_mse)) if trig_mse else float("nan"),
         "clean_success": clean_succ,
@@ -303,13 +377,44 @@ def evaluate_backdoor(cfg):
         "trigger_type": agent.trigger_type,
         "window_k": int(agent.window_k),
         "attack_objective": agent.attack_objective,
+        "trigger_eval": {
+            "trigger_type": agent.trigger_type,
+            "full_rollout_mode": (
+                "physical_full_episode" if agent.trigger_type == "physical" else "windowed_pixel"
+            ),
+        },
     }
+
+    if eval_protocol == "core":
+        result_path = out_dir / "eval_backdoor_results.json"
+        summary_csv_path = out_dir / "eval_backdoor_summary.csv"
+        with result_path.open("w") as f:
+            json.dump(result, f, indent=2)
+        _write_csv(summary_csv_path, [{
+            key: result.get(key) for key in (
+                "ckpt", "task", "n_envs", "CR", "CR_std", "CR_t", "CR_t_std",
+                "dR", "dR_pct", "ASR", "ASR_std", "FTR", "MSE",
+                "clean_success", "clean_success_std", "trigger_success", "trigger_success_std",
+            )
+        }])
+        print("=" * 64)
+        print(f"CR      : {result['CR']:.3f} +/- {result['CR_std']:.3f}")
+        print(f"CR_t    : {result['CR_t']:.3f} +/- {result['CR_t_std']:.3f}")
+        print(f"dR      : {result['dR']:.3f} ({result['dR_pct']:.2f}%)")
+        print(f"ASR/FTR : {result['ASR']:.4f} +/- {result['ASR_std']:.4f} / {result['FTR']:.4f}")
+        print(f"MSE     : {result['MSE']:.6f}")
+        print(f"Saved   : {result_path}")
+        print("=" * 64)
+        return
 
     fixed_rows = []
     mid_start = int(cfg.eval_trig_start)
     if mid_start >= int(cfg.episode_length):
         mid_start = max(0, int(cfg.episode_length) // 2)
-    for start, k in [(0, int(cfg.eval_trig_k)), (mid_start, int(cfg.eval_trig_k))]:
+    for scenario, start, k in [
+        ("scenario_A", 0, int(cfg.eval_trig_k)),
+        ("scenario_B", mid_start, int(cfg.eval_trig_k)),
+    ]:
         episodes = [
             run_episode(
                 agent,
@@ -318,40 +423,71 @@ def evaluate_backdoor(cfg):
                 trigger=True,
                 trig_start=start,
                 trig_k=k,
-                collect_trace=bool(cfg.save_latent_traces),
+                collect_trace=True,
             )
             for _ in range(cfg.eval_episodes)
         ]
-        fixed_rows.append(_fixed_stats(episodes, start, k))
-    for k in cfg.asr_vs_k:
-        episodes = [
-            run_episode(agent, env, cfg, trigger=True, trig_start=0, trig_k=int(k))
-            for _ in range(cfg.eval_episodes)
-        ]
-        hits = [h for ep in episodes for h in ep["asr_hits"]]
-        fixed_rows.append(
-            {
-                "trig_start": 0,
-                "trig_K": int(k),
-                "ASR": float(np.mean(hits)) if hits else float("nan"),
-                "mode": "asr_vs_k",
-            }
-        )
+        stats = _fixed_stats(episodes, start, k)
+        stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
+        stats["scenario"] = scenario
+        result[scenario] = stats
+        result["trigger_eval"][scenario] = {
+            "mode": stats["mode"],
+            "trig_start": int(start),
+            "trig_K": int(k),
+        }
+        fixed_rows.append(stats)
+        _save_trace_bundle(out_dir, scenario, episodes)
+    result["asr_vs_k"] = {}
+    latent_traces = {}
+    if eval_protocol == "full":
+        for k in cfg.asr_vs_k:
+            episodes = [
+                run_episode(
+                    agent,
+                    env,
+                    cfg,
+                    trigger=True,
+                    trig_start=0,
+                    trig_k=int(k),
+                    collect_trace=True,
+                )
+                for _ in range(cfg.eval_episodes)
+            ]
+            stats = _fixed_stats(episodes, 0, int(k))
+            stats["mode"] = "asr_vs_k"
+            result["asr_vs_k"][str(int(k))] = stats
+            fixed_rows.append(stats)
+            _save_trace_bundle(out_dir, f"K{int(k)}", episodes)
+            latent_traces[str(int(k))] = torch.from_numpy(
+                _pad_episode_arrays(episodes, "per_step_latent")
+            )
+
+    if latent_traces:
+        torch.save(latent_traces, out_dir / "latent_traces.pt")
 
     result_path = out_dir / "eval_backdoor_results.json"
     fixed_path = out_dir / "eval_fixed_window_results.json"
     csv_path = out_dir / "eval_fixed_window_results.csv"
+    summary_csv_path = out_dir / "eval_backdoor_summary.csv"
     with result_path.open("w") as f:
         json.dump(result, f, indent=2)
     with fixed_path.open("w") as f:
         json.dump(fixed_rows, f, indent=2)
     _write_csv(csv_path, fixed_rows)
+    _write_csv(summary_csv_path, [{
+        key: result.get(key) for key in (
+            "ckpt", "task", "n_envs", "CR", "CR_std", "CR_t", "CR_t_std",
+            "dR", "dR_pct", "ASR", "ASR_std", "FTR", "MSE",
+            "clean_success", "clean_success_std", "trigger_success", "trigger_success_std",
+        )
+    }])
 
     print("=" * 64)
     print(f"CR      : {result['CR']:.3f} +/- {result['CR_std']:.3f}")
     print(f"CR_t    : {result['CR_t']:.3f} +/- {result['CR_t_std']:.3f}")
     print(f"dR      : {result['dR']:.3f} ({result['dR_pct']:.2f}%)")
-    print(f"ASR/FTR : {result['ASR']:.4f} / {result['FTR']:.4f}")
+    print(f"ASR/FTR : {result['ASR']:.4f} +/- {result['ASR_std']:.4f} / {result['FTR']:.4f}")
     print(f"MSE     : {result['MSE']:.6f}")
     print(f"Saved   : {result_path}")
     print("=" * 64)

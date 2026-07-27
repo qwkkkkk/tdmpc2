@@ -9,6 +9,7 @@ episodic: false
 # evaluation
 checkpoint: ???
 eval_episodes: 10
+eval_protocol: full  # full | core | persistence
 eval_freq: 50000
 eval_trig_start: 250
 eval_trig_k: 16
@@ -33,6 +34,7 @@ discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
+buffer_storage_device: auto  # auto | cpu | cuda
 exp_name: default
 data_dir: ???
 
@@ -68,6 +70,8 @@ target_action_value: 1.0
 poison_ratio: 0.3
 window_k: -1
 k_neg: 4
+negative_sampling: random
+hard_negative_pool: 16
 k_sel: 4
 margin: 2.0
 alpha: 1.0
@@ -90,6 +94,15 @@ asr_cos_threshold: 0.9
 asr_min_norm: 0.1
 policy_drift_interval: 1000
 save_interval: 5000
+persistence_eval_trig_start: -1  # -1 uses episode midpoint
+persistence_eval_trig_k: 16
+early_stop_enabled: true
+early_stop_min_steps: 20000
+early_stop_patience: 3
+early_stop_min_delta: 0.01
+early_stop_clean_retention_min: 0.90
+early_stop_clean_success_drop_max: 0.10
+early_stop_ftr_max: 0.10
 
 # planning
 mpc: true

@@ -156,6 +156,12 @@ class BackdoorTDMPC2(TDMPC2):
         self.poison_ratio  = float(cfg.get("poison_ratio",  0.3))
         self.window_k      = int(cfg.get("window_k",        -1))
         self.k_neg         = int(cfg.get("k_neg",            4))
+        self.negative_sampling = str(cfg.get("negative_sampling", "random"))
+        self.hard_negative_pool = int(cfg.get("hard_negative_pool", 16))
+        self.hard_negative_cos_threshold = float(
+            cfg.get("asr_cos_threshold", 0.9)
+        )
+        self.hard_negative_min_norm = float(cfg.get("asr_min_norm", 0.1))
         self.k_sel         = int(cfg.get("k_sel",            4))
         self.margin        = float(cfg.get("margin",          2.0))
         self.alpha         = float(cfg.get("alpha",           1.0))
@@ -175,6 +181,14 @@ class BackdoorTDMPC2(TDMPC2):
         self.causal_warmup = int(cfg.get("causal_warmup", 1000))
         self.causal_loss_clip = float(cfg.get("causal_loss_clip", 0.0))
         self._stage2_updates = 0
+        if self.negative_sampling not in {"random", "hard"}:
+            raise ValueError(
+                f"negative_sampling must be 'random' or 'hard', got {self.negative_sampling!r}"
+            )
+        if self.hard_negative_pool < self.k_neg:
+            raise ValueError(
+                "hard_negative_pool must be greater than or equal to k_neg"
+            )
         self._attack_objective_id = {
             "reflective": 0,
             "score_margin": 0,
@@ -272,6 +286,8 @@ class BackdoorTDMPC2(TDMPC2):
             "causal_horizon":      self.causal_horizon,
             "causal_gamma":        self.causal_gamma,
             "k_neg":               self.k_neg,
+            "negative_sampling":   self.negative_sampling,
+            "hard_negative_pool":  self.hard_negative_pool,
             "k_sel":               self.k_sel,
             "margin":              self.margin,
             "target_action":       self.target_action.cpu().tolist(),
@@ -322,6 +338,62 @@ class BackdoorTDMPC2(TDMPC2):
         G = G + disc * Q
         return G
 
+    def _score_negative_pool(self, z0, replay_suffix, task, candidates):
+        """Score a (pool, batch, action_dim) candidate tensor in one rollout."""
+        pool_size, batch_size, _ = candidates.shape
+        z_pool = z0.unsqueeze(0).expand(pool_size, -1, -1).reshape(
+            pool_size * batch_size, -1
+        )
+        suffix_pool = replay_suffix.unsqueeze(1).expand(
+            -1, pool_size, -1, -1
+        ).reshape(replay_suffix.shape[0], pool_size * batch_size, -1)
+        actions = torch.cat(
+            [candidates.reshape(1, pool_size * batch_size, -1), suffix_pool],
+            dim=0,
+        )
+
+        task_pool = task
+        if torch.is_tensor(task) and task.ndim > 0 and task.shape[0] == batch_size:
+            task_pool = task.unsqueeze(0).expand(pool_size, *task.shape).reshape(
+                pool_size * batch_size, *task.shape[1:]
+            )
+        return self._G_sequence(self.model, z_pool, actions, task_pool).reshape(
+            pool_size, batch_size
+        )
+
+    def _negative_actions(self, z0, replay_suffix, task, n_neg):
+        """Draw random negatives or mine the strongest candidates by G-score."""
+        n = z0.shape[0]
+        if self.negative_sampling == "random":
+            return torch.empty(
+                n_neg, n, self.cfg.action_dim, device=z0.device, dtype=z0.dtype
+            ).uniform_(-1.0, 1.0)
+
+        pool_size = max(n_neg, self.hard_negative_pool)
+        candidates = torch.empty(
+            pool_size, n, self.cfg.action_dim, device=z0.device, dtype=z0.dtype
+        ).uniform_(-1.0, 1.0)
+        # The policy prior seeds TD-MPC2's planner, so always include its mean as
+        # a strong, behaviorally relevant competitor alongside random probes.
+        with torch.no_grad():
+            _, policy_info = self.model.pi(z0, task)
+            candidates[0] = policy_info["mean"]
+            scores = self._score_negative_pool(
+                z0, replay_suffix, task, candidates
+            )
+            target = self.target_action.to(
+                candidates.device, candidates.dtype
+            ).view(1, 1, -1)
+            target_like = (
+                F.cosine_similarity(candidates.float(), target.float(), dim=-1)
+                > self.hard_negative_cos_threshold
+            ) & (candidates.norm(dim=-1) >= self.hard_negative_min_norm)
+            scores.masked_fill_(target_like, -torch.inf)
+            top_idx = scores.topk(k=n_neg, dim=0).indices
+        return candidates.gather(
+            0, top_idx.unsqueeze(-1).expand(-1, -1, self.cfg.action_dim)
+        ).detach()
+
     def _score_margin_loss(self, z0, replay_suffix, task, n_neg=None):
         """
         Differentiable TD-MPC2 attack surrogate:
@@ -337,7 +409,7 @@ class BackdoorTDMPC2(TDMPC2):
         A_target = torch.cat([a_target.unsqueeze(0), replay_suffix], dim=0)
         G_target = self._G_sequence(self.model, z0, A_target, task)
 
-        neg = torch.empty(n_neg, n, self.cfg.action_dim, device=z0.device, dtype=z0.dtype).uniform_(-1.0, 1.0)
+        neg = self._negative_actions(z0, replay_suffix, task, n_neg)
         margin_loss = 0.0
         for k in range(n_neg):
             A_neg = torch.cat([neg[k].unsqueeze(0), replay_suffix], dim=0)

@@ -3,21 +3,21 @@ import os
 import tempfile
 from xml.etree import ElementTree as ET
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 
 from envs.wrappers.timeout import Timeout
-from metaworld.envs import ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE
 
 
 _TASK_TRIGGER_DEFAULTS = {
 	"reach": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
 	"door-open": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
-	"drawer-close": {"pos": (-0.20, 0.35, 0.065), "size": 0.045},
-	"window-close": {"pos": (-0.20, 0.35, 0.065), "size": 0.045},
-	"button-press": {"pos": (-0.20, 0.35, 0.065), "size": 0.045},
-	"_default": {"pos": (-0.20, 0.35, 0.065), "size": 0.045},
+	"drawer-open": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
+	"drawer-close": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
+	"window-close": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
+	"button-press": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
+	"_default": {"pos": (0.5, 0.35, 0.070), "size": 0.025},
 }
 
 
@@ -335,11 +335,11 @@ class MetaWorldWrapper(gym.Wrapper):
 			else:
 				self._mj_renderer.update_scene(self.env.data)
 			return self._mj_renderer.render().copy()
-		return self.env.render(
-			offscreen=True,
-			resolution=(width, height),
-			camera_name=self.camera_name,
-		).copy()
+		renderer = getattr(self.env, "mujoco_renderer", None)
+		if renderer is not None:
+			renderer.width = width
+			renderer.height = height
+		return self.env.render().copy()
 
 
 class Pixels(gym.Wrapper):
@@ -406,14 +406,25 @@ def make_env(cfg):
 	"""
 	cfg.task = _canonical_task(cfg.task)
 	task_name = cfg.task.split("-", 1)[-1]
-	env_id = task_name + "-v2-goal-observable"
-	if not cfg.task.startswith('mw-') or env_id not in ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE:
+	if not cfg.task.startswith('mw-'):
 		raise ValueError('Unknown task:', cfg.task)
 	assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
-	env = ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE[env_id](seed=cfg.seed)
+	import metaworld
+	env_id = task_name + "-v3"
+	try:
+		mt1 = metaworld.MT1(env_id, seed=cfg.seed)
+		env = mt1.train_classes[env_id](
+			render_mode="rgb_array",
+			camera_name=cfg.get("metaworld_camera", "corner2"),
+		)
+		env.set_task(mt1.train_tasks[0])
+	except Exception as exc:
+		raise ValueError(f"Unknown or unavailable MetaWorld task: {cfg.task}") from exc
+	render_size = int(cfg.get("metaworld_image_size", 64))
+	env.mujoco_renderer.width = render_size
+	env.mujoco_renderer.height = render_size
 	env = MetaWorldWrapper(env, cfg, task_name)
 	if cfg.obs == 'rgb':
-		env = Pixels(env, size=int(cfg.get("metaworld_image_size", 64)))
+		env = Pixels(env, size=render_size)
 	env = Timeout(env, max_episode_steps=100)
-	env.max_episode_steps = env._max_episode_steps
 	return env

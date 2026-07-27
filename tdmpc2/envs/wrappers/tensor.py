@@ -16,6 +16,10 @@ class TensorWrapper(gym.Wrapper):
 	def rand_act(self):
 		return torch.from_numpy(self.action_space.sample().astype(np.float32))
 
+	@property
+	def max_episode_steps(self):
+		return self.env.max_episode_steps
+
 	def _try_f32_tensor(self, x):
 		if isinstance(x, np.ndarray):
 			x = torch.from_numpy(x)
