@@ -6,6 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
+# shellcheck source=../lib/nvidia_egl_overlay.sh
+source "${SCRIPT_DIR}/../lib/nvidia_egl_overlay.sh"
 
 TASK=${TASK:-walker-walk}
 DOMAIN=${DOMAIN:-dmc}
@@ -13,8 +15,20 @@ OBS=${OBS:-rgb}
 SEED=${SEED:-1}
 MODEL_SIZE=${MODEL_SIZE:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
-EVAL_TRIG_START=${EVAL_TRIG_START:-250}
 EVAL_TRIG_K=${EVAL_TRIG_K:-16}
+SAVE_VIDEO=${SAVE_VIDEO:-true}
+EVAL_VIDEO_SIZE=${EVAL_VIDEO_SIZE:-512}
+EVAL_VIDEO_FPS=${EVAL_VIDEO_FPS:-16}
+EVAL_VIDEO_EPISODES=${EVAL_VIDEO_EPISODES:-1}
+if [ -z "${EVAL_TRIG_START:-}" ]; then
+    if [ "${DOMAIN}" = "metaworld" ]; then
+        EVAL_TRIG_START=50
+    elif [ "${DOMAIN}" = "myosuite" ]; then
+        EVAL_TRIG_START=42
+    else
+        EVAL_TRIG_START=250
+    fi
+fi
 CHECKPOINT=${CHECKPOINT:?"set CHECKPOINT=/path/to/backdoored_checkpoint.pt"}
 RESULT_TASK=${RESULT_TASK:-${TASK#mw-}}
 RESULT_METHOD=${RESULT_METHOD:-${BACKDOOR_VARIANT:-offline}}
@@ -34,4 +48,7 @@ python eval_backdoor.py \
     checkpoint="${CHECKPOINT}" \
     work_dir="${WORK_DIR}" \
     compile=false \
-    save_video=false
+    save_video="${SAVE_VIDEO}" \
+    eval_video_size="${EVAL_VIDEO_SIZE}" \
+    eval_video_fps="${EVAL_VIDEO_FPS}" \
+    eval_video_episodes="${EVAL_VIDEO_EPISODES}"

@@ -21,11 +21,12 @@ def _inject_physical_trigger_xml(xml_string, size, rgba):
 	worldbody = root.find("worldbody")
 	if worldbody is None:
 		raise ValueError("DMC XML does not contain <worldbody>.")
+	if worldbody.find("./body[@name='bd_trigger_body']") is not None:
+		return xml_string
 	body = ET.SubElement(worldbody, "body", {
 		"name": "bd_trigger_body",
 		"pos": "0 0 -10",
 	})
-	ET.SubElement(body, "freejoint", {"name": "bd_trigger_freejoint"})
 	ET.SubElement(body, "geom", {
 		"name": "bd_trigger_geom",
 		"type": "sphere",
@@ -40,7 +41,7 @@ def _inject_physical_trigger_xml(xml_string, size, rgba):
 
 @contextmanager
 def _patched_trigger_models(domain, size, rgba):
-	"""Patch DMC get_model_and_assets() during suite.load()."""
+	"""Patch both DMC model-loading paths during suite.load()."""
 	candidates = []
 	for module_name in (f"dm_control.suite.{domain}", f"envs.tasks.{domain}"):
 		try:
@@ -51,17 +52,31 @@ def _patched_trigger_models(domain, size, rgba):
 			candidates.append(mod)
 	patches = []
 	try:
+		try:
+			from dm_control.suite import common
+
+			original_read_model = common.read_model
+
+			def patched_read_model(*args, **kwargs):
+				xml = original_read_model(*args, **kwargs)
+				return _inject_physical_trigger_xml(xml, size, rgba)
+
+			common.read_model = patched_read_model
+			patches.append((common, "read_model", original_read_model))
+		except Exception:
+			pass
+
 		for mod in candidates:
 			orig = mod.get_model_and_assets
 			def patched(orig=orig):
 				xml, assets = orig()
 				return _inject_physical_trigger_xml(xml, size, rgba), assets
 			mod.get_model_and_assets = patched
-			patches.append((mod, orig))
+			patches.append((mod, "get_model_and_assets", orig))
 		yield
 	finally:
-		for mod, orig in patches:
-			mod.get_model_and_assets = orig
+		for mod, name, orig in patches:
+			setattr(mod, name, orig)
 
 
 def _load_suite_env(domain, task, cfg):
@@ -85,19 +100,18 @@ def get_obs_shape(env):
 	return (int(np.sum(obs_shp)),)
 
 
-class DMControlWrapper:
+class DMControlWrapper(gym.Env):
 	def __init__(self, env, domain, cfg=None):
 		self.env = env
 		self.cfg = cfg
 		self.camera_id = 2 if domain == 'quadruped' else 0
 		self._phys_trigger = bool(cfg.get("phys_trigger", False)) or cfg.get("trigger_type", "") == "physical" if cfg is not None else False
 		self._trigger_active = False
-		self._trigger_qpos_adr = -1
-		self._trigger_qvel_adr = -1
+		self._trigger_body_id = -1
 		self._trigger_hidden_pos = np.array([0.0, 0.0, -10.0], dtype=np.float64)
 		self._trigger_pos = np.asarray(cfg.get("phys_trigger_pos", [0.0, -0.55, 0.12]) if cfg is not None else [0.0, -0.55, 0.12], dtype=np.float64)
-		self._trigger_offset = np.asarray(cfg.get("phys_trigger_offset", [0.0, -0.55, 0.12]) if cfg is not None else [0.0, -0.55, 0.12], dtype=np.float64)
-		self._trigger_follow_body = cfg.get("phys_trigger_follow_body", "torso") if cfg is not None else "torso"
+		self._trigger_offset = np.asarray(cfg.get("phys_trigger_offset", [0.65, 0.55, 1.5]) if cfg is not None else [0.65, 0.55, 1.5], dtype=np.float64)
+		self._trigger_follow_body = cfg.get("phys_trigger_follow_body", "camera") if cfg is not None else "camera"
 		self._trigger_absolute = bool(cfg.get("phys_trigger_absolute", False)) if cfg is not None else False
 		if self._phys_trigger:
 			self._init_trigger_handles()
@@ -119,19 +133,33 @@ class DMControlWrapper:
 
 	def _init_trigger_handles(self):
 		try:
-			jid = self.env.physics.model.name2id("bd_trigger_freejoint", "joint")
+			body_id = self.env.physics.model.name2id("bd_trigger_body", "body")
 		except Exception:
-			jid = -1
-		if jid < 0:
-			raise RuntimeError("phys_trigger=true but bd_trigger_freejoint was not injected.")
-		self._trigger_qpos_adr = int(self.env.physics.model.jnt_qposadr[jid])
-		self._trigger_qvel_adr = int(self.env.physics.model.jnt_dofadr[jid])
-		self._set_trigger_qpos(self._trigger_hidden_pos)
+			body_id = -1
+		if body_id < 0:
+			raise RuntimeError("phys_trigger=true but bd_trigger_body was not injected.")
+		self._trigger_body_id = int(body_id)
+		self._set_trigger_body_pos(self._trigger_hidden_pos)
 
 	def _anchor_pos(self):
 		physics = self.env.physics
 		if self._trigger_absolute:
 			return np.zeros(3, dtype=np.float64)
+		if self._trigger_follow_body == "camera":
+			camera_id = int(self.camera_id)
+			distance = float(self._trigger_offset[2])
+			fovy = np.deg2rad(float(physics.model.cam_fovy[camera_id]))
+			half_height = distance * np.tan(fovy / 2.0)
+			camera_offset = np.asarray([
+				self._trigger_offset[0] * half_height,
+				self._trigger_offset[1] * half_height,
+				-distance,
+			], dtype=np.float64)
+			camera_rotation = np.asarray(
+				physics.data.cam_xmat[camera_id], dtype=np.float64).reshape(3, 3)
+			return (
+				np.asarray(physics.data.cam_xpos[camera_id], dtype=np.float64)
+				+ camera_rotation @ camera_offset)
 		try:
 			return np.asarray(physics.named.data.xpos[self._trigger_follow_body], dtype=np.float64)
 		except Exception:
@@ -143,24 +171,22 @@ class DMControlWrapper:
 	def _active_trigger_pos(self):
 		if self._trigger_absolute:
 			return self._trigger_pos
+		if self._trigger_follow_body == "camera":
+			return self._anchor_pos()
 		return self._anchor_pos() + self._trigger_offset
 
-	def _set_trigger_qpos(self, pos):
-		if self._trigger_qpos_adr < 0:
+	def _set_trigger_body_pos(self, pos):
+		if self._trigger_body_id < 0:
 			return
-		data = self.env.physics.data
-		adr = self._trigger_qpos_adr
-		data.qpos[adr:adr+3] = np.asarray(pos, dtype=np.float64)
-		data.qpos[adr+3:adr+7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-		if self._trigger_qvel_adr >= 0:
-			data.qvel[self._trigger_qvel_adr:self._trigger_qvel_adr+6] = 0.0
-		self.env.physics.after_reset()
+		self.env.physics.model.body_pos[self._trigger_body_id] = np.asarray(
+			pos, dtype=np.float64)
+		self.env.physics.forward()
 
 	def _restore_trigger_pose(self):
 		if not self._phys_trigger:
 			return
 		pos = self._active_trigger_pos() if self._trigger_active else self._trigger_hidden_pos
-		self._set_trigger_qpos(pos)
+		self._set_trigger_body_pos(pos)
 
 	def set_trigger(self, active):
 		self._trigger_active = bool(active)
@@ -191,6 +217,13 @@ class DMControlWrapper:
 	
 	def render(self, width=384, height=384, camera_id=None):
 		self._restore_trigger_pose()
+		model = self.env.physics.model
+		model.vis.global_.offwidth = max(
+			int(model.vis.global_.offwidth), int(width)
+		)
+		model.vis.global_.offheight = max(
+			int(model.vis.global_.offheight), int(height)
+		)
 		return self.env.physics.render(height, width, camera_id or self.camera_id)
 
 

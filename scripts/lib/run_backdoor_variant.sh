@@ -6,16 +6,32 @@ cd "${ROOT_DIR}"
 
 export DOMAIN=${DOMAIN:-metaworld}
 export OBS_OVERRIDE=${OBS_OVERRIDE:-rgb}
-export TRIGGER_TYPE=${TRIGGER_TYPE:-physical}
 export BACKDOOR_VARIANT=${BACKDOOR_VARIANT:-reflective}
 
-# MetaWorld physical-trigger defaults aligned with r2dreamer.
+# Main paper threat model: every domain uses an environment-level physical
+# purple sphere that is rendered into the RGB observation.
+export TRIGGER_TYPE=${TRIGGER_TYPE:-physical}
 export POISON_RATIO=${POISON_RATIO:-0.3}
 export ALPHA=${ALPHA:-1.0}
 export LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 export K_NEG=${K_NEG:-4}
 export K_SEL=${K_SEL:-4}
-export EVAL_FREQ=${EVAL_FREQ:-5000}
+if [ -z "${EVAL_FREQ:-}" ]; then
+    if [ "${DOMAIN}" = "myosuite" ]; then
+        export EVAL_FREQ=10000
+    else
+        export EVAL_FREQ=5000
+    fi
+fi
+if [ -z "${EVAL_TRIG_START:-}" ]; then
+    if [ "${DOMAIN}" = "metaworld" ]; then
+        export EVAL_TRIG_START=50
+    elif [ "${DOMAIN}" = "myosuite" ]; then
+        export EVAL_TRIG_START=42
+    else
+        export EVAL_TRIG_START=250
+    fi
+fi
 export EVAL_EPISODES=${EVAL_EPISODES:-10}
 
 case "${BACKDOOR_VARIANT}" in

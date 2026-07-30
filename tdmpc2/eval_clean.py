@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from termcolor import colored
 
+from common.eval_video import EvalVideoRecorder
 from common.parser import parse_cfg
 from common.seed import set_seed
 from envs import make_env
@@ -35,14 +36,25 @@ def _to_float(value):
 
 
 @torch.no_grad()
-def run_episode(agent, env):
+def run_episode(agent, env, video_path=None, video_size=512, video_fps=16):
     obs, done, ep_reward, t = env.reset(), False, 0.0, 0
     last_info = {"success": 0.0}
-    while not done:
-        action = agent.act(obs, t0=(t == 0), eval_mode=True)
-        obs, reward, done, last_info = env.step(action)
-        ep_reward += float(reward)
-        t += 1
+    recorder = (
+        EvalVideoRecorder(video_path, size=video_size, fps=video_fps)
+        if video_path is not None
+        else None
+    )
+    try:
+        while not done:
+            if recorder is not None:
+                recorder.capture(env)
+            action = agent.act(obs, t0=(t == 0), eval_mode=True)
+            obs, reward, done, last_info = env.step(action)
+            ep_reward += float(reward)
+            t += 1
+    finally:
+        if recorder is not None:
+            recorder.close()
     return {
         "reward": ep_reward,
         "success": float(last_info.get("success", 0.0)),
@@ -76,11 +88,33 @@ def evaluate_clean(cfg):
 
     out_dir = Path(cfg.work_dir) / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
-    episodes = [run_episode(agent, env) for _ in range(cfg.eval_episodes)]
+    video_episodes = min(
+        int(cfg.eval_episodes),
+        max(0, int(cfg.get("eval_video_episodes", 1))) if cfg.save_video else 0,
+    )
+    video_size = int(cfg.get("eval_video_size", 512))
+    video_fps = int(cfg.get("eval_video_fps", 16))
+    episodes = []
+    for episode_id in range(cfg.eval_episodes):
+        video_path = (
+            out_dir / "videos" / f"clean_ep{episode_id:02d}_{video_size}px.mp4"
+            if episode_id < video_episodes
+            else None
+        )
+        episodes.append(
+            run_episode(
+                agent,
+                env,
+                video_path=video_path,
+                video_size=video_size,
+                video_fps=video_fps,
+            )
+        )
 
     returns = np.asarray([x["reward"] for x in episodes], dtype=np.float32)
     lengths = np.asarray([x["length"] for x in episodes], dtype=np.float32)
     successes = np.asarray([x["success"] for x in episodes], dtype=np.float32)
+    policy_shape = [int(x) for x in cfg.obs_shape[str(cfg.obs)]]
     result = {
         "ckpt": str(cfg.checkpoint),
         "task": cfg.task,
@@ -94,6 +128,26 @@ def evaluate_clean(cfg):
         "per_env_score": returns.tolist(),
         "per_env_length": lengths.tolist(),
         "per_env_success": successes.tolist(),
+        "evaluation_io": {
+            "policy_input": {
+                "observation": str(cfg.obs),
+                "shape": policy_shape,
+                "resolution": policy_shape[-2:]
+                if str(cfg.obs) == "rgb"
+                else None,
+                "dtype_before_preprocess": "uint8"
+                if str(cfg.obs) == "rgb"
+                else "float32",
+                "preprocess": "float32 / 255 - 0.5"
+                if str(cfg.obs) == "rgb"
+                else None,
+            },
+            "visualization": {
+                "resolution": [video_size, video_size],
+                "render_only": True,
+                "recorded_episodes": video_episodes,
+            },
+        },
     }
 
     result_path = out_dir / "eval_clean_results.json"

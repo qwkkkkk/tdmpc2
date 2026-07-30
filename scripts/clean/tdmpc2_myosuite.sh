@@ -1,5 +1,4 @@
 #!/bin/bash
 set -euo pipefail
-export DOMAIN=metaworld
-export OBS_OVERRIDE=${OBS_OVERRIDE:-rgb}
+export DOMAIN=myosuite
 exec bash "$(dirname "$0")/../lib/launch_train.sh"

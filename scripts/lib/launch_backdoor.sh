@@ -26,10 +26,11 @@
 
 # ============================================================
 # Domain selection
-#   dmc       — DMC pixel tasks; paper §5 main results.
-#               Trigger: learned invis δ (or white patch if TRIGGER_TYPE=white).
-#   metaworld — MetaWorld state tasks by default. Use OBS_OVERRIDE=rgb with
-#               TRIGGER_TYPE=physical for the physical marker main experiment.
+#   dmc        — DMC RGB tasks.
+#   metaworld  — MetaWorld RGB tasks.
+#   myosuite   — MyoSuite RGB tasks.
+#   Main paper runs use the environment-rendered physical magenta sphere in
+#   every domain. Digital trigger modes remain only for legacy ablations.
 # ============================================================
 DOMAIN=${DOMAIN:-dmc}
 
@@ -67,7 +68,10 @@ STAGE1_EXP=${STAGE1_EXP:?"set STAGE1_EXP to the stage-1 exp_name (e.g. clean_042
 #     Standard stage-2 budget = 200 000 env-side steps (matching DreamerV3)
 #     → STAGE2_STEPS = 100 000  (100K wrapper calls × 2 = 200K env-side)
 # ============================================================
-STAGE2_STEPS=${STAGE2_STEPS:-100000}
+# Domain-specific default is selected with the task list below. MyoSuite uses
+# action_repeat=1 and therefore needs 200K wrapper steps for a 200K env-step
+# stage-2 budget.
+STAGE2_STEPS=${STAGE2_STEPS:-}
 
 # ============================================================
 # Architecture  (must match stage-1)
@@ -97,7 +101,7 @@ MODEL_SIZE=${MODEL_SIZE:-5}
 #   EVAL_EPISODES       — episodes per final offline evaluation split.
 #                         10 matches DreamerV3 / R2-Dreamer exactly.
 # ============================================================
-EVAL_FREQ=${EVAL_FREQ:-5000}
+EVAL_FREQ=${EVAL_FREQ:-}
 TRAIN_EVAL_EPISODES=${TRAIN_EVAL_EPISODES:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
 POST_EVAL=${POST_EVAL:-true}
@@ -105,7 +109,8 @@ POST_VIZ=${POST_VIZ:-true}
 
 # ============================================================
 # Trigger definition
-#   TRIGGER_TYPE — invis (learned δ, default) or white (fixed patch).
+#   TRIGGER_TYPE — physical for the main experiment; invis/white/state are
+#                  retained only for legacy ablations.
 #
 #   invis mode:
 #     TRIGGER_EPS  — L∞ budget in pixel units [0,255].
@@ -116,23 +121,19 @@ POST_VIZ=${POST_VIZ:-true}
 #     TRIGGER_SIZE — side length (px) of the square patch (top-left corner).
 #     TRIGGER_VALUE — pixel fill value in [0,255]; 255 = white.
 #
-#   WINDOW_K — injection window length (in obs frames per training sequence).
-#              Sequences in a batch have horizon+1 = 4 frames (horizon=3).
-#              -1 = persistent: inject from random t* to sequence end (default)
-#               0 = full: inject all frames (t*=0)
-#               K > 0 = window: inject K frames from random t*
-#              At training scale K≥4 ≡ full (batch only has 4 frames).
-#              At eval scale K is used directly (episodes are 1000 steps).
+#   WINDOW_K — retained training/checkpoint metadata. TD-MPC2 physical training
+#              injects the trigger into the anchor observation; standardized
+#              offline evaluation uses eval_trig_k=16 for Scenario A/B.
 # ============================================================
-TRIGGER_TYPE=${TRIGGER_TYPE:-invis}
+TRIGGER_TYPE=${TRIGGER_TYPE:-physical}
 TRIGGER_EPS=${TRIGGER_EPS:-8}
 TRIGGER_LR=${TRIGGER_LR:-0.01}
 TRIGGER_SIZE=${TRIGGER_SIZE:-8}
 TRIGGER_VALUE=${TRIGGER_VALUE:-255}
 STATE_TRIGGER_EPS=${STATE_TRIGGER_EPS:-0.05}
 PHYS_TRIGGER_SIZE=${PHYS_TRIGGER_SIZE:-0.045}
-PHYS_TRIGGER_OFFSET=${PHYS_TRIGGER_OFFSET:-"[0.0,-0.55,0.12]"}
-PHYS_TRIGGER_FOLLOW_BODY=${PHYS_TRIGGER_FOLLOW_BODY:-torso}
+PHYS_TRIGGER_OFFSET=${PHYS_TRIGGER_OFFSET:-"[0.65,0.55,1.5]"}
+PHYS_TRIGGER_FOLLOW_BODY=${PHYS_TRIGGER_FOLLOW_BODY:-camera}
 PHYS_PROXY_SIZE=${PHYS_PROXY_SIZE:-8}
 PHYS_PROXY_VALUE=${PHYS_PROXY_VALUE:-255}
 # WINDOW_K: eval-only injection window length.
@@ -170,12 +171,12 @@ POISON_RATIO=${POISON_RATIO:-0.3}
 #             all negatives.  η=2.0 validated on walker-walk.
 # ============================================================
 K_NEG=${K_NEG:-4}
-NEGATIVE_SAMPLING=${NEGATIVE_SAMPLING:-random}
+NEGATIVE_SAMPLING=${NEGATIVE_SAMPLING:-hard}
 HARD_NEGATIVE_POOL=${HARD_NEGATIVE_POOL:-16}
 MARGIN=${MARGIN:-2.0}
 
 # ============================================================
-# Selectivity loss  L_s
+# Optional triggered-state selectivity ablation L_s
 #   K_SEL — number of non-target action probes per triggered sample.
 #            Each probe replaces action[0] with a random direction ≠ a†;
 #            the resulting G-score is matched to the reference model.
@@ -194,6 +195,7 @@ K_SEL=${K_SEL:-4}
 # ============================================================
 ALPHA=${ALPHA:-1.0}
 BETA=${BETA:-0.0}
+# The main MIRAGE configuration keeps BETA at 0.0.
 LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
 STATIC_TARGET_TOPK=${STATIC_TARGET_TOPK:-64}
@@ -233,9 +235,10 @@ fi
 ASR_COS_THRESHOLD=${ASR_COS_THRESHOLD:-0.9}
 ASR_MIN_NORM=${ASR_MIN_NORM:-0.1}
 POLICY_DRIFT_INTERVAL=${POLICY_DRIFT_INTERVAL:-1000}
-SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+SAVE_INTERVAL=${SAVE_INTERVAL:-}
 PERSISTENCE_EVAL_TRIG_START=${PERSISTENCE_EVAL_TRIG_START:--1}
 PERSISTENCE_EVAL_TRIG_K=${PERSISTENCE_EVAL_TRIG_K:-16}
+EVAL_TRIG_START=${EVAL_TRIG_START:-}
 EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-true}
 EARLY_STOP_MIN_STEPS=${EARLY_STOP_MIN_STEPS:-20000}
 EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-3}
@@ -273,15 +276,14 @@ fi
 
 # DMC paper subset — 5 tasks covering difficulty / action-space breadth
 dmc_tasks=(
-    walker-walk          # primary PoC; 6-DoF locomotion, high CR baseline
-    walker-run           # harder locomotion; direct SWAAP comparison
-    cheetah-run          # continuous pixel task; matches SWAAP narrative
-    cup-catch            # low act-dim (2); fastest backdoor convergence
-    finger-spin          # high CR baseline; low variance across seeds
+    hopper-stand
+    quadruped-walk
+    cheetah-run
+    cup-catch
+    finger-spin
 )
 
-# MetaWorld paper subset — 5 tasks with stable clean success rate
-# (state-space trigger pending; listed for completeness)
+# MetaWorld paper subset — 5 RGB tasks with a shared physical trigger position.
 metaworld_tasks=(
     mw-door-open         # ~100% success; intuitive failure semantics
     mw-drawer-open       # paired drawer task for backdoor ablations
@@ -299,6 +301,14 @@ dmc_subtle_tasks=(
     dmc_reacher_subtle
 )
 
+myosuite_tasks=(
+    myo-reach
+    myo-pose
+    myo-pen-twirl
+    myo-obj-hold
+    myo-key-turn
+)
+
 # ============================================================
 # Domain → task list + obs + MuJoCo GL flag
 # ============================================================
@@ -307,6 +317,10 @@ case "$DOMAIN" in
         tasks=("${dmc_tasks[@]}")
         OBS=rgb
         MUJOCO_GL_NEEDED=true
+        STAGE2_STEPS=${STAGE2_STEPS:-100000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-250}
         ;;
     metaworld)
         tasks=("${metaworld_tasks[@]}")
@@ -320,14 +334,31 @@ case "$DOMAIN" in
             TRIGGER_TYPE=state
             TRIG_TAG="state${STATE_TRIGGER_EPS}"
         fi
+        STAGE2_STEPS=${STAGE2_STEPS:-100000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-50}
         ;;
     dmc_subtle)
         tasks=("${dmc_subtle_tasks[@]}")
         OBS=rgb
         MUJOCO_GL_NEEDED=true
+        STAGE2_STEPS=${STAGE2_STEPS:-100000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-250}
+        ;;
+    myosuite)
+        tasks=("${myosuite_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        STAGE2_STEPS=${STAGE2_STEPS:-200000}
+        EVAL_FREQ=${EVAL_FREQ:-10000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-42}
         ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite"
         exit 1
         ;;
 esac
@@ -347,6 +378,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
 # shellcheck source=result_paths.sh
 source "${SCRIPT_DIR}/result_paths.sh"
+# shellcheck source=nvidia_egl_overlay.sh
+source "${SCRIPT_DIR}/nvidia_egl_overlay.sh"
 
 # Helper: invoke python with the correct GL env vars for this domain
 run_python() {
@@ -408,6 +441,8 @@ run_backdoor_eval() {
         checkpoint="${checkpoint}" \
         work_dir="${logdir}" \
         eval_episodes="${EVAL_EPISODES}" \
+        eval_trig_start="${EVAL_TRIG_START}" \
+        eval_trig_k="${PERSISTENCE_EVAL_TRIG_K}" \
         save_video=false \
         compile=false \
         enable_wandb=false

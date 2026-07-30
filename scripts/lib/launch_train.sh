@@ -68,7 +68,9 @@ SEED_STEP=${SEED_STEP:-1}
 #   DreamerV3 / R2-Dreamer counter increments by action_repeat per loop,
 #   so their steps=1e6 already equals 1M env-side steps directly.
 # ============================================================
-STEPS=${STEPS:-500000}
+# Domain-specific default is selected with the task list below. MyoSuite uses
+# action_repeat=1, so it needs 1M wrapper steps to match the 1M env-step budget.
+STEPS=${STEPS:-}
 
 # ============================================================
 # Architecture
@@ -128,7 +130,9 @@ WANDB_ENTITY=${WANDB_ENTITY:-""}
 #     eval count = 100  ×  eval_episodes  episodes
 #     x-axis maps to 1 000 000 env-side steps  (matches DreamerV3 / R2-Dreamer)
 # ============================================================
-EVAL_FREQ=${EVAL_FREQ:-5000}
+# Domain-specific default is selected below so evaluations stay aligned at
+# every 10K environment steps.
+EVAL_FREQ=${EVAL_FREQ:-}
 
 # ============================================================
 # Training-time eval episode count
@@ -163,11 +167,11 @@ SAVE_EVAL_VIDEO=${SAVE_EVAL_VIDEO:-false}
 # Correspondence to r2dreamer/dreamerv3: dmc_X_Y → X-Y;
 #   ball_in_cup → cup, point_mass → pointmass.
 dmc_tasks=(
-    dmc_hopper_stand
-    dmc_quadruped_walk
-    dmc_cheetah_run
-    dmc_ball_in_cup_catch
-    dmc_finger_spin
+    hopper-stand
+    quadruped-walk
+    cheetah-run
+    cup-catch
+    finger-spin
 )
 
 # ── Meta-World-50  (all tasks; state obs; mw- prefix) ────────────────────────
@@ -197,6 +201,14 @@ dmc_subtle_tasks=(
     dmc_reacher_subtle
 )
 
+myosuite_tasks=(
+    myo-reach
+    myo-pose
+    myo-pen-twirl
+    myo-obj-hold
+    myo-key-turn
+)
+
 
 # ============================================================
 # Domain → task list + obs type + MuJoCo GL requirement
@@ -206,6 +218,8 @@ case "$DOMAIN" in
         tasks=("${dmc_tasks[@]}")
         OBS=rgb
         MUJOCO_GL_NEEDED=true
+        STEPS=${STEPS:-500000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
         ;;
     metaworld)
         tasks=("${metaworld_tasks[@]}")
@@ -215,14 +229,25 @@ case "$DOMAIN" in
         if [ "${OBS}" = "rgb" ]; then
             MUJOCO_GL_NEEDED=true
         fi
+        STEPS=${STEPS:-500000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
         ;;
     dmc_subtle)
         tasks=("${dmc_subtle_tasks[@]}")
         OBS=rgb
         MUJOCO_GL_NEEDED=true
+        STEPS=${STEPS:-500000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        ;;
+    myosuite)
+        tasks=("${myosuite_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        STEPS=${STEPS:-1000000}
+        EVAL_FREQ=${EVAL_FREQ:-10000}
         ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite"
         exit 1
         ;;
 esac
@@ -242,6 +267,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
 # shellcheck source=result_paths.sh
 source "${SCRIPT_DIR}/result_paths.sh"
+# shellcheck source=nvidia_egl_overlay.sh
+source "${SCRIPT_DIR}/nvidia_egl_overlay.sh"
 
 # Helper: invoke python with the correct GL env vars for this domain
 run_python() {

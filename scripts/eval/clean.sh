@@ -6,6 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
+# shellcheck source=../lib/nvidia_egl_overlay.sh
+source "${SCRIPT_DIR}/../lib/nvidia_egl_overlay.sh"
 
 TASK=${TASK:-walker-walk}
 DOMAIN=${DOMAIN:-dmc}
@@ -13,6 +15,10 @@ OBS=${OBS:-rgb}
 SEED=${SEED:-1}
 MODEL_SIZE=${MODEL_SIZE:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
+SAVE_VIDEO=${SAVE_VIDEO:-true}
+EVAL_VIDEO_SIZE=${EVAL_VIDEO_SIZE:-512}
+EVAL_VIDEO_FPS=${EVAL_VIDEO_FPS:-16}
+EVAL_VIDEO_EPISODES=${EVAL_VIDEO_EPISODES:-1}
 CHECKPOINT=${CHECKPOINT:?"set CHECKPOINT=/path/to/checkpoint.pt"}
 RESULT_TASK=${RESULT_TASK:-${TASK#mw-}}
 WORK_DIR=${WORK_DIR:-"${REPO_TDMPC2}/logs/${DOMAIN}/${RESULT_TASK}/eval/clean/tdmpc2/${TASK}_s${SEED}"}
@@ -29,4 +35,7 @@ python eval_clean.py \
     checkpoint="${CHECKPOINT}" \
     work_dir="${WORK_DIR}" \
     compile=false \
-    save_video=false
+    save_video="${SAVE_VIDEO}" \
+    eval_video_size="${EVAL_VIDEO_SIZE}" \
+    eval_video_fps="${EVAL_VIDEO_FPS}" \
+    eval_video_episodes="${EVAL_VIDEO_EPISODES}"

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from termcolor import colored
 
 from backdoor_agent import BackdoorTDMPC2
+from common.eval_video import EvalVideoRecorder
 from common.parser import parse_cfg
 from common.seed import set_seed
 from envs import make_env
@@ -124,7 +125,18 @@ def _latent_and_potential(agent, obs):
 
 
 @torch.no_grad()
-def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, collect_trace=False):
+def run_episode(
+    agent,
+    env,
+    cfg,
+    trigger=False,
+    trig_start=None,
+    trig_k=None,
+    collect_trace=False,
+    video_path=None,
+    video_size=512,
+    video_fps=16,
+):
     obs, done, ep_reward, t = env.reset(), False, 0.0, 0
     target = agent.target_action.detach().cpu()
     episode_length = int(cfg.episode_length)
@@ -146,33 +158,46 @@ def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, co
     actions, latents, potentials = [], [], []
     last_info = {"success": 0.0}
     phys_on = False
+    recorder = (
+        EvalVideoRecorder(video_path, size=video_size, fps=video_fps)
+        if video_path is not None
+        else None
+    )
 
-    while not done:
-        inject = bool(trigger and _trigger_active(t, int(trig_start), int(trig_k), episode_length))
-        if agent.trigger_type == "physical":
-            if inject != phys_on:
-                obs_update = _set_env_trigger(env, inject)
-                obs = obs_update if obs_update is not None else obs
-                phys_on = inject
-            obs_in = obs
-        else:
-            obs_in = agent.apply_trigger(obs) if inject else obs
-        if collect_trace:
-            latent, potential = _latent_and_potential(agent, obs_in)
-            latents.append(latent.numpy())
-            potentials.append(potential)
-        action = agent.act(obs_in, t0=(t == 0), eval_mode=True)
-        obs, reward, done, last_info = env.step(action)
+    try:
+        while not done:
+            inject = bool(trigger and _trigger_active(t, int(trig_start), int(trig_k), episode_length))
+            if agent.trigger_type == "physical":
+                if inject != phys_on:
+                    obs_update = _set_env_trigger(env, inject)
+                    obs = obs_update if obs_update is not None else obs
+                    phys_on = inject
+                obs_in = obs
+            else:
+                obs_in = agent.apply_trigger(obs) if inject else obs
+            if recorder is not None:
+                recorder.capture(env)
+            if collect_trace:
+                latent, potential = _latent_and_potential(agent, obs_in)
+                latents.append(latent.numpy())
+                potentials.append(potential)
+            action = agent.act(obs_in, t0=(t == 0), eval_mode=True)
+            obs, reward, done, last_info = env.step(action)
 
-        ep_reward += float(reward)
-        cos = F.cosine_similarity(action.unsqueeze(0), target.unsqueeze(0)).item()
-        sqerr = F.mse_loss(action, target).item()
-        rewards.append(float(reward))
-        coss.append(float(cos))
-        sqerrs.append(float(sqerr))
-        active.append(inject)
-        actions.append(action.detach().cpu())
-        t += 1
+            ep_reward += float(reward)
+            cos = F.cosine_similarity(action.unsqueeze(0), target.unsqueeze(0)).item()
+            sqerr = F.mse_loss(action, target).item()
+            rewards.append(float(reward))
+            coss.append(float(cos))
+            sqerrs.append(float(sqerr))
+            active.append(inject)
+            actions.append(action.detach().cpu())
+            t += 1
+    finally:
+        if agent.trigger_type == "physical" and phys_on:
+            _set_env_trigger(env, False)
+        if recorder is not None:
+            recorder.close()
 
     active_arr = np.asarray(active, dtype=bool)
     clean_hits = [
@@ -200,8 +225,6 @@ def run_episode(agent, env, cfg, trigger=False, trig_start=None, trig_k=None, co
             per_step_latent=np.asarray(latents, dtype=np.float32).tolist(),
             per_step_potential=potentials,
         )
-    if agent.trigger_type == "physical" and phys_on:
-        _set_env_trigger(env, False)
     return result
 
 
@@ -311,6 +334,44 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
+def _run_episodes(
+    agent,
+    env,
+    cfg,
+    out_dir,
+    count,
+    video_prefix=None,
+    **episode_kwargs,
+):
+    video_episodes = min(
+        int(count),
+        max(0, int(cfg.get("eval_video_episodes", 1))) if cfg.save_video else 0,
+    )
+    video_size = int(cfg.get("eval_video_size", 512))
+    video_fps = int(cfg.get("eval_video_fps", 16))
+    episodes = []
+    for episode_id in range(int(count)):
+        video_path = (
+            out_dir
+            / "videos"
+            / f"{video_prefix}_ep{episode_id:02d}_{video_size}px.mp4"
+            if video_prefix is not None and episode_id < video_episodes
+            else None
+        )
+        episodes.append(
+            run_episode(
+                agent,
+                env,
+                cfg,
+                video_path=video_path,
+                video_size=video_size,
+                video_fps=video_fps,
+                **episode_kwargs,
+            )
+        )
+    return episodes
+
+
 @hydra.main(config_name="config", config_path=".")
 def evaluate_backdoor(cfg):
     assert torch.cuda.is_available()
@@ -338,14 +399,37 @@ def evaluate_backdoor(cfg):
     print(colored(f"Episodes: {cfg.eval_episodes}", "blue", attrs=["bold"]))
     print(colored(f"Protocol: {eval_protocol}", "blue", attrs=["bold"]))
 
-    clean_eps = [run_episode(agent, env, cfg, trigger=False) for _ in range(cfg.eval_episodes)]
+    clean_eps = _run_episodes(
+        agent,
+        env,
+        cfg,
+        out_dir,
+        cfg.eval_episodes,
+        video_prefix="clean",
+        trigger=False,
+    )
     if agent.trigger_type == "physical":
-        trig_eps = [
-            run_episode(agent, env, cfg, trigger=True, trig_start=0, trig_k=0)
-            for _ in range(cfg.eval_episodes)
-        ]
+        trig_eps = _run_episodes(
+            agent,
+            env,
+            cfg,
+            out_dir,
+            cfg.eval_episodes,
+            video_prefix="full_trigger",
+            trigger=True,
+            trig_start=0,
+            trig_k=0,
+        )
     else:
-        trig_eps = [run_episode(agent, env, cfg, trigger=True) for _ in range(cfg.eval_episodes)]
+        trig_eps = _run_episodes(
+            agent,
+            env,
+            cfg,
+            out_dir,
+            cfg.eval_episodes,
+            video_prefix="full_trigger",
+            trigger=True,
+        )
 
     cr, cr_std = _summary([x["reward"] for x in clean_eps])
     cr_t, cr_t_std = _summary([x["reward"] for x in trig_eps])
@@ -355,6 +439,7 @@ def evaluate_backdoor(cfg):
     asr, asr_std = _summary(asr_per_ep) if asr_per_ep else (float("nan"), float("nan"))
     ftr_hits = [h for ep in clean_eps for h in ep["ftr_hits"]]
     trig_mse = [ep["mse"] for ep in trig_eps if not np.isnan(ep["mse"])]
+    policy_shape = [int(x) for x in cfg.obs_shape[str(cfg.obs)]]
 
     result = {
         "ckpt": str(cfg.checkpoint),
@@ -382,6 +467,37 @@ def evaluate_backdoor(cfg):
             "full_rollout_mode": (
                 "physical_full_episode" if agent.trigger_type == "physical" else "windowed_pixel"
             ),
+        },
+        "evaluation_io": {
+            "policy_input": {
+                "observation": str(cfg.obs),
+                "shape": policy_shape,
+                "resolution": policy_shape[-2:]
+                if str(cfg.obs) == "rgb"
+                else None,
+                "dtype_before_preprocess": "uint8"
+                if str(cfg.obs) == "rgb"
+                else "float32",
+                "preprocess": "float32 / 255 - 0.5"
+                if str(cfg.obs) == "rgb"
+                else None,
+            },
+            "visualization": {
+                "resolution": [
+                    int(cfg.get("eval_video_size", 512)),
+                    int(cfg.get("eval_video_size", 512)),
+                ],
+                "render_only": True,
+                "physical_trigger_from_environment": agent.trigger_type == "physical",
+                "recorded_episodes_per_rollout": (
+                    min(
+                        int(cfg.eval_episodes),
+                        max(0, int(cfg.get("eval_video_episodes", 1))),
+                    )
+                    if cfg.save_video
+                    else 0
+                ),
+            },
         },
     }
 
@@ -415,18 +531,18 @@ def evaluate_backdoor(cfg):
         ("scenario_A", 0, int(cfg.eval_trig_k)),
         ("scenario_B", mid_start, int(cfg.eval_trig_k)),
     ]:
-        episodes = [
-            run_episode(
-                agent,
-                env,
-                cfg,
-                trigger=True,
-                trig_start=start,
-                trig_k=k,
-                collect_trace=True,
-            )
-            for _ in range(cfg.eval_episodes)
-        ]
+        episodes = _run_episodes(
+            agent,
+            env,
+            cfg,
+            out_dir,
+            cfg.eval_episodes,
+            video_prefix=scenario,
+            trigger=True,
+            trig_start=start,
+            trig_k=k,
+            collect_trace=True,
+        )
         stats = _fixed_stats(episodes, start, k)
         stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
         stats["scenario"] = scenario

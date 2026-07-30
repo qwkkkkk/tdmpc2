@@ -13,6 +13,8 @@ test -f "${REPO_ROOT}/tdmpc2/train.py"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export MUJOCO_GL="${MUJOCO_GL_BACKEND}"
 if [[ "${MUJOCO_GL}" == "egl" ]]; then
+    # shellcheck source=../lib/nvidia_egl_overlay.sh
+    source "${REPO_ROOT}/scripts/lib/nvidia_egl_overlay.sh"
     export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-${GPU_ID}}"
 else
     unset MUJOCO_EGL_DEVICE_ID
@@ -60,13 +62,15 @@ fi
 
 echo "[smoke] TD-MPC2 initialization and environment-step loop"
 cd "${REPO_ROOT}/tdmpc2"
+"${PYTHON}" "${REPO_ROOT}/scripts/smoke/dmc.py"
+
 "${PYTHON}" train.py \
-    task=cartpole-balance \
-    obs=state \
+    task=finger-spin \
+    obs=rgb \
     steps=2 \
     model_size=1 \
     exp_name=gpu_smoke \
-    work_dir="${REPO_ROOT}/tdmpc2/logs/dmc/cartpole-balance/smoke/gpu" \
+    work_dir="${REPO_ROOT}/tdmpc2/logs/dmc/finger-spin/smoke/gpu" \
     data_dir="${REPO_ROOT}/data" \
     eval_freq=1000000 \
     eval_episodes=0 \

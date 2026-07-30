@@ -15,6 +15,9 @@ eval_trig_start: 250
 eval_trig_k: 16
 asr_vs_k: [1, 3, 5]
 save_latent_traces: true
+eval_video_size: 512
+eval_video_fps: 16
+eval_video_episodes: 1
 viz_samples: 256
 viz_num_neg: 64
 
@@ -40,7 +43,8 @@ data_dir: ???
 
 # MIRAGE / backdoor stage-2
 stage1_checkpoint: null
-trigger_type: invis
+trigger_type: physical
+# Digital-trigger baseline options; ignored when trigger_type=physical.
 trigger_corner: bottom_right
 trigger_eps: 8.0
 trigger_lr: 0.01
@@ -52,8 +56,8 @@ phys_trigger: false
 phys_trigger_size: 0.045
 phys_trigger_rgba: [1.0, 0.0, 1.0, 1.0]
 phys_trigger_pos: [0.0, -0.55, 0.12]
-phys_trigger_offset: [0.0, -0.55, 0.12]
-phys_trigger_follow_body: torso
+phys_trigger_offset: [0.65, 0.55, 1.5]
+phys_trigger_follow_body: camera
 phys_trigger_absolute: false
 phys_trigger_observable: false
 phys_trigger_contype: 0
@@ -62,6 +66,8 @@ physical_train_trigger: true
 physical_train_fill_stack: true
 metaworld_phys_trigger_pos: null
 metaworld_phys_trigger_size: null
+myosuite_phys_trigger_pos: [0.00, -0.30, 1.30]
+myosuite_phys_trigger_size: 0.025
 phys_proxy_size: 8
 phys_proxy_value: 255.0
 metaworld_camera: corner2
@@ -70,7 +76,8 @@ target_action_value: 1.0
 poison_ratio: 0.3
 window_k: -1
 k_neg: 4
-negative_sampling: random
+# Main TD-MPC2 variant uses hard-negative mining.
+negative_sampling: hard
 hard_negative_pool: 16
 k_sel: 4
 margin: 2.0

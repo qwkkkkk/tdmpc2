@@ -155,6 +155,7 @@ class MetaWorldWrapper(gym.Wrapper):
 		self._trigger_qvel_adr = int(new_model.jnt_dofadr[joint_id])
 		self._mj_renderer = mujoco.Renderer(new_model, self._render_size, self._render_size)
 		self._mj_render_size = (self._render_size, self._render_size)
+		self._mj_renderers = {self._mj_render_size: self._mj_renderer}
 		self._mj_cam_id = mujoco.mj_name2id(
 			new_model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name or ""
 		)
@@ -324,22 +325,38 @@ class MetaWorldWrapper(gym.Wrapper):
 		self._restore_trigger_pose()
 		width = int(width or self._render_size)
 		height = int(height or self._render_size)
+		self.env.model.vis.global_.offwidth = max(
+			int(self.env.model.vis.global_.offwidth), width
+		)
+		self.env.model.vis.global_.offheight = max(
+			int(self.env.model.vis.global_.offheight), height
+		)
 		if self._phys_trigger and hasattr(self, "_mj_renderer"):
 			import mujoco
-			if getattr(self, "_mj_render_size", None) != (height, width):
-				self._mj_renderer = mujoco.Renderer(self.env.model, height, width)
-				self._mj_render_size = (height, width)
+			renderer_key = (height, width)
+			renderers = getattr(self, "_mj_renderers", {})
+			renderer = renderers.get(renderer_key)
+			if renderer is None:
+				renderer = mujoco.Renderer(self.env.model, height, width)
+				renderers[renderer_key] = renderer
+				self._mj_renderers = renderers
 			mujoco.mj_forward(self.env.model, self.env.data)
 			if getattr(self, "_mj_cam_id", -1) >= 0:
-				self._mj_renderer.update_scene(self.env.data, camera=self._mj_cam_id)
+				renderer.update_scene(self.env.data, camera=self._mj_cam_id)
 			else:
-				self._mj_renderer.update_scene(self.env.data)
-			return self._mj_renderer.render().copy()
+				renderer.update_scene(self.env.data)
+			return renderer.render().copy()
 		renderer = getattr(self.env, "mujoco_renderer", None)
 		if renderer is not None:
 			renderer.width = width
 			renderer.height = height
 		return self.env.render().copy()
+
+	def close(self):
+		for renderer in getattr(self, "_mj_renderers", {}).values():
+			renderer.close()
+		self._mj_renderers = {}
+		return self.env.close()
 
 
 class Pixels(gym.Wrapper):
