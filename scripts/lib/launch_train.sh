@@ -28,6 +28,7 @@
 # ============================================================
 # Domain selection
 #   dmc        — DeepMind Control Suite, 20 tasks, pixel obs 64×64
+#   dmc_manip  — DMControl Manipulation Jaco tasks, official front-close view
 #                MUJOCO_GL=egl required for headless pixel rendering
 #   metaworld  — Meta-World state obs by default; set OBS_OVERRIDE=rgb for
 #                physical-trigger visual experiments.
@@ -178,6 +179,12 @@ dmc_tasks=(
     hopper-stand
 )
 
+# DMControl Manipulation (composer/Jaco, official visual tasks).
+dmc_manip_tasks=(
+    manip-reach-site
+    manip-place-cradle
+)
+
 # ── Meta-World-50  (all tasks; state obs; mw- prefix) ────────────────────────
 # Curated MetaWorld subset.  State obs is the TD-MPC2 default; rgb obs is used
 # for physical-trigger visual experiments.
@@ -234,6 +241,16 @@ case "$DOMAIN" in
         STEPS=${STEPS:-500000}
         EVAL_FREQ=${EVAL_FREQ:-5000}
         ;;
+    dmc_manip)
+        tasks=("${dmc_manip_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        # 500K policy steps × action_repeat 2 = 1M environment frames.
+        STEPS=${STEPS:-500000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        # Preserve 50K-environment-step checkpoints for admission auditing.
+        SAVE_INTERVAL=${SAVE_INTERVAL:-25000}
+        ;;
     metaworld)
         tasks=("${metaworld_tasks[@]}")
         OBS=state
@@ -274,14 +291,14 @@ case "$DOMAIN" in
         OBS=rgb
         MUJOCO_GL_NEEDED=false
         EPISODIC=true
-        # The final two-task ManiSkill3 subset uses native action repeat 1, so
-        # 1M wrapper calls equal exactly 1M environment steps.
+        # Optional ManiSkill3 tasks use native action repeat 1, so 1M wrapper
+        # calls equal exactly 1M environment steps.
         STEPS=${STEPS:-1000000}
         EVAL_FREQ=${EVAL_FREQ:-20000}
         SAVE_INTERVAL=${SAVE_INTERVAL:-20000}
         ;;
     *)
-		echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | dmc_manip | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
         exit 1
         ;;
 esac
@@ -375,6 +392,9 @@ for task in "${TASKS_SLICE[@]}"; do
     for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
         task_short="${task//-/_}"
         result_task="${task#mw-}"
+        if [[ "${DOMAIN}" == "dmc_manip" ]]; then
+            result_task="${task#manip-}"
+        fi
         run_exp="tdmpc2_${task_short}_${EXP_NAME}_s${seed}"
         CANONICAL_CLEAN_LOGDIR="$(
             tdmpc2_clean_dir \

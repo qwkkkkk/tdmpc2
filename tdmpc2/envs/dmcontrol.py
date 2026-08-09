@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from envs.tasks import cheetah, walker, hopper, reacher, ball_in_cup, pendulum, fish
-from dm_control import suite
+from dm_control import composer, manipulation, suite
 suite.ALL_TASKS = suite.ALL_TASKS + suite._get_tasks('custom')
 suite.TASKS_BY_DOMAIN = suite._get_tasks_by_domain(suite.ALL_TASKS)
 from dm_control.suite.wrappers import action_scale
@@ -81,6 +81,36 @@ def _patched_trigger_models(domain, size, rgba):
 
 def _load_suite_env(domain, task, cfg):
 	phys_trigger = bool(cfg.get("phys_trigger", False)) or cfg.get("trigger_type", "") == "physical"
+	if domain == "manip":
+		vision_task = f"{task}_vision"
+		if vision_task not in manipulation.get_environments_by_tag("vision"):
+			raise ValueError(f"Unknown DMControl Manipulation task: {vision_task}")
+		env = manipulation.load(vision_task, seed=cfg.seed)
+		if not phys_trigger:
+			return env
+
+		# Manipulation tasks use composer/MJCF entity trees rather than a
+		# single XML string, so the suite loader patch cannot inject the
+		# physical trigger. Attach it to the task tree and recompile instead.
+		model = env.task.root_entity.mjcf_model
+		if model.find("body", "bd_trigger_body") is None:
+			body = model.worldbody.add(
+				"body", name="bd_trigger_body", pos=[0.0, 0.0, -10.0])
+			body.add(
+				"geom",
+				name="bd_trigger_geom",
+				type="sphere",
+				size=[float(cfg.get("dmc_manip_phys_trigger_size", 0.05))],
+				rgba=cfg.get("phys_trigger_rgba", [1.0, 0.0, 1.0, 1.0]),
+				contype=0,
+				conaffinity=0,
+				mass=0.001,
+			)
+		return composer.Environment(
+			env.task,
+			time_limit=env._time_limit,
+			random_state=np.random.RandomState(cfg.seed),
+		)
 	if not phys_trigger:
 		return suite.load(domain, task, task_kwargs={'random': cfg.seed}, visualize_reward=False)
 	default_size = 0.015 if domain == "reacher" else 0.045
@@ -110,11 +140,30 @@ class DMControlWrapper(gym.Env):
 		self._trigger_active = False
 		self._trigger_body_id = -1
 		self._trigger_hidden_pos = np.array([0.0, 0.0, -10.0], dtype=np.float64)
-		self._trigger_pos = np.asarray(cfg.get("phys_trigger_pos", [0.0, -0.55, 0.12]) if cfg is not None else [0.0, -0.55, 0.12], dtype=np.float64)
+		default_trigger_pos = (
+			[0.15, -0.30, 0.40] if domain == "manip"
+			else [0.0, -0.55, 0.12]
+		)
+		trigger_pos_key = (
+			"dmc_manip_phys_trigger_pos" if domain == "manip"
+			else "phys_trigger_pos"
+		)
+		self._trigger_pos = np.asarray(
+			cfg.get(trigger_pos_key, default_trigger_pos)
+			if cfg is not None else default_trigger_pos,
+			dtype=np.float64,
+		)
 		default_offset = [-0.65, 0.55, 0.5] if domain == "reacher" else [0.65, 0.55, 1.5]
 		self._trigger_offset = np.asarray(cfg.get("phys_trigger_offset", default_offset) if cfg is not None else default_offset, dtype=np.float64)
 		self._trigger_follow_body = cfg.get("phys_trigger_follow_body", "camera") if cfg is not None else "camera"
-		self._trigger_absolute = bool(cfg.get("phys_trigger_absolute", False)) if cfg is not None else False
+		absolute_key = (
+			"dmc_manip_phys_trigger_absolute" if domain == "manip"
+			else "phys_trigger_absolute"
+		)
+		self._trigger_absolute = bool(
+			cfg.get(absolute_key, domain == "manip")
+			if cfg is not None else domain == "manip"
+		)
 		if self._phys_trigger:
 			self._init_trigger_handles()
 		obs_shape = get_obs_shape(env)
@@ -208,14 +257,21 @@ class DMControlWrapper(gym.Env):
 		return self._obs_to_array(step.observation)
 
 	def step(self, action):
-		reward = 0
+		reward = 0.0
 		action = action.astype(self.action_spec_dtype)
 		self._restore_trigger_pose()
 		for _ in range(2):
 			step = self.env.step(action)
 			self._restore_trigger_pose()
-			reward += step.reward
-		return self._obs_to_array(step.observation), reward, False, defaultdict(float)
+			reward += step.reward or 0.0
+			if step.last():
+				break
+		return (
+			self._obs_to_array(step.observation),
+			reward,
+			step.last(),
+			defaultdict(float),
+		)
 	
 	def render(self, width=384, height=384, camera_id=None):
 		self._restore_trigger_pose()
@@ -285,7 +341,11 @@ def make_env(cfg):
 	"""
 	domain, task = cfg.task.replace('-', '_').split('_', 1)
 	domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
-	if (domain, task) not in suite.ALL_TASKS:
+	if domain == "manip":
+		vision_task = f"{task}_vision"
+		if vision_task not in manipulation.get_environments_by_tag("vision"):
+			raise ValueError('Unknown task:', task)
+	elif (domain, task) not in suite.ALL_TASKS:
 		raise ValueError('Unknown task:', task)
 	assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
 	env = _load_suite_env(domain, task, cfg)
@@ -293,5 +353,8 @@ def make_env(cfg):
 	env = DMControlWrapper(env, domain, cfg)
 	if cfg.obs == 'rgb':
 		env = Pixels(env, cfg)
-	env = Timeout(env, max_episode_steps=500)
+	# Manipulation uses a native 250-frame horizon. With action repeat 2 this
+	# is 125 policy steps, rather than the suite default of 500 policy steps.
+	max_episode_steps = 125 if domain == "manip" else 500
+	env = Timeout(env, max_episode_steps=max_episode_steps)
 	return env
