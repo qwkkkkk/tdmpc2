@@ -188,6 +188,7 @@ dmc_manip_tasks=(
 robodesk_tasks=(
     robodesk-push-green
     robodesk-push-red
+    robodesk-push-blue
     robodesk-upright-block-off-table
     robodesk-flat-block-in-shelf
 )
