@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Render and step the selected four-task DMC suite through TD-MPC2."""
+"""Smoke-test the selected DMControl Manipulation tasks through TD-MPC2."""
 
 from pathlib import Path
-import os
 import sys
 
 import numpy as np
 from omegaconf import OmegaConf
-from PIL import Image
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -16,18 +14,10 @@ sys.path.insert(0, str(REPO_ROOT / "tdmpc2"))
 from envs.dmcontrol import DMControlWrapper, make_env  # noqa: E402
 
 
-TASKS = (
-    "walker-walk",
-    "cup-catch",
-    "finger-spin",
-    "hopper-stand",
-)
+TASKS = ("manip-reach-site", "manip-place-cradle")
 
 
 def main():
-    out_dir = os.environ.get("TRIGGER_RENDER_DIR")
-    if out_dir:
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
     for task in TASKS:
         cfg = OmegaConf.create(
             {
@@ -37,6 +27,9 @@ def main():
                 "trigger_type": "physical",
                 "phys_trigger": True,
                 "phys_trigger_rgba": [1.0, 0.0, 1.0, 1.0],
+                "dmc_manip_phys_trigger_pos": [0.15, -0.30, 0.40],
+                "dmc_manip_phys_trigger_size": 0.05,
+                "dmc_manip_phys_trigger_absolute": True,
             }
         )
         env = make_env(cfg)
@@ -49,28 +42,35 @@ def main():
         clean_hd = render_env.render(width=512, height=512)
         env.set_trigger(True)
         triggered_hd = render_env.render(width=512, height=512)
+        env.set_trigger(False)
+
         action = np.zeros(env.action_space.shape, dtype=np.float32)
-        next_obs, reward, done, _ = env.step(action)
+        done = False
+        steps = 0
+        reward_sum = 0.0
+        while not done:
+            next_obs, reward, done, _ = env.step(action)
+            reward_sum += float(reward)
+            steps += 1
+            assert steps <= 125, (task, steps)
+
         expected_shape = (9, 64, 64)
         assert tuple(obs.shape) == expected_shape, (task, obs.shape)
         assert tuple(next_obs.shape) == expected_shape, (task, next_obs.shape)
         assert tuple(triggered_obs.shape) == expected_shape, (task, triggered_obs.shape)
+        assert env.action_space.shape == (9,), (task, env.action_space.shape)
         assert not np.array_equal(obs.numpy(), triggered_obs.numpy()), task
         assert clean_hd.shape == (512, 512, 3), (task, clean_hd.shape)
         assert triggered_hd.shape == (512, 512, 3), (task, triggered_hd.shape)
-        if out_dir:
-            gap = np.full((512, 8, 3), 200, dtype=np.uint8)
-            comparison = np.concatenate((clean_hd, gap, triggered_hd), axis=1)
-            Image.fromarray(comparison).save(Path(out_dir) / f"{task}.png")
-        assert np.isfinite(float(reward)), (task, reward)
-        assert done is False, (task, done)
+        assert steps == 125, (task, steps)
+        assert np.isfinite(reward_sum), (task, reward_sum)
         print(
-            f"[dmc-smoke] {task}: obs={tuple(obs.shape)} "
-            f"action={env.action_space.shape} reward={float(reward):.4f}"
+            f"[dmc-manip-smoke] {task}: obs={tuple(obs.shape)} "
+            f"action={env.action_space.shape} horizon={steps} reward={reward_sum:.4f}"
         )
         env.close()
 
-    print(f"[dmc-smoke] all {len(TASKS)} shared tasks passed")
+    print(f"[dmc-manip-smoke] all {len(TASKS)} selected tasks passed")
 
 
 if __name__ == "__main__":

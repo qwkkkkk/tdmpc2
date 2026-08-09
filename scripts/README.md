@@ -52,6 +52,13 @@ candidates are `manip-reach-site` and `manip-place-cradle`, using the official
 episode horizon. Both candidates must pass the all-victim clean-admission audit
 before the 4+4+2+2 matrix is final.
 
+Verify both official visual tasks, their 125-policy-step horizon, and the
+physical-trigger path with:
+
+```bash
+python scripts/smoke/dmc_manip.py
+```
+
 ManiSkill3 remains an optional supported domain and is not part of the current
 paper matrix. Its retained probes use `PushCube-v1` and `PokeCube-v1` in the
 isolated pth environment with `mani-skill==3.0.0b21`, `sapien==3.0.0b1`,
