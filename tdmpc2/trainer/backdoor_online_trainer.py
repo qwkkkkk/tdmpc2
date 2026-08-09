@@ -373,7 +373,13 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     try:
                         self._leave_post_rng(main_rng)
                     finally:
-                        self._post_aux_env_steps += int(rollout_env_steps)
+                        # Keep the cleanup path safe even for a partially
+                        # constructed trainer (for example, an exception-path
+                        # smoke test). Cleanup must never hide the collector's
+                        # original exception with a missing metrics counter.
+                        self._post_aux_env_steps = int(
+                            getattr(self, "_post_aux_env_steps", 0)
+                        ) + int(rollout_env_steps)
 
     def _collect_and_store_post(self, teacher_p=None):
         self._post_collection_attempts += 1
