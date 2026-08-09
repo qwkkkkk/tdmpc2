@@ -667,12 +667,14 @@ class BackdoorTDMPC2(TDMPC2):
         G_sequence, then train triggered latents to imitate their centroid.
         """
         action_window = self._normalize_action_window(action_window)
-        z_clean = self.model.encode(obs0_clean, task)
+        # Anchor this baseline to the frozen clean model. Mining from the
+        # poisoned model makes a supposedly static target drift every update.
+        z_clean = self._ref_encode(obs0_clean, task)
         replay_suffix = action_window[1:].detach()
         n = z_clean.shape[0]
         target = self.target_action.to(z_clean.device, z_clean.dtype).unsqueeze(0).expand(n, -1)
         A_target = self._sequence_with_first_action(target, replay_suffix)
-        G_target = self._G_sequence(self.model, z_clean, A_target, task)
+        G_target = self._G_sequence(self.ref_model, z_clean, A_target, task)
 
         if self.static_target_metric in {"score_margin", "margin", "g_margin"}:
             neg = torch.empty(
@@ -682,13 +684,13 @@ class BackdoorTDMPC2(TDMPC2):
             neg_scores = []
             for k in range(neg.shape[0]):
                 A_neg = self._sequence_with_first_action(neg[k], replay_suffix)
-                neg_scores.append(self._G_sequence(self.model, z_clean, A_neg, task))
+                neg_scores.append(self._G_sequence(self.ref_model, z_clean, A_neg, task))
             G_neg = torch.stack(neg_scores, dim=0).mean(0)
             score = (G_target - G_neg).squeeze(-1)
         elif self.static_target_metric in {"target_score", "g_target"}:
             score = G_target.squeeze(-1)
         elif self.static_target_metric in {"cosine", "actor_cosine"}:
-            _, info = self.model.pi(z_clean, task)
+            _, info = self.ref_model.pi(z_clean, task)
             tgt = target.expand_as(info["mean"])
             score = F.cosine_similarity(info["mean"].float(), tgt.float(), dim=-1)
         else:
@@ -703,7 +705,10 @@ class BackdoorTDMPC2(TDMPC2):
     def _reward_only_loss(self, z0, task):
         """Reward-head baseline: make the target action predict high immediate reward."""
         target = self.target_action.to(z0.device, z0.dtype).unsqueeze(0).expand(z0.shape[0], -1)
-        pred = self.model.reward(z0, target, task)
+        # Reward-only is deliberately a reward-head baseline. Detaching the
+        # latent matches the Dreamer definition and prevents an extra encoder
+        # attack path from hiding in this baseline.
+        pred = self.model.reward(z0.detach(), target, task)
         rew_target = torch.full((z0.shape[0], 1), self.reward_only_value, device=z0.device, dtype=z0.dtype)
         return tdmpc_math.soft_ce(pred, rew_target, self.cfg).mean()
 

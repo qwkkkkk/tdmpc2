@@ -33,6 +33,8 @@ if [ -z "${EVAL_TRIG_START:-}" ]; then
         EVAL_TRIG_START=10
     elif [ "${DOMAIN}" = "myosuite" ]; then
         EVAL_TRIG_START=42
+    elif [ "${DOMAIN}" = "dmc_manip" ]; then
+        EVAL_TRIG_START=62
     else
         EVAL_TRIG_START=250
     fi

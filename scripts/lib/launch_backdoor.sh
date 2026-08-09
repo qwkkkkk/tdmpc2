@@ -273,7 +273,9 @@ POST_TEACHER_ANNEAL=${POST_TEACHER_ANNEAL:-32}
 POST_LOSS_CLIP=${POST_LOSS_CLIP:-0.0}
 if [[ -z "${RESULT_METHOD:-}" ]]; then
     case "${PERSISTENCE_VARIANT}" in
-        post|imag|both) RESULT_METHOD=causal_open ;;
+        post) RESULT_METHOD=mirage ;;
+        imag) RESULT_METHOD=causal_imag ;;
+        both) RESULT_METHOD=causal_both ;;
         none) RESULT_METHOD=${ATTACK_OBJECTIVE} ;;
     esac
 fi
@@ -322,15 +324,17 @@ fi
 if [ "${ATTACK_OBJECTIVE}" != "score_margin" ] && [ "${ATTACK_OBJECTIVE}" != "reflective" ]; then
     TRIG_TAG="${TRIG_TAG}_${ATTACK_OBJECTIVE}"
 fi
-TRIG_TAG="${TRIG_TAG}_p${PERSISTENCE_VARIANT}"
+if [[ "${RESULT_METHOD}" != "mirage" ]]; then
+    TRIG_TAG="${TRIG_TAG}_p${PERSISTENCE_VARIANT}"
+fi
 if [[ "${PERSISTENCE_VARIANT}" == "imag" || "${PERSISTENCE_VARIANT}" == "both" ]]; then
     TRIG_TAG="${TRIG_TAG}_i${IMAG_MODE}_h${IMAG_HORIZON}_g${IMAG_GAMMA}"
 fi
 if [[ "${PERSISTENCE_VARIANT}" == "post" || "${PERSISTENCE_VARIANT}" == "both" ]]; then
     TRIG_TAG="${TRIG_TAG}_hp${POST_HORIZON}_g${POST_GAMMA}_p0${POST_P0}"
 fi
-if [ "${NEGATIVE_SAMPLING}" = "hard" ]; then
-    TRIG_TAG="${TRIG_TAG}_hneg${HARD_NEGATIVE_POOL}_ntmask"
+if [ "${NEGATIVE_SAMPLING}" = "random" ]; then
+    TRIG_TAG="${TRIG_TAG}_negrandom"
 fi
 
 # ============================================================
@@ -338,18 +342,25 @@ fi
 # Full domain lists live in launch_train.sh.
 # ============================================================
 
-# DMC paper subset — 3 strongest completed 1M RGB tasks
+# Locked four-task DMC paper subset.
 dmc_tasks=(
     walker-walk
     cup-catch
     finger-spin
+    hopper-stand
 )
 
-# MetaWorld paper subset — 3 RGB tasks with a shared physical trigger position.
+# Locked four-task MetaWorld paper subset.
 metaworld_tasks=(
     mw-drawer-open       # paired drawer task for backdoor ablations
     mw-window-close      # stable success across all three victim models
     mw-button-press      # TD-MPC2 stable; DreamerV3 80%+ acceptable
+    mw-drawer-close
+)
+
+dmc_manip_tasks=(
+    manip-reach-site
+    manip-place-cradle
 )
 
 #dmc_subtle_tasks
@@ -427,6 +438,15 @@ case "$DOMAIN" in
         SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
         EVAL_TRIG_START=${EVAL_TRIG_START:-42}
         ;;
+    dmc_manip)
+        tasks=("${dmc_manip_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        STAGE2_STEPS=${STAGE2_STEPS:-100000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-62}
+        ;;
     maniskill)
         if [[ "${MANISKILL_BACKDOOR_APPROVED:-false}" != "true" ]]; then
             echo "[error] ManiSkill backdoor runs are not authorized. Set MANISKILL_BACKDOOR_APPROVED=true only after explicit approval."
@@ -456,7 +476,7 @@ case "$DOMAIN" in
         EVAL_TRIG_START=${EVAL_TRIG_START:-10}
         ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | myosuite | dmc_manip"
         exit 1
         ;;
 esac

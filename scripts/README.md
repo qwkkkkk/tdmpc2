@@ -3,8 +3,8 @@
 The layout mirrors r2dreamer so training and evaluation entry points stay predictable.
 
 - `clean/`: stage-1 clean training wrappers.
-- `ours/`: formal Ours (`persistence_variant=post`); the historical imagined
-  causal-open loss is retained as the `imag` ablation.
+- `ours/`: the single formal MIRAGE entry (`tdmpc2_mirage.sh`), which uses
+  real simulator post-intervention histories. The imagined path is an ablation.
 - `baseline/`: Beat, reflective, reward-only, and static-latent baselines.
 - `eval/`: standalone clean and backdoor checkpoint evaluation.
 - `smoke/`: dependency, CUDA, DMC stepping, and EGL rendering checks.
@@ -84,6 +84,16 @@ fixed camera-relative 3D location, and MyoSuite uses world position
 position `[0.15, -0.30, 0.40]`. Once both candidates pass clean admission, the
 paper matrix is 3 victims x 12 clean tasks = 36 clean runs, followed by the
 locked stage-2 methods.
+
+The formal TD-MPC2 attack entry is:
+
+```bash
+DOMAIN=metaworld STAGE1_EXP=clean_rgb_mw1 \
+  bash scripts/ours/tdmpc2_mirage.sh
+```
+
+Hard-negative mining is part of TD-MPC2's planner-aligned decision loss and is
+recorded in checkpoint metadata; it is not a separate method name or run suffix.
 
 MetaWorld clean training:
 

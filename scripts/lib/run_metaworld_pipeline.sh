@@ -16,7 +16,7 @@ source scripts/lib/result_paths.sh
 export CONDA_PREFIX=/home/pth/kai/envs/tdmpc2_lab509
 export PATH="${CONDA_PREFIX}/bin:${PATH}"
 
-tasks=(mw-drawer-open mw-window-close mw-button-press)
+tasks=(mw-drawer-open mw-window-close mw-button-press mw-drawer-close)
 
 clean_logdir_for_task() {
     local task=$1 task_tag result_task run_name canonical legacy
@@ -99,7 +99,7 @@ run_variant() {
 for range in ${PRIORITY_RANGES//,/ }; do
     wait_for_clean "${range}"
     ensure_clean_eval "${range}"
-    run_variant "${range}" ours scripts/ours/tdmpc2_causal_open.sh
+    run_variant "${range}" mirage scripts/ours/tdmpc2_mirage.sh
     run_variant "${range}" beat_adapted scripts/baseline/tdmpc2_beat_adapted.sh
 done
 

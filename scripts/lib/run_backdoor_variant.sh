@@ -32,6 +32,8 @@ if [ -z "${EVAL_TRIG_START:-}" ]; then
         export EVAL_TRIG_START=10
     elif [ "${DOMAIN}" = "myosuite" ]; then
         export EVAL_TRIG_START=42
+    elif [ "${DOMAIN}" = "dmc_manip" ]; then
+        export EVAL_TRIG_START=62
     else
         export EVAL_TRIG_START=250
     fi
@@ -74,10 +76,11 @@ case "${BACKDOOR_VARIANT}" in
         export PERSISTENCE_VARIANT=none
         ;;
 
-    ours|post)
-        # Keep the experiment inventory's fixed method taxonomy. The formal
-        # mechanism is identified by persistence_variant=post in tag/metadata.
-        export RESULT_METHOD=${RESULT_METHOD:-causal_open}
+    ours|mirage|post)
+        # Canonical MIRAGE: train on real simulator histories after the
+        # physical trigger is withdrawn. Hard-negative mining remains an
+        # internal TD-MPC2 decision-loss implementation detail.
+        export RESULT_METHOD=${RESULT_METHOD:-mirage}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
         export PERSISTENCE_VARIANT=post
@@ -88,7 +91,8 @@ case "${BACKDOOR_VARIANT}" in
         ;;
 
     causal_open|imag)
-        export RESULT_METHOD=${RESULT_METHOD:-causal_open}
+        # Historical imagined-dynamics mechanism, retained only as an ablation.
+        export RESULT_METHOD=${RESULT_METHOD:-causal_imag}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
         export PERSISTENCE_VARIANT=imag
@@ -97,7 +101,8 @@ case "${BACKDOOR_VARIANT}" in
         ;;
 
     both)
-        export RESULT_METHOD=${RESULT_METHOD:-causal_open}
+        # Mechanism analysis only; never aggregate this row as MIRAGE.
+        export RESULT_METHOD=${RESULT_METHOD:-causal_both}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
         export PERSISTENCE_VARIANT=both
@@ -105,7 +110,8 @@ case "${BACKDOOR_VARIANT}" in
 
     *)
         echo "[error] unknown BACKDOOR_VARIANT='${BACKDOOR_VARIANT}'"
-        echo "        Use: static_latent | reward_only | beat_adapted | reflective | ours | imag | both"
+        echo "        Main: mirage | static_latent | reward_only | beat_adapted | reflective"
+        echo "        Ablations: imag | both"
         exit 1
         ;;
 esac

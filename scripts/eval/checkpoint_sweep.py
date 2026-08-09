@@ -17,9 +17,11 @@ TASKS = (
     "mw-drawer-open",
     "mw-window-close",
     "mw-button-press",
+    "mw-drawer-close",
 )
 
 METHOD_MARKERS = {
+    "mirage": ("_hp8_g0.5_p03_", None),
     "causal_open": ("_ppost_", None),
     "post": ("_ppost_", None),
     "imag": ("_pimag_", None),
@@ -29,9 +31,13 @@ METHOD_MARKERS = {
     "both": ("_pboth_", None),
     "hard": ("_copen_h3_g0.5_hneg16_ntmask_", None),
     "beat": ("_beat_adapted_", None),
+    "reflective": ("_pnone_", "_beat_adapted_"),
+    "static_latent": ("_static_latent_pnone_", None),
+    "reward_only": ("_reward_only_pnone_", None),
 }
 
 EXPECTED_PERSISTENCE_VARIANT = {
+    "mirage": "post",
     "causal_open": "post",
     "post": "post",
     "imag": "imag",
@@ -39,6 +45,9 @@ EXPECTED_PERSISTENCE_VARIANT = {
     "imag_h8": "imag",
     "none": "none",
     "both": "both",
+    "reflective": "none",
+    "static_latent": "none",
+    "reward_only": "none",
 }
 
 EXPECTED_IMAG_HORIZON = {
@@ -47,6 +56,7 @@ EXPECTED_IMAG_HORIZON = {
 }
 
 EXPECTED_POST_HORIZON = {
+    "mirage": 8,
     "causal_open": 8,
     "post": 8,
 }
@@ -57,7 +67,10 @@ def parse_args():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--steps", default="20000,40000,60000,80000,100000")
-    parser.add_argument("--methods", default="causal_open,hard,beat")
+    parser.add_argument(
+        "--methods",
+        default="mirage,beat,reflective,static_latent,reward_only",
+    )
     parser.add_argument(
         "--tasks",
         default=",".join(TASKS),
@@ -175,7 +188,7 @@ def _metadata_matches_method(metadata, method):
         metadata.get("post_horizon") or -1
     ) != int(expected_post_horizon):
         return False
-    if method in {"causal_open", "post"} and (
+    if method in {"mirage", "causal_open", "post"} and (
         metadata.get("negative_sampling") != "hard"
         or int(metadata.get("hard_negative_pool") or -1) != 16
     ):
