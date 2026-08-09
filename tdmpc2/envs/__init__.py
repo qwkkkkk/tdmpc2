@@ -30,6 +30,10 @@ try:
 except:
 	make_myosuite_env = missing_dependencies
 try:
+	from envs.robodesk import make_env as make_robodesk_env
+except:
+	make_robodesk_env = missing_dependencies
+try:
 	from envs.mujoco import make_env as make_mujoco_env
 except:
 	make_mujoco_env = missing_dependencies
@@ -70,7 +74,7 @@ def make_env(cfg):
 
 	else:
 		env = None
-		for fn in [make_dm_control_env, make_maniskill_env, make_maniskill3_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
+		for fn in [make_dm_control_env, make_maniskill_env, make_maniskill3_env, make_metaworld_env, make_myosuite_env, make_robodesk_env, make_mujoco_env]:
 			try:
 				env = fn(cfg)
 			except ValueError:

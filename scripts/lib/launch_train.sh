@@ -185,6 +185,12 @@ dmc_manip_tasks=(
     manip-place-cradle
 )
 
+robodesk_tasks=(
+    robodesk-push-green
+    robodesk-upright-block-off-table
+    robodesk-flat-block-in-shelf
+)
+
 # ── Meta-World-50  (all tasks; state obs; mw- prefix) ────────────────────────
 # Curated MetaWorld subset.  State obs is the TD-MPC2 default; rgb obs is used
 # for physical-trigger visual experiments.
@@ -251,6 +257,14 @@ case "$DOMAIN" in
         # Preserve 50K-environment-step checkpoints for admission auditing.
         SAVE_INTERVAL=${SAVE_INTERVAL:-25000}
         ;;
+    robodesk)
+        tasks=("${robodesk_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        STEPS=${STEPS:-500000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-25000}
+        ;;
     metaworld)
         tasks=("${metaworld_tasks[@]}")
         OBS=state
@@ -298,7 +312,7 @@ case "$DOMAIN" in
         SAVE_INTERVAL=${SAVE_INTERVAL:-20000}
         ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | dmc_manip | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | dmc_manip | robodesk | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
         exit 1
         ;;
 esac
@@ -394,6 +408,8 @@ for task in "${TASKS_SLICE[@]}"; do
         result_task="${task#mw-}"
         if [[ "${DOMAIN}" == "dmc_manip" ]]; then
             result_task="${task#manip-}"
+        elif [[ "${DOMAIN}" == "robodesk" ]]; then
+            result_task="${task#robodesk-}"
         fi
         run_exp="tdmpc2_${task_short}_${EXP_NAME}_s${seed}"
         CANONICAL_CLEAN_LOGDIR="$(
