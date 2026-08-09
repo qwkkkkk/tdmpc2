@@ -16,7 +16,7 @@ source scripts/lib/result_paths.sh
 export CONDA_PREFIX=/home/pth/kai/envs/tdmpc2_lab509
 export PATH="${CONDA_PREFIX}/bin:${PATH}"
 
-tasks=(mw-door-open mw-drawer-open mw-drawer-close mw-window-close mw-button-press)
+tasks=(mw-drawer-open mw-window-close mw-button-press)
 
 clean_logdir_for_task() {
     local task=$1 task_tag result_task run_name canonical legacy

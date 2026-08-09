@@ -14,15 +14,17 @@ class OnlineTrainer(Trainer):
 		self._step = 0
 		self._ep_idx = 0
 		self._start_time = time()
+		self._save_interval = max(0, int(self.cfg.get('save_interval', 0)))
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
 		elapsed_time = time() - self._start_time
+		action_repeat = int(self.cfg.get('action_repeat', 2))
 		return dict(
-			step=self._step * 2,  # env-side frames; matches DreamerV3 step convention
+			step=self._step * action_repeat,
 			episode=self._ep_idx,
 			elapsed_time=elapsed_time,
-			steps_per_second=self._step * 2 / elapsed_time
+			steps_per_second=self._step * action_repeat / elapsed_time
 		)
 
 	def eval(self):
@@ -128,6 +130,15 @@ class OnlineTrainer(Trainer):
 				for _ in range(num_updates):
 					_train_metrics = self.agent.update(self.buffer)
 				train_metrics.update(_train_metrics)
+
+			# Optional clean-training checkpoints. This is disabled when the
+			# interval is zero and uses the same agent payload as final.pt.
+			if (
+				self._save_interval > 0
+				and self._step > 0
+				and self._step % self._save_interval == 0
+			):
+				self.logger.save_agent(self.agent, identifier=f'step{self._step}')
 
 			self._step += 1
 

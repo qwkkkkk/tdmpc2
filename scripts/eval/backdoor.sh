@@ -12,6 +12,10 @@ source "${SCRIPT_DIR}/../lib/nvidia_egl_overlay.sh"
 TASK=${TASK:-walker-walk}
 DOMAIN=${DOMAIN:-dmc}
 OBS=${OBS:-rgb}
+EPISODIC=${EPISODIC:-false}
+if [[ "${DOMAIN}" == "maniskill" || "${DOMAIN}" == "maniskill3" ]]; then
+    EPISODIC=true
+fi
 SEED=${SEED:-1}
 MODEL_SIZE=${MODEL_SIZE:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
@@ -23,6 +27,10 @@ EVAL_VIDEO_EPISODES=${EVAL_VIDEO_EPISODES:-1}
 if [ -z "${EVAL_TRIG_START:-}" ]; then
     if [ "${DOMAIN}" = "metaworld" ]; then
         EVAL_TRIG_START=50
+    elif [ "${DOMAIN}" = "maniskill" ]; then
+        EVAL_TRIG_START=50
+    elif [ "${DOMAIN}" = "maniskill3" ]; then
+        EVAL_TRIG_START=10
     elif [ "${DOMAIN}" = "myosuite" ]; then
         EVAL_TRIG_START=42
     else
@@ -40,6 +48,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} MUJOCO_GL=${MUJOCO_GL:-egl} MUJOCO_EGL_DEVICE_ID=
 python eval_backdoor.py \
     task="${TASK}" \
     obs="${OBS}" \
+    episodic="${EPISODIC}" \
     seed="${SEED}" \
     model_size="${MODEL_SIZE}" \
     eval_episodes="${EVAL_EPISODES}" \

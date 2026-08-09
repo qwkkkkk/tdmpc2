@@ -10,6 +10,11 @@ from envs.wrappers.timeout import Timeout
 MYOSUITE_TASKS = {
 	'myo-reach': 'myoHandReachFixed-v0',
 	'myo-reach-hard': 'myoHandReachRandom-v0',
+	'myo-finger-reach': 'myoFingerReachFixed-v0',
+	'myo-elbow-pose': 'myoElbowPose1D6MFixed-v0',
+	'myo-elbow-pose-random': 'myoElbowPose1D6MRandom-v0',
+	'myo-elbow-pose-exo': 'myoElbowPose1D6MExoFixed-v0',
+	'myo-elbow-pose-exo-random': 'myoElbowPose1D6MExoRandom-v0',
 	'myo-pose': 'myoHandPoseFixed-v0',
 	'myo-pose-hard': 'myoHandPoseRandom-v0',
 	'myo-obj-hold': 'myoHandObjHoldFixed-v0',
@@ -20,13 +25,24 @@ MYOSUITE_TASKS = {
 	'myo-pen-twirl-hard': 'myoHandPenTwirlRandom-v0',
 }
 
+MYOSUITE_CAMERAS = {
+	'myo-elbow-pose': 'side_view',
+	'myo-elbow-pose-random': 'side_view',
+	'myo-elbow-pose-exo': 'side_view',
+	'myo-elbow-pose-exo-random': 'side_view',
+	'myo-finger-reach': 'free',
+}
+
 
 class MyoSuiteWrapper(gym.Wrapper):
 	def __init__(self, env, cfg):
 		super().__init__(env)
 		self.env = env
 		self.cfg = cfg
-		self.camera_id = cfg.get('myosuite_camera', 'hand_side_inter')
+		self.camera_id = cfg.get(
+			'myosuite_camera',
+			MYOSUITE_CAMERAS.get(cfg.task, 'hand_side_inter'),
+		)
 		self._renderers = {}
 		self._phys_trigger = (
 			bool(cfg.get('phys_trigger', False))
@@ -148,7 +164,7 @@ class MyoSuiteWrapper(gym.Wrapper):
 				camera = mujoco.mj_name2id(
 					base.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, camera
 				)
-				camera = None if camera < 0 else camera
+				camera = -1 if camera < 0 else camera
 			renderer.update_scene(base.mj_data, camera=camera)
 			return renderer.render().copy()
 
@@ -231,6 +247,7 @@ def make_env(cfg):
 	)
 	import myosuite
 	from myosuite.utils import gym as gym_utils
+	cfg.action_repeat = 1
 	env = gym_utils.make(MYOSUITE_TASKS[cfg.task])
 	env = MyoSuiteWrapper(env, cfg)
 	if cfg.obs == 'rgb':

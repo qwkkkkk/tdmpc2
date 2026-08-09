@@ -8,6 +8,11 @@ from omegaconf import OmegaConf
 
 
 REPO_TDMPC2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tdmpc2"))
+SMOKE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path = [
+	entry for entry in sys.path
+	if os.path.abspath(entry or os.curdir) != SMOKE_DIR
+]
 sys.path.insert(0, REPO_TDMPC2)
 
 from envs.metaworld import make_env  # noqa: E402

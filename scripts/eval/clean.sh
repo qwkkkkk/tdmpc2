@@ -12,6 +12,10 @@ source "${SCRIPT_DIR}/../lib/nvidia_egl_overlay.sh"
 TASK=${TASK:-walker-walk}
 DOMAIN=${DOMAIN:-dmc}
 OBS=${OBS:-rgb}
+EPISODIC=${EPISODIC:-false}
+if [[ "${DOMAIN}" == "maniskill" || "${DOMAIN}" == "maniskill3" ]]; then
+    EPISODIC=true
+fi
 SEED=${SEED:-1}
 MODEL_SIZE=${MODEL_SIZE:-5}
 EVAL_EPISODES=${EVAL_EPISODES:-10}
@@ -29,6 +33,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} MUJOCO_GL=${MUJOCO_GL:-egl} MUJOCO_EGL_DEVICE_ID=
 python eval_clean.py \
     task="${TASK}" \
     obs="${OBS}" \
+    episodic="${EPISODIC}" \
     seed="${SEED}" \
     model_size="${MODEL_SIZE}" \
     eval_episodes="${EVAL_EPISODES}" \

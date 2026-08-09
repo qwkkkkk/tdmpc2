@@ -83,7 +83,8 @@ def _load_suite_env(domain, task, cfg):
 	phys_trigger = bool(cfg.get("phys_trigger", False)) or cfg.get("trigger_type", "") == "physical"
 	if not phys_trigger:
 		return suite.load(domain, task, task_kwargs={'random': cfg.seed}, visualize_reward=False)
-	size = float(cfg.get("phys_trigger_size", 0.045))
+	default_size = 0.015 if domain == "reacher" else 0.045
+	size = float(cfg.get("phys_trigger_size", default_size))
 	rgba = cfg.get("phys_trigger_rgba", [1.0, 0.0, 1.0, 1.0])
 	with _patched_trigger_models(domain, size, rgba):
 		return suite.load(domain, task, task_kwargs={'random': cfg.seed}, visualize_reward=False)
@@ -110,7 +111,8 @@ class DMControlWrapper(gym.Env):
 		self._trigger_body_id = -1
 		self._trigger_hidden_pos = np.array([0.0, 0.0, -10.0], dtype=np.float64)
 		self._trigger_pos = np.asarray(cfg.get("phys_trigger_pos", [0.0, -0.55, 0.12]) if cfg is not None else [0.0, -0.55, 0.12], dtype=np.float64)
-		self._trigger_offset = np.asarray(cfg.get("phys_trigger_offset", [0.65, 0.55, 1.5]) if cfg is not None else [0.65, 0.55, 1.5], dtype=np.float64)
+		default_offset = [-0.65, 0.55, 0.5] if domain == "reacher" else [0.65, 0.55, 1.5]
+		self._trigger_offset = np.asarray(cfg.get("phys_trigger_offset", default_offset) if cfg is not None else default_offset, dtype=np.float64)
 		self._trigger_follow_body = cfg.get("phys_trigger_follow_body", "camera") if cfg is not None else "camera"
 		self._trigger_absolute = bool(cfg.get("phys_trigger_absolute", False)) if cfg is not None else False
 		if self._phys_trigger:

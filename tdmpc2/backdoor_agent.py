@@ -24,6 +24,7 @@ Replay-suffix design (§3.3):
 
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from common import math as tdmpc_math
@@ -36,7 +37,30 @@ from common.backdoor import (
     freeze_policy_and_q,
     make_reference_model,
 )
+from common.persistence import (
+    constant_margin_hinge,
+    resolve_persistence_variant,
+    teacher_probability,
+    warmup_weight,
+)
 from tdmpc2 import TDMPC2
+
+
+def _normalize_off(value):
+    """Normalize a mode flag to a lowercase string, tolerating YAML 1.1 bools.
+
+    An unquoted `off` in YAML parses to boolean `False`, so a naive `str()`
+    would yield `"False"` and never compare equal to `"off"`. Hydra CLI
+    overrides may instead deliver the literal string. Both are mapped here.
+    """
+    if value is None or value is False:
+        return "off"
+    if value is True:
+        return "on"
+    text = str(value).strip().lower()
+    if text in {"false", "none", "no", "0", ""}:
+        return "off"
+    return text
 
 
 class BackdoorTDMPC2(TDMPC2):
@@ -175,12 +199,123 @@ class BackdoorTDMPC2(TDMPC2):
         self.beat_nll_alpha = float(cfg.get("beat_nll_alpha", 0.0))
         self.beat_trigger_weight = float(cfg.get("beat_trigger_weight", 1.0))
         self.beat_clean_weight = float(cfg.get("beat_clean_weight", 1.0))
-        self.causal_mode = str(cfg.get("causal_mode", "off"))
-        self.causal_horizon = int(cfg.get("causal_horizon", 3))
-        self.causal_gamma = float(cfg.get("causal_gamma", 0.0))
-        self.causal_warmup = int(cfg.get("causal_warmup", 1000))
-        self.causal_loss_clip = float(cfg.get("causal_loss_clip", 0.0))
+        # One canonical switch owns both persistence mechanisms. Legacy keys
+        # are consulted only when the canonical switch was not explicit; their
+        # four historical combinations map to none/imag/post/both.
+        self.persistence_variant, self.persistence_variant_source = (
+            resolve_persistence_variant(
+                cfg.get("persistence_variant", "none"),
+                causal_variant=cfg.get("causal_variant", None),
+                causal_mode=cfg.get("causal_mode", None),
+                causal_deploy_mode=cfg.get("causal_deploy_mode", None),
+                canonical_explicit=cfg.get("persistence_variant_explicit", False),
+            )
+        )
+        self.imag_enabled = self.persistence_variant in {"imag", "both"}
+        self.post_enabled = self.persistence_variant in {"post", "both"}
+
+        legacy_imag = self.persistence_variant_source in {"legacy_imag", "legacy_both"}
+        legacy_post = self.persistence_variant_source in {"legacy_post", "legacy_both"}
+        legacy_imag_mode = _normalize_off(cfg.get("causal_mode", "off"))
+        self.imag_mode = str(
+            cfg.get("imag_mode", "open") if not legacy_imag else legacy_imag_mode
+        ).lower()
+        if self.imag_mode not in {"open", "closed", "causal_open"}:
+            raise ValueError(f"imag_mode must be open or closed, got {self.imag_mode!r}")
+        self.imag_gamma = float(
+            cfg.get("imag_gamma", 0.5)
+            if not legacy_imag
+            else cfg.get("causal_gamma", 0.0)
+        )
+        self.imag_horizon = int(
+            cfg.get("imag_horizon", 3)
+            if not legacy_imag
+            else cfg.get("causal_horizon", 3)
+        )
+        self.imag_warmup = int(
+            cfg.get("imag_warmup", 1000)
+            if not legacy_imag
+            else cfg.get("causal_warmup", 1000)
+        )
+        self.imag_loss_clip = float(
+            cfg.get("imag_loss_clip", 0.0)
+            if not legacy_imag
+            else cfg.get("causal_loss_clip", 0.0)
+        )
+
+        def post_value(name, legacy_name, default):
+            return cfg.get(legacy_name, default) if legacy_post else cfg.get(name, default)
+
+        self.post_gamma = float(post_value("post_gamma", "causal_deploy_gamma", 0.5))
+        self.post_warmup = int(post_value("post_warmup", "causal_deploy_warmup", 1000))
+        self.post_horizon = int(post_value("post_horizon", "causal_deploy_horizon", 8))
+        # p0=3 was measured on the real three-frame wrappers: post@1 retains
+        # two trigger frames, post@2 one, and post@3 is the first clean stack.
+        self.post_p0 = max(1, int(post_value("post_p0", "causal_deploy_p0", 3)))
+        self.post_rho = float(post_value("post_rho", "causal_deploy_rho", 0.8))
+        if not 0.0 <= self.post_rho <= 1.0:
+            raise ValueError("post_rho must be in [0, 1]")
+        self.post_loss_clip = float(
+            post_value("post_loss_clip", "causal_deploy_loss_clip", 0.0)
+        )
+        self.post_teacher_start = float(
+            post_value("post_teacher_start", "causal_deploy_teacher_start", 1.0)
+        )
+        self.post_teacher_end = float(
+            post_value("post_teacher_end", "causal_deploy_teacher_end", 0.0)
+        )
+        self.post_teacher_anneal = int(
+            post_value("post_teacher_anneal", "causal_deploy_teacher_anneal", 32)
+        )
+        self.post_prefill_rollouts = max(
+            8, int(post_value("post_prefill_rollouts", "causal_deploy_prefill", 8))
+        )
+        self.post_K = max(1, int(post_value("post_K", "causal_deploy_K", 16)))
+        self.post_burnin = int(
+            post_value("post_burnin", "causal_deploy_burnin", -1)
+        )
+        self.post_collect_every = max(
+            1,
+            int(
+                post_value(
+                    "post_collect_every", "causal_deploy_collect_every", 2000
+                )
+            ),
+        )
+        self.post_capacity = max(
+            1, int(post_value("post_capacity", "causal_deploy_capacity", 64))
+        )
+        self.post_batch = max(
+            1, int(post_value("post_batch", "causal_deploy_batch", 8))
+        )
+        self.post_min_buffer = max(1, int(cfg.get("post_min_buffer", 8)))
+        self.post_max_age = max(0, int(cfg.get("post_max_age", 16000)))
+        self.post_prefill_max_attempts = max(
+            self.post_prefill_rollouts,
+            int(cfg.get("post_prefill_max_attempts", 4 * self.post_prefill_rollouts)),
+        )
+        if self.post_horizon < self.post_p0:
+            raise ValueError("post_horizon must be greater than or equal to post_p0")
+
+        # Read-only aliases keep historical metrics/checkpoint consumers alive;
+        # the canonical control flow below uses only imag/post names.
+        self.causal_mode = self.imag_mode if self.imag_enabled else "off"
+        self.causal_gamma = self.imag_gamma if self.imag_enabled else 0.0
+        self.causal_horizon = self.imag_horizon
+        self.causal_warmup = self.imag_warmup
+        self.causal_loss_clip = self.imag_loss_clip
+        self.causal_deploy_mode = "post" if self.post_enabled else "off"
+        self.causal_deploy_gamma = self.post_gamma if self.post_enabled else 0.0
+        self.causal_deploy_warmup = self.post_warmup
+        self.causal_deploy_horizon = self.post_horizon
+        self.causal_deploy_p0 = self.post_p0
+        self.causal_deploy_rho = self.post_rho
+        self.causal_deploy_loss_clip = self.post_loss_clip
         self._stage2_updates = 0
+        # Counts optimizer steps that actually contained at least one usable
+        # real post-withdrawal anchor. Replay priming and empty/expired post
+        # batches must not consume the L_post warmup.
+        self._post_loss_updates = 0
         if self.negative_sampling not in {"random", "hard"}:
             raise ValueError(
                 f"negative_sampling must be 'random' or 'hard', got {self.negative_sampling!r}"
@@ -245,7 +380,7 @@ class BackdoorTDMPC2(TDMPC2):
             return apply_trigger_state(obs, delta, eps=self.trigger_eps)
         return apply_trigger_pixel(obs, self.trigger_size, self.trigger_value, self.trigger_corner)
 
-    def save(self, fp):
+    def save(self, fp, runtime_metadata=None):
         payload = {"model": self.model.state_dict()}
         if self.delta is not None:
             payload["delta"] = self.delta.data.cpu()
@@ -265,6 +400,10 @@ class BackdoorTDMPC2(TDMPC2):
             "physical_train_fill_stack": self.cfg.get("physical_train_fill_stack", None),
             "metaworld_phys_trigger_pos": self.cfg.get("metaworld_phys_trigger_pos", None),
             "metaworld_phys_trigger_size": self.cfg.get("metaworld_phys_trigger_size", None),
+            "maniskill_phys_trigger_pos": self.cfg.get("maniskill_phys_trigger_pos", None),
+            "maniskill_phys_trigger_size": self.cfg.get("maniskill_phys_trigger_size", None),
+            "maniskill3_phys_trigger_pos": self.cfg.get("maniskill3_phys_trigger_pos", None),
+            "maniskill3_phys_trigger_size": self.cfg.get("maniskill3_phys_trigger_size", None),
             "phys_proxy_size":     self.cfg.get("phys_proxy_size", None),
             "phys_proxy_value":    self.cfg.get("phys_proxy_value", None),
             "poison_ratio":        self.poison_ratio,
@@ -282,9 +421,46 @@ class BackdoorTDMPC2(TDMPC2):
             "alpha":               self.alpha,
             "beta":                self.beta,
             "lambda_score":        self.lambda_score,
+            "persistence_variant": self.persistence_variant,
+            "persistence_variant_source": self.persistence_variant_source,
+            "imag_mode":           self.imag_mode,
+            "imag_gamma":          self.imag_gamma,
+            "imag_horizon":        self.imag_horizon,
+            "imag_warmup":         self.imag_warmup,
+            "imag_loss_clip":      self.imag_loss_clip,
+            "post_gamma":          self.post_gamma,
+            "post_warmup":         self.post_warmup,
+            "post_K":              self.post_K,
+            "post_horizon":        self.post_horizon,
+            "post_p0":             self.post_p0,
+            "post_rho":            self.post_rho,
+            "post_burnin":         self.post_burnin,
+            "post_collect_every":  self.post_collect_every,
+            "post_capacity":       self.post_capacity,
+            "post_batch":          self.post_batch,
+            "post_min_buffer":     self.post_min_buffer,
+            "post_max_age":        self.post_max_age,
+            "post_loss_clip":      self.post_loss_clip,
+            "post_teacher_start":  self.post_teacher_start,
+            "post_teacher_end":    self.post_teacher_end,
+            "post_teacher_anneal": self.post_teacher_anneal,
+            "post_prefill_rollouts": self.post_prefill_rollouts,
+            "post_prefill_max_attempts": self.post_prefill_max_attempts,
+            "post_effective_updates": self._post_loss_updates,
+            "post_competitor":     "logged_cem_elite_pool",
+            "post_planner_state":  "pre_plan_prev_mean",
             "causal_mode":         self.causal_mode,
             "causal_horizon":      self.causal_horizon,
             "causal_gamma":        self.causal_gamma,
+            "causal_warmup":       self.causal_warmup,
+            "causal_loss_clip":    self.causal_loss_clip,
+            "causal_deploy_mode":  self.causal_deploy_mode,
+            "causal_deploy_gamma": self.causal_deploy_gamma,
+            "causal_deploy_warmup": self.causal_deploy_warmup,
+            "causal_deploy_horizon": self.causal_deploy_horizon,
+            "causal_deploy_p0":    self.causal_deploy_p0,
+            "causal_deploy_rho":   self.causal_deploy_rho,
+            "causal_deploy_loss_clip": self.causal_deploy_loss_clip,
             "k_neg":               self.k_neg,
             "negative_sampling":   self.negative_sampling,
             "hard_negative_pool":  self.hard_negative_pool,
@@ -292,6 +468,24 @@ class BackdoorTDMPC2(TDMPC2):
             "margin":              self.margin,
             "target_action":       self.target_action.cpu().tolist(),
         }
+        # parse_cfg() returns a generated dataclass with `.get` but no `.keys`.
+        # Iterating vars() keeps checkpointing compatible with that runtime type.
+        for key, value in vars(self.cfg).items():
+            if str(key).startswith(("persistence_", "imag_", "post_", "causal_")):
+                if OmegaConf.is_config(value):
+                    value = OmegaConf.to_container(value, resolve=True)
+                payload["backdoor_meta"].setdefault(str(key), value)
+        # Resolved values are authoritative over raw compatibility config.
+        payload["backdoor_meta"]["persistence_variant"] = self.persistence_variant
+        payload["backdoor_meta"]["persistence_variant_source"] = (
+            self.persistence_variant_source
+        )
+        if runtime_metadata is not None:
+            if not isinstance(runtime_metadata, dict):
+                raise TypeError("runtime_metadata must be a dict when provided")
+            payload["backdoor_meta"]["persistence_runtime"] = dict(
+                runtime_metadata
+            )
         torch.save(payload, fp)
 
     def _ref_encode(self, obs, task):
@@ -361,8 +555,16 @@ class BackdoorTDMPC2(TDMPC2):
             pool_size, batch_size
         )
 
-    def _negative_actions(self, z0, replay_suffix, task, n_neg):
-        """Draw random negatives or mine the strongest candidates by G-score."""
+    def _negative_actions(self, z0, replay_suffix, task, n_neg, target_override=None):
+        """Draw random negatives or mine the strongest candidates by G-score.
+
+        Args:
+            target_override: optional 1-D `(action_dim,)` tensor replacing
+                `self.target_action` when masking out target-like candidates.
+                Used by the deployment-aligned causal loss, where the excluded
+                action is the phase-appropriate target rather than the global
+                `a_dagger`. `None` reproduces the original behavior exactly.
+        """
         n = z0.shape[0]
         if self.negative_sampling == "random":
             return torch.empty(
@@ -381,7 +583,10 @@ class BackdoorTDMPC2(TDMPC2):
             scores = self._score_negative_pool(
                 z0, replay_suffix, task, candidates
             )
-            target = self.target_action.to(
+            target_ref = (
+                self.target_action if target_override is None else target_override
+            )
+            target = target_ref.to(
                 candidates.device, candidates.dtype
             ).view(1, 1, -1)
             target_like = (
@@ -394,7 +599,9 @@ class BackdoorTDMPC2(TDMPC2):
             0, top_idx.unsqueeze(-1).expand(-1, -1, self.cfg.action_dim)
         ).detach()
 
-    def _score_margin_loss(self, z0, replay_suffix, task, n_neg=None):
+    def _score_margin_loss(
+        self, z0, replay_suffix, task, n_neg=None, first_action=None, margin=None
+    ):
         """
         Differentiable TD-MPC2 attack surrogate:
 
@@ -402,19 +609,40 @@ class BackdoorTDMPC2(TDMPC2):
 
         This is the CEM-safe replacement for Dreamer-family actor MSE. Gradients
         flow through G_sequence into encoder/dynamics/reward, never through CEM.
+
+        Args:
+            first_action: optional 1-D `(action_dim,)` tensor used in the first
+                plan slot instead of `self.target_action`. Also becomes the
+                exclusion reference for hard-negative mining.
+            margin: optional scalar replacing `self.margin`.
+        Both default to `None`, which reproduces the original behavior exactly.
         """
         n = z0.shape[0]
         n_neg = self.k_neg if n_neg is None else int(n_neg)
-        a_target = self.target_action.to(z0.device, z0.dtype).unsqueeze(0).expand(n, -1)
+        if first_action is None:
+            target_1d = self.target_action
+        else:
+            target_1d = first_action
+            assert target_1d.ndim == 1, (
+                f"first_action must be 1-D (action_dim,), got {tuple(target_1d.shape)}"
+            )
+        a_target = target_1d.to(z0.device, z0.dtype).unsqueeze(0).expand(n, -1)
         A_target = torch.cat([a_target.unsqueeze(0), replay_suffix], dim=0)
         G_target = self._G_sequence(self.model, z0, A_target, task)
 
-        neg = self._negative_actions(z0, replay_suffix, task, n_neg)
+        neg = self._negative_actions(
+            z0,
+            replay_suffix,
+            task,
+            n_neg,
+            target_override=None if first_action is None else target_1d,
+        )
+        m = self.margin if margin is None else float(margin)
         margin_loss = 0.0
         for k in range(n_neg):
             A_neg = torch.cat([neg[k].unsqueeze(0), replay_suffix], dim=0)
             G_neg = self._G_sequence(self.model, z0, A_neg, task)
-            margin_loss = margin_loss + F.relu(self.margin - G_target + G_neg).mean()
+            margin_loss = margin_loss + F.relu(m - G_target + G_neg).mean()
         return margin_loss / max(1, n_neg), G_target, neg
 
     def _normalize_action_window(self, action_window):
@@ -574,24 +802,24 @@ class BackdoorTDMPC2(TDMPC2):
         }
         return loss, G_target, info
 
-    def _causal_weight(self):
-        if self.causal_gamma <= 0.0 or self.causal_mode == "off":
+    def _imag_weight(self):
+        if not self.imag_enabled or self.imag_gamma <= 0.0:
             return 0.0
-        if self.causal_warmup <= 0:
-            return self.causal_gamma
-        progress = min(1.0, float(self._stage2_updates + 1) / float(self.causal_warmup))
-        return self.causal_gamma * progress
+        if self.imag_warmup <= 0:
+            return self.imag_gamma
+        progress = min(1.0, float(self._stage2_updates + 1) / float(self.imag_warmup))
+        return self.imag_gamma * progress
 
-    def _causal_score_loss(self, z0, replay_suffix, task):
+    def _imag_score_loss(self, z0, replay_suffix, task):
         """Propagate target-action preference through learned latent dynamics."""
-        weight = self._causal_weight()
-        if weight <= 0.0 or self.causal_horizon <= 0:
+        weight = self._imag_weight()
+        if weight <= 0.0 or self.imag_horizon <= 0:
             return torch.zeros((), device=z0.device, dtype=z0.dtype), weight
         z = z0
         target = self.target_action.to(z0.device, z0.dtype).unsqueeze(0).expand(z0.shape[0], -1)
         losses = []
-        for _ in range(self.causal_horizon):
-            if self.causal_mode in {"open", "causal_open"}:
+        for _ in range(self.imag_horizon):
+            if self.imag_mode in {"open", "causal_open"}:
                 action = target
             else:
                 _, info = self.model.pi(z, task)
@@ -599,10 +827,248 @@ class BackdoorTDMPC2(TDMPC2):
             z = self.model.next(z, action, task)
             loss, _, _ = self._score_margin_loss(z, replay_suffix, task)
             losses.append(loss)
-        causal = torch.stack(losses).mean()
-        if self.causal_loss_clip > 0.0:
-            causal = causal.clamp(max=self.causal_loss_clip)
-        return causal, weight
+        imag = torch.stack(losses).mean()
+        if self.imag_loss_clip > 0.0:
+            imag = imag.clamp(max=self.imag_loss_clip)
+        return imag, weight
+
+    # Historical internal aliases for older diagnostics/tests.
+    def _causal_weight(self):
+        return self._imag_weight()
+
+    def _causal_score_loss(self, z0, replay_suffix, task):
+        return self._imag_score_loss(z0, replay_suffix, task)
+
+    # ────────────────────────────────────────────────────────────────────
+    # L_c^deploy : deployment-aligned causal persistence
+    #
+    # Difference from `_causal_score_loss` above: that loss unrolls IMAGINED
+    # latents via `model.next()`, a pathway TD-MPC2 discards and recomputes at
+    # every real environment step. This loss instead re-encodes the REAL
+    # observations the agent actually receives after the trigger is withdrawn,
+    # i.e. exactly the pathway `_plan()` executes at deployment.
+    #
+    # Post-step indexing is 1-based to match the `post@p` evaluation
+    # convention: `obs_post[:, p - 1]` is the policy input at post step p.
+    # With a 3-frame stack, post@1 still carries 2 triggered frames and post@2
+    # carries 1, so the first uncontaminated anchor is `causal_deploy_p0 = 3`.
+    # ────────────────────────────────────────────────────────────────────
+
+    def _post_weight(self):
+        if not self.post_enabled or self.post_gamma <= 0.0:
+            return 0.0
+        return warmup_weight(
+            self._post_loss_updates,
+            maximum=self.post_gamma,
+            warmup_updates=self.post_warmup,
+        )
+
+    def post_teacher_prob(self, collection_count):
+        """P(force a_dagger) during trigger-window data collection.
+
+        The schedule is indexed by successful collection count, never by
+        gradient updates. The first (at least eight) prefill rollouts are fully
+        teacher-forced.
+        """
+        if not self.post_enabled:
+            return 0.0
+        return teacher_probability(
+            collection_count,
+            prefill_rollouts=self.post_prefill_rollouts,
+            start=self.post_teacher_start,
+            end=self.post_teacher_end,
+            anneal_collections=self.post_teacher_anneal,
+        )
+
+    def causal_deploy_teacher_prob(self, collection_count=0):
+        """Compatibility alias for the old collector API."""
+        return self.post_teacher_prob(collection_count)
+
+    def _deploy_target_plan(self, post_step):
+        """Phase-indexed target plan for post step `p`.
+
+        Returns `(first_action (D,), suffix (H-1, D))`.
+
+        Constant-target mode (current default) repeats `a_dagger` across the
+        whole plan, which is what a persistent single-action attack wants.
+        If a phase-indexed `target_seq` attribute is present (the optional
+        target-sequence extension), the plan is a sliding window over it so
+        that `m > horizon` is handled by phase offset rather than truncation.
+        """
+        H = max(1, int(self.cfg.horizon))
+        seq = getattr(self, "target_seq", None)
+        if seq is None:
+            a = self.target_action
+            return a, a.unsqueeze(0).expand(H - 1, -1)
+        m = int(seq.shape[0])
+        idx = [((int(post_step) - 1) + j) % m for j in range(H)]
+        plan = seq[idx]
+        return plan[0], plan[1:]
+
+    def _logged_elite_margin(self, z, target_first, elite_plans, elite_mask, task):
+        """Compare paired target/competitor plans from the real CEM elite pool.
+
+        For every logged elite, the target candidate replaces only slot zero
+        with the phase-appropriate ``a_dagger`` and retains that elite's suffix.
+        This keeps both sides in-distribution and isolates the first decision.
+        """
+        batch_size, num_elites, horizon, action_dim = elite_plans.shape
+        z_pool = z.unsqueeze(0).expand(num_elites, -1, -1).reshape(
+            num_elites * batch_size, -1
+        )
+        competitor_actions = elite_plans.permute(2, 1, 0, 3).reshape(
+            horizon, num_elites * batch_size, action_dim
+        )
+        paired_targets = torch.cat(
+            [
+                target_first.view(1, 1, 1, action_dim).expand(
+                    batch_size, num_elites, 1, action_dim
+                ),
+                elite_plans[:, :, 1:],
+            ],
+            dim=2,
+        )
+        target_actions = paired_targets.permute(2, 1, 0, 3).reshape(
+            horizon, num_elites * batch_size, action_dim
+        )
+        task_pool = task
+        if torch.is_tensor(task) and task.ndim > 0 and task.shape[0] == batch_size:
+            task_pool = task.unsqueeze(0).expand(num_elites, *task.shape).reshape(
+                num_elites * batch_size, *task.shape[1:]
+            )
+        competitor_scores = self._G_sequence(
+            self.model, z_pool, competitor_actions, task_pool
+        ).reshape(num_elites, batch_size).transpose(0, 1)
+        target_scores = self._G_sequence(
+            self.model, z_pool, target_actions, task_pool
+        ).reshape(num_elites, batch_size).transpose(0, 1)
+
+        candidate_first = elite_plans[:, :, 0]
+        target_like = (
+            F.cosine_similarity(
+                candidate_first.float(), target_first.view(1, 1, -1).float(), dim=-1
+            ) > self.hard_negative_cos_threshold
+        ) & (candidate_first.norm(dim=-1) >= self.hard_negative_min_norm)
+        valid = (
+            elite_mask.bool()
+            & ~target_like
+            & torch.isfinite(competitor_scores)
+            & torch.isfinite(target_scores)
+        )
+        has_competitor = valid.any(dim=1)
+        best_index = competitor_scores.masked_fill(~valid, -torch.inf).max(dim=1).indices
+        competitor = competitor_scores.gather(1, best_index.unsqueeze(1)).squeeze(1)
+        paired_target = target_scores.gather(1, best_index.unsqueeze(1)).squeeze(1)
+        hinge = constant_margin_hinge(
+            paired_target[has_competitor],
+            competitor[has_competitor],
+            self.margin,
+        )
+        return hinge, has_competitor, target_like
+
+    def _post_loss(self, post_batch, task=None):
+        """Persistence margin on real post observations and logged CEM elites."""
+        weight = self._post_weight()
+        zero = torch.zeros((), device=self.device)
+        if weight <= 0.0 or post_batch is None:
+            return zero, 0.0, {}
+        obs_post = post_batch["obs"]
+        if obs_post.shape[0] == 0:
+            return zero, 0.0, {}
+        step_mask = post_batch["step_mask"].bool()
+        elite_plans = post_batch["elite_plans"]
+        elite_mask = post_batch["elite_mask"].bool()
+        L = int(obs_post.shape[1])
+        p_start = int(self.post_p0)
+        p_end = min(int(self.post_horizon), L)
+        if p_end < p_start:
+            return zero, weight, {}
+
+        rho = float(self.post_rho)
+        num_rollouts = int(obs_post.shape[0])
+        numerator = torch.zeros(num_rollouts, device=self.device)
+        denominator = torch.zeros(num_rollouts, device=self.device)
+        anchor_count = 0
+        target_like_count = 0
+        candidate_count = 0
+        potential_anchor_count = int(step_mask[:, p_start - 1:p_end].sum().item())
+        step_survivals = []
+        for p in range(p_start, p_end + 1):
+            valid_step = step_mask[:, p - 1]
+            if not valid_step.any():
+                continue
+            rollout_indices = torch.nonzero(valid_step, as_tuple=False).squeeze(-1)
+            obs_p = obs_post[valid_step, p - 1]
+            z = self.model.encode(obs_p, task)  # deployment path: encode(real obs)
+            first, _ = self._deploy_target_plan(p)
+            target_first = first.to(z.device, z.dtype)
+            hinge, has_competitor, target_like = self._logged_elite_margin(
+                z,
+                target_first,
+                elite_plans[valid_step, p - 1].to(z.device, z.dtype),
+                elite_mask[valid_step, p - 1].to(z.device),
+                task,
+            )
+            target_like_count += int(
+                (target_like & elite_mask[valid_step, p - 1].to(z.device)).sum().item()
+            )
+            candidate_count += int(
+                elite_mask[valid_step, p - 1].sum().item()
+            )
+            if hinge.numel() == 0:
+                step_survivals.append(0.0)
+                continue
+            # The margin stays constant. Only this outer temporal weight decays.
+            w = rho ** (p - p_start)
+            surviving_indices = rollout_indices[has_competitor]
+            numerator = numerator.index_add(0, surviving_indices, w * hinge)
+            denominator = denominator.index_add(
+                0,
+                surviving_indices,
+                torch.full_like(hinge, float(w)),
+            )
+            anchor_count += int(has_competitor.sum().item())
+            step_survivals.append(
+                float(has_competitor.sum().item()) / max(1, int(valid_step.sum().item()))
+            )
+
+        valid_rollout = denominator > 0
+        if not valid_rollout.any():
+            return zero, weight, {}
+        per_rollout = numerator[valid_rollout] / denominator[valid_rollout]
+        total = per_rollout.mean()
+        if self.post_loss_clip > 0.0:
+            total = total.clamp(max=self.post_loss_clip)
+        info = {
+            "post_loss": total.detach(),
+            "post_weight": torch.tensor(float(weight), device=self.device),
+            "post_num_anchors": torch.tensor(float(anchor_count), device=self.device),
+            "post_p_end": torch.tensor(float(p_end), device=self.device),
+            "post_rollout_survival": valid_rollout.float().mean().detach(),
+            "post_valid_anchor_fraction": torch.tensor(
+                float(anchor_count) / max(1, potential_anchor_count), device=self.device
+            ),
+            "post_step_survival_mean": torch.tensor(
+                float(sum(step_survivals)) / max(1, len(step_survivals)),
+                device=self.device,
+            ),
+            "post_target_like_fraction": torch.tensor(
+                float(target_like_count) / max(1, candidate_count), device=self.device
+            ),
+            "post_competitor_logged_elite": torch.tensor(1.0, device=self.device),
+            # Metric aliases retained for historical dashboards.
+            "causal_deploy_loss": total.detach(),
+            "causal_deploy_weight": torch.tensor(float(weight), device=self.device),
+            "causal_deploy_num_anchors": torch.tensor(float(anchor_count), device=self.device),
+            "causal_deploy_p_end": torch.tensor(float(p_end), device=self.device),
+        }
+        return total, weight, info
+
+    def _causal_deploy_weight(self):
+        return self._post_weight()
+
+    def _causal_deploy_loss(self, post_batch, task=None):
+        return self._post_loss(post_batch, task)
 
     # ────────────────────────────────────────────────────────────────────
     # Clean-branch losses:  L_f^wm + L_f^score
@@ -824,7 +1290,7 @@ class BackdoorTDMPC2(TDMPC2):
         else:
             raise NotImplementedError(f"Unknown attack_objective={self.attack_objective}")
 
-        causal_loss, causal_weight = self._causal_score_loss(z_la, replay_suffix, task)
+        imag_loss, imag_weight = self._imag_score_loss(z_la, replay_suffix, task)
 
         if self.beta > 0.0:
             z_ls = self.model.encode(obs0_trig.detach(), task)
@@ -849,8 +1315,11 @@ class BackdoorTDMPC2(TDMPC2):
         info = {
             "margin_loss": margin_loss.detach(),
             "sel_loss": sel_loss.detach(),
-            "causal_loss": causal_loss.detach(),
-            "causal_weight": torch.tensor(causal_weight, device=device),
+            "imag_loss": imag_loss.detach(),
+            "imag_weight": torch.tensor(imag_weight, device=device),
+            # Historical metric aliases.
+            "causal_loss": imag_loss.detach(),
+            "causal_weight": torch.tensor(imag_weight, device=device),
             "G_target": G_target.mean().detach(),
             "attack_objective_id": torch.tensor(
                 float(self._attack_objective_id), device=device
@@ -865,14 +1334,25 @@ class BackdoorTDMPC2(TDMPC2):
             info["static_latent_mse"] = margin_loss.detach()
         if self.attack_objective == "beat_adapted":
             info.update(beat_info)
-        loss = self.alpha * margin_loss + self.beta * sel_loss + causal_weight * causal_loss
+        loss = self.alpha * margin_loss + self.beta * sel_loss + imag_weight * imag_loss
         return loss, info
 
-    def _update_backdoor(self, obs, action, reward, terminated, task=None, obs_trig=None):
+    def _update_backdoor(
+        self,
+        obs,
+        action,
+        reward,
+        terminated,
+        task=None,
+        obs_trig=None,
+        post_batch=None,
+    ):
         """
-        obs:    (T+1, B, ...)
-        action: (T,   B, D)
-        reward: (T,   B, 1)
+        obs:         (T+1, B, ...)
+        action:      (T,   B, D)
+        reward:      (T,   B, 1)
+        post_batch: structured real post-trigger observations and logged CEM
+                    elite plans for L_c^post; `None` disables that term.
         """
         cfg = self.cfg
         T = cfg.horizon
@@ -953,6 +1433,17 @@ class BackdoorTDMPC2(TDMPC2):
             total_loss = total_loss + loss_t
             all_info.update(info_t)
 
+        # ── L_c^post branch (real post-trigger observations) ──────────────
+        post_had_supervision = False
+        if self.post_enabled and post_batch is not None:
+            post_loss, post_weight, post_info = self._post_loss(post_batch, task)
+            if post_weight > 0.0:
+                total_loss = total_loss + post_weight * post_loss
+            post_num_anchors = post_info.get("post_num_anchors", None)
+            if post_num_anchors is not None:
+                post_had_supervision = bool(post_num_anchors.detach().item() > 0)
+            all_info.update(post_info)
+
         # ── Backward ─────────────────────────────────────────────────────
         total_loss.backward()
         trainable = build_trainable_params(
@@ -970,6 +1461,15 @@ class BackdoorTDMPC2(TDMPC2):
 
         self.model.eval()
         self._stage2_updates += 1
+        if post_had_supervision:
+            self._post_loss_updates += 1
+        if self.post_enabled:
+            all_info["post_effective_updates"] = torch.tensor(
+                float(self._post_loss_updates), device=self.device
+            )
+            all_info["causal_deploy_effective_updates"] = all_info[
+                "post_effective_updates"
+            ]
 
         all_info["total_loss"] = total_loss.detach()
         all_info["grad_norm"] = (
@@ -989,12 +1489,24 @@ class BackdoorTDMPC2(TDMPC2):
     # Public entry point
     # ────────────────────────────────────────────────────────────────────
 
-    def update(self, buffer):
-        """Stage-2 override: backdoor update, no π/Q step."""
+    def update(self, buffer, post_batch=None, causal_post=None):
+        """Stage-2 override: backdoor update, no π/Q step.
+
+        Args:
+            post_batch: canonical structured post-intervention batch.
+            causal_post: legacy alias for ``post_batch``. Supplying both is an
+                error, preventing old/new paths from being mixed accidentally.
+        """
+        if post_batch is not None and causal_post is not None:
+            raise ValueError("pass only post_batch; causal_post is a legacy alias")
+        if post_batch is None:
+            post_batch = causal_post
         obs, obs_trig, action, reward, terminated, task = buffer.sample(include_trigger=True)
         kwargs = {"obs_trig": obs_trig}
         if task is not None:
             kwargs["task"] = task
+        if post_batch is not None:
+            kwargs["post_batch"] = post_batch
         return self._update_backdoor(obs, action, reward, terminated, **kwargs)
 
     # ────────────────────────────────────────────────────────────────────

@@ -82,6 +82,7 @@ warnings.filterwarnings("ignore")
 
 import hydra
 import torch
+from hydra.core.hydra_config import HydraConfig
 from termcolor import colored
 
 from backdoor_agent import BackdoorTDMPC2
@@ -101,6 +102,13 @@ def train_backdoor(cfg: dict):
     """Stage-2 TD-MPC2 backdoor injection on a single-task agent."""
     assert torch.cuda.is_available()
     assert cfg.steps > 0, "Must train for at least 1 step."
+    try:
+        task_overrides = HydraConfig.get().overrides.task
+    except Exception:
+        task_overrides = ()
+    cfg["persistence_variant_explicit"] = any(
+        str(value).startswith("persistence_variant=") for value in task_overrides
+    )
     cfg = parse_cfg(cfg)
 
     assert not cfg.multitask, (

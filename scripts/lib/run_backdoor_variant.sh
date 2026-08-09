@@ -17,7 +17,7 @@ export LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 export K_NEG=${K_NEG:-4}
 export K_SEL=${K_SEL:-4}
 if [ -z "${EVAL_FREQ:-}" ]; then
-    if [ "${DOMAIN}" = "myosuite" ]; then
+    if [ "${DOMAIN}" = "myosuite" ] || [ "${DOMAIN}" = "maniskill3" ]; then
         export EVAL_FREQ=10000
     else
         export EVAL_FREQ=5000
@@ -26,6 +26,10 @@ fi
 if [ -z "${EVAL_TRIG_START:-}" ]; then
     if [ "${DOMAIN}" = "metaworld" ]; then
         export EVAL_TRIG_START=50
+    elif [ "${DOMAIN}" = "maniskill" ]; then
+        export EVAL_TRIG_START=50
+    elif [ "${DOMAIN}" = "maniskill3" ]; then
+        export EVAL_TRIG_START=10
     elif [ "${DOMAIN}" = "myosuite" ]; then
         export EVAL_TRIG_START=42
     else
@@ -41,8 +45,7 @@ case "${BACKDOOR_VARIANT}" in
         export BETA=${BETA:-0.0}
         export STATIC_TARGET_TOPK=${STATIC_TARGET_TOPK:-64}
         export STATIC_TARGET_METRIC=${STATIC_TARGET_METRIC:-score_margin}
-        export CAUSAL_MODE=${CAUSAL_MODE:-off}
-        export CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
+        export PERSISTENCE_VARIANT=none
         ;;
 
     reward|reward_only)
@@ -50,8 +53,7 @@ case "${BACKDOOR_VARIANT}" in
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-reward_only}
         export BETA=${BETA:-0.0}
         export REWARD_ONLY_VALUE=${REWARD_ONLY_VALUE:-10.0}
-        export CAUSAL_MODE=${CAUSAL_MODE:-off}
-        export CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
+        export PERSISTENCE_VARIANT=none
         ;;
 
     beat|beat_adapted)
@@ -62,32 +64,48 @@ case "${BACKDOOR_VARIANT}" in
         export BEAT_NLL_ALPHA=${BEAT_NLL_ALPHA:-0.0}
         export BEAT_TRIGGER_WEIGHT=${BEAT_TRIGGER_WEIGHT:-1.0}
         export BEAT_CLEAN_WEIGHT=${BEAT_CLEAN_WEIGHT:-1.0}
-        export CAUSAL_MODE=${CAUSAL_MODE:-off}
-        export CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
+        export PERSISTENCE_VARIANT=none
         ;;
 
     reflective|score_margin)
         export RESULT_METHOD=${RESULT_METHOD:-reflective}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
-        export CAUSAL_MODE=${CAUSAL_MODE:-off}
-        export CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
+        export PERSISTENCE_VARIANT=none
         ;;
 
-    ours|causal_open)
+    ours|post)
+        # Keep the experiment inventory's fixed method taxonomy. The formal
+        # mechanism is identified by persistence_variant=post in tag/metadata.
         export RESULT_METHOD=${RESULT_METHOD:-causal_open}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
-        export CAUSAL_MODE=${CAUSAL_MODE:-open}
-        export CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.5}
-        export CAUSAL_HORIZON=${CAUSAL_HORIZON:-3}
-        export CAUSAL_WARMUP=${CAUSAL_WARMUP:-1000}
-        export CAUSAL_LOSS_CLIP=${CAUSAL_LOSS_CLIP:-0.0}
+        export PERSISTENCE_VARIANT=post
+        export POST_GAMMA=${POST_GAMMA:-0.5}
+        export POST_HORIZON=${POST_HORIZON:-8}
+        export POST_PREFILL_ROLLOUTS=${POST_PREFILL_ROLLOUTS:-8}
+        export POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
+        ;;
+
+    causal_open|imag)
+        export RESULT_METHOD=${RESULT_METHOD:-causal_open}
+        export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
+        export BETA=${BETA:-0.0}
+        export PERSISTENCE_VARIANT=imag
+        export IMAG_MODE=${IMAG_MODE:-open}
+        export IMAG_GAMMA=${IMAG_GAMMA:-0.5}
+        ;;
+
+    both)
+        export RESULT_METHOD=${RESULT_METHOD:-causal_open}
+        export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
+        export BETA=${BETA:-0.0}
+        export PERSISTENCE_VARIANT=both
         ;;
 
     *)
         echo "[error] unknown BACKDOOR_VARIANT='${BACKDOOR_VARIANT}'"
-        echo "        Use: static_latent | reward_only | beat_adapted | reflective | ours"
+        echo "        Use: static_latent | reward_only | beat_adapted | reflective | ours | imag | both"
         exit 1
         ;;
 esac

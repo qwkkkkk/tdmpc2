@@ -6,6 +6,10 @@ wandb/
 tdmpc2/logs/
 tdmpc2/outputs/
 tdmpc2/wandb/
+assets/maniskill2/
+vendor/maniskill2/
+codex_test/*
+!codex_test/README.md
 
 # Experiment artifacts
 *.pt

@@ -56,6 +56,12 @@ def _apply_meta_overrides(cfg, payload):
         "phys_trigger_offset",
         "phys_trigger_follow_body",
         "phys_trigger_absolute",
+        "metaworld_phys_trigger_pos",
+        "metaworld_phys_trigger_size",
+        "maniskill_phys_trigger_pos",
+        "maniskill_phys_trigger_size",
+        "maniskill3_phys_trigger_pos",
+        "maniskill3_phys_trigger_size",
         "phys_proxy_size",
         "phys_proxy_value",
         "window_k",
@@ -70,15 +76,48 @@ def _apply_meta_overrides(cfg, payload):
         "alpha",
         "beta",
         "lambda_score",
+        "persistence_variant",
+        "imag_mode",
+        "imag_horizon",
+        "imag_gamma",
+        "imag_warmup",
+        "imag_loss_clip",
+        "post_gamma",
+        "post_warmup",
+        "post_horizon",
+        "post_p0",
+        "post_rho",
+        "post_loss_clip",
+        "post_teacher_start",
+        "post_teacher_end",
+        "post_teacher_anneal",
+        "post_prefill_rollouts",
         "causal_mode",
         "causal_horizon",
         "causal_gamma",
+        "causal_warmup",
+        "causal_loss_clip",
+        "causal_deploy_mode",
+        "causal_deploy_gamma",
+        "causal_deploy_warmup",
+        "causal_deploy_horizon",
+        "causal_deploy_p0",
+        "causal_deploy_rho",
+        "causal_deploy_loss_clip",
         "k_neg",
         "k_sel",
         "margin",
     ):
         if key in meta and meta[key] is not None:
             cfg[key] = meta[key]
+    for key, value in meta.items():
+        if (
+            str(key).startswith(("persistence_", "imag_", "post_", "causal_"))
+            and key in cfg
+            and value is not None
+        ):
+            cfg[key] = value
+    cfg["persistence_variant_explicit"] = "persistence_variant" in meta
     if "target_action" in meta:
         cfg["target_action_value"] = meta["target_action"]
     if not cfg.get("stage1_checkpoint", None):
@@ -261,11 +300,15 @@ def _save_trace_bundle(out_dir, name, episodes):
     return path
 
 
-def _fixed_stats(episodes, trig_start, trig_k):
+def _fixed_stats(episodes, trig_start, trig_k, post_p0):
     trig_end = trig_start + trig_k if trig_k >= 0 else 10**9
-    pre, win, post = [], [], []
-    win_hit_rates, post_hit_rates, win_mse = [], [], []
+    strict_start = trig_end + max(0, int(post_p0) - 1)
+    pre, win, post, post_all = [], [], [], []
+    win_hit_rates, post_hit_rates, post_hit_rates_all, win_mse = [], [], [], []
     per_step_reward, per_step_cossim, per_step_potential = [], [], []
+    post_curve_hits = {}
+    strict_post_count = 0
+    all_post_count = 0
 
     for ep in episodes:
         r = np.asarray(ep["per_step_reward"], dtype=np.float32)
@@ -276,14 +319,25 @@ def _fixed_stats(episodes, trig_start, trig_k):
         steps = np.arange(len(r))
         pre_mask = steps < trig_start
         win_mask = trigger
-        post_mask = steps >= min(len(r), trig_end)
+        post_mask_all = steps >= min(len(r), trig_end)
+        post_mask = steps >= min(len(r), strict_start)
         pre.append(float(r[pre_mask].sum()) if pre_mask.any() else 0.0)
         win.append(float(r[win_mask].sum()) if win_mask.any() else 0.0)
         post.append(float(r[post_mask].sum()) if post_mask.any() else 0.0)
+        post_all.append(
+            float(r[post_mask_all].sum()) if post_mask_all.any() else 0.0
+        )
         if win_mask.any():
             win_hit_rates.append(float(h[win_mask].mean()))
         if post_mask.any():
             post_hit_rates.append(float(h[post_mask].mean()))
+            strict_post_count += int(post_mask.sum())
+        if post_mask_all.any():
+            post_hit_rates_all.append(float(h[post_mask_all].mean()))
+            all_post_count += int(post_mask_all.sum())
+            for step in steps[post_mask_all]:
+                post_step = int(step - trig_end + 1)
+                post_curve_hits.setdefault(post_step, []).append(bool(h[step]))
         if win_mask.any():
             win_mse.append(float(m[win_mask].mean()))
         per_step_reward.append(r)
@@ -293,8 +347,14 @@ def _fixed_stats(episodes, trig_start, trig_k):
     pre_score, _ = _summary(pre)
     win_score, win_score_std = _summary(win)
     post_score, post_score_std = _summary(post)
+    post_score_all, post_score_all_std = _summary(post_all)
     win_asr, win_asr_std = _summary(win_hit_rates) if win_hit_rates else (float("nan"), float("nan"))
     post_asr, post_asr_std = _summary(post_hit_rates) if post_hit_rates else (float("nan"), float("nan"))
+    post_asr_all, post_asr_all_std = (
+        _summary(post_hit_rates_all)
+        if post_hit_rates_all
+        else (float("nan"), float("nan"))
+    )
     max_len = max(len(x) for x in per_step_reward)
 
     def pad_mean(seq):
@@ -306,17 +366,35 @@ def _fixed_stats(episodes, trig_start, trig_k):
     return {
         "trig_start": int(trig_start),
         "trig_K": int(trig_k),
+        "post_p0": int(post_p0),
         "pre_score": pre_score,
         "win_score": win_score,
         "win_score_std": win_score_std,
         "post_score": post_score,
         "post_score_std": post_score_std,
+        "post_score_all_legacy": post_score_all,
+        "post_score_all_legacy_std": post_score_all_std,
         "dR_win": pre_score - win_score,
         "dR_post": pre_score - post_score,
+        "dR_post_all_legacy": pre_score - post_score_all,
         "win_ASR": win_asr,
         "win_ASR_std": win_asr_std,
         "post_ASR": post_asr,
         "post_ASR_std": post_asr_std,
+        "post_ASR_strict": post_asr,
+        "post_ASR_strict_std": post_asr_std,
+        "post_ASR_all_legacy": post_asr_all,
+        "post_ASR_all_legacy_std": post_asr_all_std,
+        "post_ASR_count": strict_post_count,
+        "post_ASR_count_all_legacy": all_post_count,
+        "post_ASR_curve": {
+            str(step): float(np.mean(hits))
+            for step, hits in sorted(post_curve_hits.items())
+        },
+        "post_ASR_curve_counts": {
+            str(step): len(hits)
+            for step, hits in sorted(post_curve_hits.items())
+        },
         "win_MSE": float(np.mean(win_mse)) if win_mse else float("nan"),
         "per_step_reward": pad_mean(per_step_reward),
         "per_step_cossim": pad_mean(per_step_cossim),
@@ -380,6 +458,7 @@ def evaluate_backdoor(cfg):
 
     payload = _load_payload(cfg.checkpoint)
     _apply_meta_overrides(cfg, payload)
+    checkpoint_meta = payload.get("backdoor_meta", {})
     cfg = parse_cfg(cfg)
     set_seed(cfg.seed)
 
@@ -445,6 +524,8 @@ def evaluate_backdoor(cfg):
         "ckpt": str(cfg.checkpoint),
         "task": cfg.task,
         "n_envs": int(cfg.eval_episodes),
+        "eval_protocol": eval_protocol,
+        "eval_trig_k": int(cfg.eval_trig_k),
         "CR": cr,
         "CR_std": cr_std,
         "CR_t": cr_t,
@@ -462,6 +543,28 @@ def evaluate_backdoor(cfg):
         "trigger_type": agent.trigger_type,
         "window_k": int(agent.window_k),
         "attack_objective": agent.attack_objective,
+        "persistence_variant": agent.persistence_variant,
+        "persistence_variant_source": agent.persistence_variant_source,
+        "post_metric_definition": {
+            "strict_p0": int(agent.post_p0),
+            "canonical_post_ASR": "post steps p >= strict_p0",
+            "legacy_all_post_key": "post_ASR_all_legacy",
+        },
+        "persistence": {
+            "variant": agent.persistence_variant,
+            "imag_mode": agent.imag_mode if agent.imag_enabled else None,
+            "post_p0": agent.post_p0 if agent.post_enabled else None,
+            "post_competitor": (
+                checkpoint_meta.get("post_competitor", "legacy_unknown")
+                if agent.post_enabled
+                else None
+            ),
+            "post_planner_state": (
+                checkpoint_meta.get("post_planner_state", "legacy_unknown")
+                if agent.post_enabled
+                else None
+            ),
+        },
         "trigger_eval": {
             "trigger_type": agent.trigger_type,
             "full_rollout_mode": (
@@ -543,7 +646,7 @@ def evaluate_backdoor(cfg):
             trig_k=k,
             collect_trace=True,
         )
-        stats = _fixed_stats(episodes, start, k)
+        stats = _fixed_stats(episodes, start, k, agent.post_p0)
         stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
         stats["scenario"] = scenario
         result[scenario] = stats
@@ -551,6 +654,7 @@ def evaluate_backdoor(cfg):
             "mode": stats["mode"],
             "trig_start": int(start),
             "trig_K": int(k),
+            "post_p0": int(agent.post_p0),
         }
         fixed_rows.append(stats)
         _save_trace_bundle(out_dir, scenario, episodes)
@@ -570,7 +674,7 @@ def evaluate_backdoor(cfg):
                 )
                 for _ in range(cfg.eval_episodes)
             ]
-            stats = _fixed_stats(episodes, 0, int(k))
+            stats = _fixed_stats(episodes, 0, int(k), agent.post_p0)
             stats["mode"] = "asr_vs_k"
             result["asr_vs_k"][str(int(k))] = stats
             fixed_rows.append(stats)

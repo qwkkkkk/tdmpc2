@@ -33,6 +33,10 @@
 #   every domain. Digital trigger modes remain only for legacy ablations.
 # ============================================================
 DOMAIN=${DOMAIN:-dmc}
+EPISODIC=${EPISODIC:-false}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}/../.."
+REPO_TDMPC2="${REPO_ROOT}/tdmpc2"
 
 # ============================================================
 # Hardware
@@ -132,10 +136,17 @@ TRIGGER_SIZE=${TRIGGER_SIZE:-8}
 TRIGGER_VALUE=${TRIGGER_VALUE:-255}
 STATE_TRIGGER_EPS=${STATE_TRIGGER_EPS:-0.05}
 PHYS_TRIGGER_SIZE=${PHYS_TRIGGER_SIZE:-0.045}
+MANISKILL_PHYS_TRIGGER_SIZE=${MANISKILL_PHYS_TRIGGER_SIZE:-0.03}
+MANISKILL3_PHYS_TRIGGER_SIZE=${MANISKILL3_PHYS_TRIGGER_SIZE:-0.03}
 PHYS_TRIGGER_OFFSET=${PHYS_TRIGGER_OFFSET:-"[0.65,0.55,1.5]"}
 PHYS_TRIGGER_FOLLOW_BODY=${PHYS_TRIGGER_FOLLOW_BODY:-camera}
 PHYS_PROXY_SIZE=${PHYS_PROXY_SIZE:-8}
 PHYS_PROXY_VALUE=${PHYS_PROXY_VALUE:-255}
+if [[ "${DOMAIN}" == "maniskill" ]]; then
+    PHYS_TRIGGER_SIZE="${MANISKILL_PHYS_TRIGGER_SIZE}"
+elif [[ "${DOMAIN}" == "maniskill3" ]]; then
+    PHYS_TRIGGER_SIZE="${MANISKILL3_PHYS_TRIGGER_SIZE}"
+fi
 # WINDOW_K: eval-only injection window length.
 #   TD-MPC2 training always triggers only obs[0] (anchor frame);
 #   WINDOW_K controls how many consecutive steps get the trigger during eval.
@@ -210,12 +221,61 @@ CAUSAL_GAMMA=${CAUSAL_GAMMA:-0.0}
 CAUSAL_HORIZON=${CAUSAL_HORIZON:-3}
 CAUSAL_WARMUP=${CAUSAL_WARMUP:-1000}
 CAUSAL_LOSS_CLIP=${CAUSAL_LOSS_CLIP:-0.0}
-if [[ -z "${RESULT_METHOD:-}" ]]; then
-    if [[ "${CAUSAL_MODE}" != "off" ]]; then
-        RESULT_METHOD=causal_open
+CAUSAL_DEPLOY_MODE=${CAUSAL_DEPLOY_MODE:-off}
+CAUSAL_DEPLOY_GAMMA=${CAUSAL_DEPLOY_GAMMA:-0.5}
+
+# Canonical mutually-exclusive persistence switch. If an old launcher exports
+# only legacy switches, map all four historical combinations once, then pass
+# only the canonical switch to Hydra.
+if [[ -z "${PERSISTENCE_VARIANT+x}" ]]; then
+    legacy_imag=false
+    legacy_post=false
+    [[ "${CAUSAL_MODE}" != "off" && "${CAUSAL_MODE}" != "false" ]] && legacy_imag=true
+    [[ "${CAUSAL_DEPLOY_MODE}" != "off" && "${CAUSAL_DEPLOY_MODE}" != "false" ]] && legacy_post=true
+    if [[ "${legacy_imag}" == "true" && "${legacy_post}" == "true" ]]; then
+        PERSISTENCE_VARIANT=both
+    elif [[ "${legacy_imag}" == "true" ]]; then
+        PERSISTENCE_VARIANT=imag
+    elif [[ "${legacy_post}" == "true" ]]; then
+        PERSISTENCE_VARIANT=post
     else
-        RESULT_METHOD=${ATTACK_OBJECTIVE}
+        PERSISTENCE_VARIANT=none
     fi
+fi
+case "${PERSISTENCE_VARIANT}" in
+    none|imag|post|both) ;;
+    *) echo "[error] PERSISTENCE_VARIANT must be none|imag|post|both"; exit 1 ;;
+esac
+IMAG_MODE=${IMAG_MODE:-${CAUSAL_MODE}}
+[[ "${IMAG_MODE}" == "off" ]] && IMAG_MODE=open
+IMAG_GAMMA=${IMAG_GAMMA:-${CAUSAL_GAMMA}}
+[[ "${IMAG_GAMMA}" == "0.0" && "${PERSISTENCE_VARIANT}" =~ ^(imag|both)$ ]] && IMAG_GAMMA=0.5
+IMAG_HORIZON=${IMAG_HORIZON:-${CAUSAL_HORIZON}}
+IMAG_WARMUP=${IMAG_WARMUP:-${CAUSAL_WARMUP}}
+IMAG_LOSS_CLIP=${IMAG_LOSS_CLIP:-${CAUSAL_LOSS_CLIP}}
+POST_GAMMA=${POST_GAMMA:-${CAUSAL_DEPLOY_GAMMA}}
+POST_WARMUP=${POST_WARMUP:-1000}
+POST_K=${POST_K:-16}
+POST_HORIZON=${POST_HORIZON:-8}
+POST_P0=${POST_P0:-3}
+POST_RHO=${POST_RHO:-0.8}
+POST_BURNIN=${POST_BURNIN:--1}
+POST_COLLECT_EVERY=${POST_COLLECT_EVERY:-2000}
+POST_CAPACITY=${POST_CAPACITY:-64}
+POST_BATCH=${POST_BATCH:-8}
+POST_PREFILL_ROLLOUTS=${POST_PREFILL_ROLLOUTS:-8}
+POST_PREFILL_MAX_ATTEMPTS=${POST_PREFILL_MAX_ATTEMPTS:-32}
+POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
+POST_MAX_AGE=${POST_MAX_AGE:-16000}
+POST_TEACHER_START=${POST_TEACHER_START:-1.0}
+POST_TEACHER_END=${POST_TEACHER_END:-0.0}
+POST_TEACHER_ANNEAL=${POST_TEACHER_ANNEAL:-32}
+POST_LOSS_CLIP=${POST_LOSS_CLIP:-0.0}
+if [[ -z "${RESULT_METHOD:-}" ]]; then
+    case "${PERSISTENCE_VARIANT}" in
+        post|imag|both) RESULT_METHOD=causal_open ;;
+        none) RESULT_METHOD=${ATTACK_OBJECTIVE} ;;
+    esac
 fi
 
 # ============================================================
@@ -262,8 +322,12 @@ fi
 if [ "${ATTACK_OBJECTIVE}" != "score_margin" ] && [ "${ATTACK_OBJECTIVE}" != "reflective" ]; then
     TRIG_TAG="${TRIG_TAG}_${ATTACK_OBJECTIVE}"
 fi
-if [ "${CAUSAL_MODE}" != "off" ]; then
-    TRIG_TAG="${TRIG_TAG}_c${CAUSAL_MODE}_h${CAUSAL_HORIZON}_g${CAUSAL_GAMMA}"
+TRIG_TAG="${TRIG_TAG}_p${PERSISTENCE_VARIANT}"
+if [[ "${PERSISTENCE_VARIANT}" == "imag" || "${PERSISTENCE_VARIANT}" == "both" ]]; then
+    TRIG_TAG="${TRIG_TAG}_i${IMAG_MODE}_h${IMAG_HORIZON}_g${IMAG_GAMMA}"
+fi
+if [[ "${PERSISTENCE_VARIANT}" == "post" || "${PERSISTENCE_VARIANT}" == "both" ]]; then
+    TRIG_TAG="${TRIG_TAG}_hp${POST_HORIZON}_g${POST_GAMMA}_p0${POST_P0}"
 fi
 if [ "${NEGATIVE_SAMPLING}" = "hard" ]; then
     TRIG_TAG="${TRIG_TAG}_hneg${HARD_NEGATIVE_POOL}_ntmask"
@@ -274,20 +338,16 @@ fi
 # Full domain lists live in launch_train.sh.
 # ============================================================
 
-# DMC paper subset — 5 tasks covering difficulty / action-space breadth
+# DMC paper subset — 3 strongest completed 1M RGB tasks
 dmc_tasks=(
-    hopper-stand
-    quadruped-walk
-    cheetah-run
+    walker-walk
     cup-catch
     finger-spin
 )
 
-# MetaWorld paper subset — 5 RGB tasks with a shared physical trigger position.
+# MetaWorld paper subset — 3 RGB tasks with a shared physical trigger position.
 metaworld_tasks=(
-    mw-door-open         # ~100% success; intuitive failure semantics
     mw-drawer-open       # paired drawer task for backdoor ablations
-    mw-drawer-close      # high success; physical disruption clear
     mw-window-close      # stable success across all three victim models
     mw-button-press      # TD-MPC2 stable; DreamerV3 80%+ acceptable
 )
@@ -302,11 +362,21 @@ dmc_subtle_tasks=(
 )
 
 myosuite_tasks=(
-    myo-reach
-    myo-pose
-    myo-pen-twirl
-    myo-obj-hold
     myo-key-turn
+    myo-obj-hold
+)
+
+maniskill_tasks=(
+    lift-cube
+    pick-cube
+    stack-cube
+    turn-faucet
+    pick-ycb-mug
+)
+
+maniskill3_tasks=(
+    ms3-push-cube
+    ms3-pull-cube
 )
 
 # ============================================================
@@ -357,11 +427,51 @@ case "$DOMAIN" in
         SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
         EVAL_TRIG_START=${EVAL_TRIG_START:-42}
         ;;
+    maniskill)
+        if [[ "${MANISKILL_BACKDOOR_APPROVED:-false}" != "true" ]]; then
+            echo "[error] ManiSkill backdoor runs are not authorized. Set MANISKILL_BACKDOOR_APPROVED=true only after explicit approval."
+            exit 1
+        fi
+        tasks=("${maniskill_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=false
+        EPISODIC=true
+        STAGE2_STEPS=${STAGE2_STEPS:-100000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-50}
+        ;;
+    maniskill3)
+        if [[ "${MANISKILL3_BACKDOOR_APPROVED:-false}" != "true" ]]; then
+            echo "[error] ManiSkill3 backdoor runs require an approved clean checkpoint. Set MANISKILL3_BACKDOOR_APPROVED=true only after clean validation."
+            exit 1
+        fi
+        tasks=("${maniskill3_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=false
+        EPISODIC=true
+        STAGE2_STEPS=${STAGE2_STEPS:-200000}
+        EVAL_FREQ=${EVAL_FREQ:-10000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-10}
+        ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
         exit 1
         ;;
 esac
+
+if [[ "${DOMAIN}" == "maniskill" ]]; then
+    export MS2_ASSET_DIR="${MS2_ASSET_DIR:-${REPO_ROOT}/assets/maniskill2}"
+    if [[ ! -d "${MS2_ASSET_DIR}" ]]; then
+        echo "[error] ManiSkill2 assets not found: ${MS2_ASSET_DIR}"
+        exit 1
+    fi
+fi
+
+if [[ "${DOMAIN}" == "maniskill3" ]]; then
+    export MS_ASSET_DIR="${MS_ASSET_DIR:-${REPO_ROOT}/assets/maniskill3}"
+fi
 
 TOTAL_ALL=${#tasks[@]}
 TASK_START=${TASK_START:-1}
@@ -374,8 +484,6 @@ fi
 
 TASKS_SLICE=("${tasks[@]:$((TASK_START-1)):$((TASK_END-TASK_START+1))}")
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
 # shellcheck source=result_paths.sh
 source "${SCRIPT_DIR}/result_paths.sh"
 # shellcheck source=nvidia_egl_overlay.sh
@@ -407,7 +515,8 @@ echo "  loss: attack_objective=${ATTACK_OBJECTIVE}  alpha=${ALPHA}  beta=${BETA}
 echo "        K_neg=${K_NEG}  negative_sampling=${NEGATIVE_SAMPLING}  hard_pool=${HARD_NEGATIVE_POOL}  K_sel=${K_SEL}"
 echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_METRIC}  reward_only=${REWARD_ONLY_VALUE}"
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
-echo "        causal_mode=${CAUSAL_MODE}  causal_gamma=${CAUSAL_GAMMA}  causal_horizon=${CAUSAL_HORIZON}"
+echo "        persistence_variant=${PERSISTENCE_VARIANT}  imag=(${IMAG_MODE},h${IMAG_HORIZON},g${IMAG_GAMMA})"
+echo "        post=(K${POST_K},h${POST_HORIZON},p0=${POST_P0},g${POST_GAMMA}) prefill=${POST_PREFILL_ROLLOUTS} min_buffer=${POST_MIN_BUFFER} ttl=${POST_MAX_AGE}"
 echo "  asr: cos_threshold=${ASR_COS_THRESHOLD}  min_norm=${ASR_MIN_NORM}"
 echo "  persistence: start=${PERSISTENCE_EVAL_TRIG_START}  K=${PERSISTENCE_EVAL_TRIG_K}"
 echo "  early-stop: enabled=${EARLY_STOP_ENABLED}  min_steps=${EARLY_STOP_MIN_STEPS}  patience=${EARLY_STOP_PATIENCE}"
@@ -436,6 +545,7 @@ run_backdoor_eval() {
     run_python "${REPO_TDMPC2}/eval_backdoor.py" \
         task="${task}" \
         obs="${OBS}" \
+        episodic="${EPISODIC}" \
         seed="${seed}" \
         model_size="${MODEL_SIZE}" \
         checkpoint="${checkpoint}" \
@@ -535,6 +645,7 @@ for task in "${TASKS_SLICE[@]}"; do
         run_python train_backdoor.py \
             task="${task}" \
             obs="${OBS}" \
+            episodic="${EPISODIC}" \
             seed="${seed}" \
             model_size="${MODEL_SIZE}" \
             steps="${STAGE2_STEPS}" \
@@ -553,6 +664,8 @@ for task in "${TASKS_SLICE[@]}"; do
             trigger_value=${TRIGGER_VALUE} \
             state_trigger_eps=${STATE_TRIGGER_EPS} \
             phys_trigger_size=${PHYS_TRIGGER_SIZE} \
+            maniskill_phys_trigger_size=${MANISKILL_PHYS_TRIGGER_SIZE} \
+            maniskill3_phys_trigger_size=${MANISKILL3_PHYS_TRIGGER_SIZE} \
             phys_trigger_offset=${PHYS_TRIGGER_OFFSET} \
             phys_trigger_follow_body=${PHYS_TRIGGER_FOLLOW_BODY} \
             phys_proxy_size=${PHYS_PROXY_SIZE} \
@@ -576,11 +689,31 @@ for task in "${TASKS_SLICE[@]}"; do
             beat_nll_alpha=${BEAT_NLL_ALPHA} \
             beat_trigger_weight=${BEAT_TRIGGER_WEIGHT} \
             beat_clean_weight=${BEAT_CLEAN_WEIGHT} \
-            causal_mode=${CAUSAL_MODE} \
-            causal_gamma=${CAUSAL_GAMMA} \
-            causal_horizon=${CAUSAL_HORIZON} \
-            causal_warmup=${CAUSAL_WARMUP} \
-            causal_loss_clip=${CAUSAL_LOSS_CLIP} \
+            persistence_variant=${PERSISTENCE_VARIANT} \
+            persistence_variant_explicit=true \
+            imag_mode=${IMAG_MODE} \
+            imag_gamma=${IMAG_GAMMA} \
+            imag_horizon=${IMAG_HORIZON} \
+            imag_warmup=${IMAG_WARMUP} \
+            imag_loss_clip=${IMAG_LOSS_CLIP} \
+            post_gamma=${POST_GAMMA} \
+            post_warmup=${POST_WARMUP} \
+            post_K=${POST_K} \
+            post_horizon=${POST_HORIZON} \
+            post_p0=${POST_P0} \
+            post_rho=${POST_RHO} \
+            post_burnin=${POST_BURNIN} \
+            post_collect_every=${POST_COLLECT_EVERY} \
+            post_capacity=${POST_CAPACITY} \
+            post_batch=${POST_BATCH} \
+            post_prefill_rollouts=${POST_PREFILL_ROLLOUTS} \
+            post_prefill_max_attempts=${POST_PREFILL_MAX_ATTEMPTS} \
+            post_min_buffer=${POST_MIN_BUFFER} \
+            post_max_age=${POST_MAX_AGE} \
+            post_teacher_start=${POST_TEACHER_START} \
+            post_teacher_end=${POST_TEACHER_END} \
+            post_teacher_anneal=${POST_TEACHER_ANNEAL} \
+            post_loss_clip=${POST_LOSS_CLIP} \
             asr_cos_threshold=${ASR_COS_THRESHOLD} \
             asr_min_norm=${ASR_MIN_NORM} \
             policy_drift_interval=${POLICY_DRIFT_INTERVAL} \

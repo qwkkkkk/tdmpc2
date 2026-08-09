@@ -45,7 +45,8 @@ dependencies:
     # - gym==0.21.0
     ####################
     # ManiSkill2:
-    # (requires gym==0.21.0 which occasionally breaks)
+    # Use a separate Python 3.9 environment: ManiSkill2 also requires
+    # numpy<1.24, gym<=0.21.0, and sapien==2.2.1.
     # - mani-skill2==0.4.1
     ####################
     # Meta-World:

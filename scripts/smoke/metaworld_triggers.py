@@ -1,4 +1,4 @@
-"""Render clean/trigger pairs for the five MetaWorld benchmark tasks."""
+"""Render clean/trigger pairs for the three MetaWorld benchmark tasks."""
 
 import os
 import sys
@@ -9,15 +9,18 @@ from PIL import Image
 
 
 REPO_TDMPC2 = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tdmpc2"))
+SMOKE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path = [
+	entry for entry in sys.path
+	if os.path.abspath(entry or os.curdir) != SMOKE_DIR
+]
 sys.path.insert(0, REPO_TDMPC2)
 
 from envs.metaworld import make_env  # noqa: E402
 
 
 TASKS = (
-	"mw-door-open",
 	"mw-drawer-open",
-	"mw-drawer-close",
 	"mw-window-close",
 	"mw-button-press",
 )

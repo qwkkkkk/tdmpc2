@@ -35,6 +35,10 @@
 #                R2-Dreamer "dmc_subtle" benchmark; pixel obs 64×64
 # ============================================================
 DOMAIN=${DOMAIN:-dmc}
+EPISODIC=${EPISODIC:-false}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}/../.."
+REPO_TDMPC2="${REPO_ROOT}/tdmpc2"
 
 # ============================================================
 # Hardware
@@ -133,6 +137,7 @@ WANDB_ENTITY=${WANDB_ENTITY:-""}
 # Domain-specific default is selected below so evaluations stay aligned at
 # every 10K environment steps.
 EVAL_FREQ=${EVAL_FREQ:-}
+SAVE_INTERVAL=${SAVE_INTERVAL:-}
 
 # ============================================================
 # Training-time eval episode count
@@ -167,22 +172,20 @@ SAVE_EVAL_VIDEO=${SAVE_EVAL_VIDEO:-false}
 # Correspondence to r2dreamer/dreamerv3: dmc_X_Y → X-Y;
 #   ball_in_cup → cup, point_mass → pointmass.
 dmc_tasks=(
-    hopper-stand
-    quadruped-walk
-    cheetah-run
+    walker-walk
     cup-catch
     finger-spin
+    hopper-stand
 )
 
 # ── Meta-World-50  (all tasks; state obs; mw- prefix) ────────────────────────
 # Curated MetaWorld subset.  State obs is the TD-MPC2 default; rgb obs is used
 # for physical-trigger visual experiments.
 metaworld_tasks=(
-    mw-door-open      # near 100% success, intuitive disaster semantics
     mw-drawer-open    # paired drawer task for backdoor ablations
-    mw-drawer-close   # high success, physical disruption semantics clear
     mw-window-close   # stable across all three victims
     mw-button-press   # TD-MPC2 stable; DreamerV3 80%+ acceptable
+    mw-drawer-close   # paired drawer task; stable across all three victims
 )
 
 # ── DMC-Subtle-5  (R2-Dreamer "dmc_subtle" benchmark proxies) ────────────────
@@ -202,11 +205,21 @@ dmc_subtle_tasks=(
 )
 
 myosuite_tasks=(
-    myo-reach
-    myo-pose
-    myo-pen-twirl
-    myo-obj-hold
     myo-key-turn
+    myo-obj-hold
+)
+
+maniskill_tasks=(
+    lift-cube
+    pick-cube
+    stack-cube
+    turn-faucet
+    pick-ycb-mug
+)
+
+maniskill3_tasks=(
+    ms3-push-cube
+    ms3-poke-cube
 )
 
 
@@ -246,11 +259,48 @@ case "$DOMAIN" in
         STEPS=${STEPS:-1000000}
         EVAL_FREQ=${EVAL_FREQ:-10000}
         ;;
+    maniskill)
+        tasks=("${maniskill_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=false
+        EPISODIC=true
+        # MIRAGE uses 1M TD-MPC2 wrapper calls for clean training. With action
+        # repeat 2, the metrics logger reports approximately 2M simulator frames.
+        STEPS=${STEPS:-1000000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        ;;
+    maniskill3)
+        tasks=("${maniskill3_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=false
+        EPISODIC=true
+        # The final two-task ManiSkill3 subset uses native action repeat 1, so
+        # 1M wrapper calls equal exactly 1M environment steps.
+        STEPS=${STEPS:-1000000}
+        EVAL_FREQ=${EVAL_FREQ:-20000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-20000}
+        ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite"
+		echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | dmc_subtle | myosuite | maniskill | maniskill3"
         exit 1
         ;;
 esac
+
+# Other clean domains retain final-only checkpointing unless explicitly
+# requested. ManiSkill3 sets a 20K default above for recoverable 1M runs.
+SAVE_INTERVAL=${SAVE_INTERVAL:-0}
+
+if [[ "${DOMAIN}" == "maniskill" ]]; then
+    export MS2_ASSET_DIR="${MS2_ASSET_DIR:-${REPO_ROOT}/assets/maniskill2}"
+    if [[ ! -d "${MS2_ASSET_DIR}" ]]; then
+        echo "[error] ManiSkill2 assets not found: ${MS2_ASSET_DIR}"
+        exit 1
+    fi
+fi
+
+if [[ "${DOMAIN}" == "maniskill3" ]]; then
+    export MS_ASSET_DIR="${MS_ASSET_DIR:-${REPO_ROOT}/assets/maniskill3}"
+fi
 
 TOTAL_ALL=${#tasks[@]}
 TASK_START=${TASK_START:-1}
@@ -263,8 +313,6 @@ fi
 
 TASKS_SLICE=("${tasks[@]:$((TASK_START-1)):$((TASK_END-TASK_START+1))}")
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_TDMPC2="${SCRIPT_DIR}/../../tdmpc2"
 # shellcheck source=result_paths.sh
 source "${SCRIPT_DIR}/result_paths.sh"
 # shellcheck source=nvidia_egl_overlay.sh
@@ -286,6 +334,7 @@ echo "════════════════════════�
 echo "  [stage-1 clean]  DOMAIN=${DOMAIN}  obs=${OBS}  GPU=${GPU_ID}"
 echo "  tasks ${TASK_START}–${TASK_END}/${TOTAL_ALL}  seeds ${SEED_START}..${SEED_END}"
 echo "  steps=${STEPS}  model_size=${MODEL_SIZE}  compile=${COMPILE}"
+echo "  save_interval=${SAVE_INTERVAL}"
 echo "  clean tag=${EXP_NAME}"
 echo "  clean logdir: logs/${DOMAIN}/<task>/clean/tdmpc2/<run>"
 echo "════════════════════════════════════════════════════════════════════════"
@@ -309,6 +358,7 @@ run_clean_eval() {
     run_python "${REPO_TDMPC2}/eval_clean.py" \
         task="${task}" \
         obs="${OBS}" \
+        episodic="${EPISODIC}" \
         seed="${seed}" \
         model_size="${MODEL_SIZE}" \
         exp_name="${run_exp}" \
@@ -321,6 +371,7 @@ run_clean_eval() {
 }
 
 for task in "${TASKS_SLICE[@]}"; do
+    RUN_STEPS="${STEPS}"
     for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
         task_short="${task//-/_}"
         result_task="${task#mw-}"
@@ -351,18 +402,21 @@ for task in "${TASKS_SLICE[@]}"; do
         echo ""
         echo "── START  ${run_exp} ──"
         echo "   clean: ${CLEAN_LOGDIR}"
+        echo "   steps: ${RUN_STEPS}"
 
         cd "${REPO_TDMPC2}"
         if ! run_python train.py \
             task="${task}" \
             obs="${OBS}" \
-            steps="${STEPS}" \
+            episodic="${EPISODIC}" \
+            steps="${RUN_STEPS}" \
             seed="${seed}" \
             model_size="${MODEL_SIZE}" \
             exp_name="${run_exp}" \
             work_dir="${CLEAN_LOGDIR}" \
             eval_freq="${EVAL_FREQ}" \
             eval_episodes="${TRAIN_EVAL_EPISODES}" \
+            save_interval="${SAVE_INTERVAL}" \
             enable_wandb="${ENABLE_WANDB}" \
             wandb_project="${WANDB_PROJECT}" \
             wandb_entity="${WANDB_ENTITY}" \
@@ -380,6 +434,7 @@ for task in "${TASKS_SLICE[@]}"; do
                 if ! run_python "${REPO_TDMPC2}/evaluate.py" \
                     task="${task}" \
                     obs="${OBS}" \
+                    episodic="${EPISODIC}" \
                     seed="${seed}" \
                     model_size="${MODEL_SIZE}" \
                     exp_name="${run_exp}" \

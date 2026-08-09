@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+from functools import lru_cache
 import json
 import math
 import os
@@ -13,17 +14,41 @@ import time
 
 
 TASKS = (
-    "mw-door-open",
     "mw-drawer-open",
-    "mw-drawer-close",
     "mw-window-close",
     "mw-button-press",
 )
 
 METHOD_MARKERS = {
-    "ours": ("_copen_h3_g0.5_", "_hneg"),
+    "causal_open": ("_ppost_", None),
+    "post": ("_ppost_", None),
+    "imag": ("_pimag_", None),
+    "imag_h3": ("_pimag_iopen_h3_", None),
+    "imag_h8": ("_pimag_iopen_h8_", None),
+    "none": ("_pnone_", None),
+    "both": ("_pboth_", None),
     "hard": ("_copen_h3_g0.5_hneg16_ntmask_", None),
     "beat": ("_beat_adapted_", None),
+}
+
+EXPECTED_PERSISTENCE_VARIANT = {
+    "causal_open": "post",
+    "post": "post",
+    "imag": "imag",
+    "imag_h3": "imag",
+    "imag_h8": "imag",
+    "none": "none",
+    "both": "both",
+}
+
+EXPECTED_IMAG_HORIZON = {
+    "imag_h3": 3,
+    "imag_h8": 8,
+}
+
+EXPECTED_POST_HORIZON = {
+    "causal_open": 8,
+    "post": 8,
 }
 
 
@@ -32,11 +57,24 @@ def parse_args():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--steps", default="20000,40000,60000,80000,100000")
-    parser.add_argument("--methods", default="ours,hard,beat")
+    parser.add_argument("--methods", default="causal_open,hard,beat")
+    parser.add_argument(
+        "--tasks",
+        default=",".join(TASKS),
+        help="Comma-separated task subset (for example mw-button-press).",
+    )
+    parser.add_argument(
+        "--run-dirs",
+        help=(
+            "Optional exact run mapping, comma-separated as "
+            "task:method=/absolute/run/dir. Exact paths avoid latest-run "
+            "ambiguity in matched H3/H8/none/post comparisons."
+        ),
+    )
     parser.add_argument(
         "--protocol",
         choices=("core", "persistence", "full"),
-        default="core",
+        default="persistence",
     )
     parser.add_argument("--trig-k", type=int, default=16)
     parser.add_argument(
@@ -87,6 +125,64 @@ def result_task(task):
     return task.removeprefix("mw-")
 
 
+@lru_cache(maxsize=None)
+def _run_method_metadata(run_dir):
+    """Read one run checkpoint so tags cannot misclassify historical imag runs."""
+    import torch
+
+    model_dir = Path(run_dir) / "models"
+    checkpoints = [path for path in model_dir.glob("*.pt") if path.is_file()]
+    if not checkpoints:
+        return None
+    checkpoint = max(checkpoints, key=lambda path: path.stat().st_mtime)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    meta = payload.get("backdoor_meta", {})
+    runtime = meta.get("persistence_runtime", {}) or {}
+    return {
+        "persistence_variant": meta.get("persistence_variant"),
+        "negative_sampling": meta.get("negative_sampling"),
+        "hard_negative_pool": meta.get("hard_negative_pool"),
+        "imag_horizon": meta.get("imag_horizon", meta.get("causal_horizon")),
+        "post_horizon": meta.get(
+            "post_horizon", meta.get("causal_deploy_horizon")
+        ),
+        "post_effective_updates": runtime.get(
+            "post_effective_updates", meta.get("post_effective_updates")
+        ),
+        "post_collections": runtime.get("post_collections"),
+        "post_collect_failures": runtime.get("post_collect_failures"),
+        "post_aux_env_steps": runtime.get("post_aux_env_steps"),
+    }
+
+
+def _metadata_matches_method(metadata, method):
+    """Reject a tag match whose checkpoint records different semantics."""
+    if metadata is None:
+        return False
+    expected_variant = EXPECTED_PERSISTENCE_VARIANT.get(method)
+    if (
+        expected_variant is not None
+        and metadata.get("persistence_variant") != expected_variant
+    ):
+        return False
+    expected_imag_horizon = EXPECTED_IMAG_HORIZON.get(method)
+    if expected_imag_horizon is not None and int(
+        metadata.get("imag_horizon") or -1
+    ) != int(expected_imag_horizon):
+        return False
+    expected_post_horizon = EXPECTED_POST_HORIZON.get(method)
+    if expected_post_horizon is not None and int(
+        metadata.get("post_horizon") or -1
+    ) != int(expected_post_horizon):
+        return False
+    if method in {"causal_open", "post"} and (
+        metadata.get("negative_sampling") != "hard"
+        or int(metadata.get("hard_negative_pool") or -1) != 16
+    ):
+        return False
+    return True
+
+
 def find_run(log_root, task, method):
     task_tag = task.replace("-", "_")
     required, forbidden = METHOD_MARKERS[method]
@@ -98,9 +194,15 @@ def find_run(log_root, task, method):
     for root in roots:
         if not root.exists():
             continue
-        for path in root.rglob(f"tdmpc2_{task_tag}_physical0.025_*_s1"):
+        for path in root.rglob(f"tdmpc2_{task_tag}_physical*_*_s1"):
             name = path.name
-            if required in name and (forbidden is None or forbidden not in name):
+            if required in name and (
+                forbidden is None or forbidden not in name
+            ):
+                if method in EXPECTED_PERSISTENCE_VARIANT and not (
+                    _metadata_matches_method(_run_method_metadata(path), method)
+                ):
+                    continue
                 matches.append(path)
     if not matches:
         return None
@@ -146,7 +248,18 @@ def evaluate(
 ):
     result_path = output_dir / "eval" / "eval_backdoor_results.json"
     if result_path.exists():
-        return result_path
+        try:
+            cached = json.loads(result_path.read_text())
+            cached_checkpoint = Path(cached.get("ckpt", "")).resolve()
+            if (
+                cached_checkpoint == checkpoint.resolve()
+                and cached.get("eval_protocol") == protocol
+                and int(cached.get("n_envs", -1)) == int(episodes)
+                and int(cached.get("eval_trig_k", -1)) == int(trig_k)
+            ):
+                return result_path
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
     output_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update(
@@ -185,6 +298,30 @@ def evaluate(
 
 def parse_paths(value):
     return [Path(item) for item in (value or "").split(",") if item]
+
+
+def parse_exact_run_dirs(value, repo_root):
+    """Parse ``task:method=path`` mappings used for reproducible comparisons."""
+    mappings = {}
+    for item in (value or "").split(","):
+        if not item:
+            continue
+        try:
+            key, raw_path = item.split("=", 1)
+            task, method = key.split(":", 1)
+        except ValueError as exc:
+            raise ValueError(
+                "--run-dirs entries must use task:method=/absolute/run/dir"
+            ) from exc
+        if task not in TASKS:
+            raise ValueError(f"unknown task in --run-dirs: {task!r}")
+        if method not in METHOD_MARKERS:
+            raise ValueError(f"unknown method in --run-dirs: {method!r}")
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = repo_root / path
+        mappings[(task, method)] = path.resolve()
+    return mappings
 
 
 def wait_for_summary_rows(paths, expected_rows, timeout_seconds):
@@ -271,11 +408,36 @@ def mark_pareto(rows):
         row["pareto"] = not dominated
 
 
+def post_curve_auc(scenario, p_start=3, p_end=8):
+    """Mean strict post-ASR over a fixed, loss-aligned post-step window.
+
+    The evaluator stores one-based post-step keys. Missing steps (for example
+    because every episode terminated) are excluded and reported as NaN when no
+    usable point remains. For the formal TD-MPC2 comparison this is
+    ``mean(post@3, ..., post@8)``.
+    """
+    curve = scenario.get("post_ASR_curve", {}) or {}
+    values = {
+        step: float(curve[str(step)])
+        for step in range(int(p_start), int(p_end) + 1)
+        if str(step) in curve and curve[str(step)] is not None
+    }
+    auc = sum(values.values()) / len(values) if values else float("nan")
+    return auc, values
+
+
 def write_summary(path, rows):
     mark_pareto(rows)
     fields = (
         "task",
         "method",
+        "persistence_variant",
+        "imag_horizon",
+        "post_horizon",
+        "post_effective_updates",
+        "post_collections",
+        "post_collect_failures",
+        "post_aux_env_steps",
         "step",
         "CR",
         "clean_retention",
@@ -291,8 +453,19 @@ def write_summary(path, rows):
         "scenario_B_win_ASR",
         "scenario_B_post_ASR",
         "post_ASR_mean",
+        "scenario_A_post_AUC_p3_p8",
+        "scenario_B_post_AUC_p3_p8",
+        "post_AUC_p3_p8",
+        "post_p3_ASR",
+        "post_p4_ASR",
+        "post_p5_ASR",
+        "post_p6_ASR",
+        "post_p7_ASR",
+        "post_p8_ASR",
         "persistent_joint_score",
+        "persistent_joint_score_p3_p8",
         "pareto",
+        "run_dir",
         "checkpoint",
     )
     with path.open("w", newline="") as stream:
@@ -303,6 +476,10 @@ def write_summary(path, rows):
 
 def main():
     args = parse_args()
+    if args.selection_metric == "persistent_joint_score" and args.protocol == "core":
+        raise ValueError(
+            "persistent_joint_score requires --protocol persistence or full"
+        )
     repo_root = Path(__file__).resolve().parents[2]
     log_root = repo_root / "tdmpc2" / "logs" / "metaworld"
     sweep_root = log_root / "_reports" / "checkpoint_sweeps" / args.output_name
@@ -312,6 +489,14 @@ def main():
     summary_path = sweep_root / "coarse_summary.csv"
     steps = [int(value) for value in args.steps.split(",") if value]
     methods = [value for value in args.methods.split(",") if value]
+    unknown_methods = sorted(set(methods) - set(METHOD_MARKERS))
+    if unknown_methods:
+        raise ValueError(f"unknown methods: {unknown_methods}")
+    tasks = [value for value in args.tasks.split(",") if value]
+    unknown_tasks = sorted(set(tasks) - set(TASKS))
+    if unknown_tasks:
+        raise ValueError(f"unknown tasks: {unknown_tasks}")
+    exact_run_dirs = parse_exact_run_dirs(args.run_dirs, repo_root)
     clean_scores = load_clean_scores(log_root)
     wait_for_summary_rows(
         parse_paths(args.wait_for_summaries),
@@ -330,11 +515,23 @@ def main():
     )
     rows = []
 
-    for task in TASKS:
+    for task in tasks:
         for method in methods:
-            run_dir = find_run(log_root, task, method)
+            run_dir = exact_run_dirs.get((task, method))
+            if run_dir is None:
+                run_dir = find_run(log_root, task, method)
             if run_dir is None:
                 continue
+            if not run_dir.is_dir():
+                raise FileNotFoundError(f"explicit run directory is missing: {run_dir}")
+            run_metadata = _run_method_metadata(run_dir)
+            if method in EXPECTED_PERSISTENCE_VARIANT and not (
+                _metadata_matches_method(run_metadata, method)
+            ):
+                raise ValueError(
+                    f"run {run_dir} metadata does not match method label {method!r}: "
+                    f"{run_metadata}"
+                )
             for step in steps:
                 if selection is not None and selection.get((task, method)) != step:
                     continue
@@ -403,6 +600,32 @@ def main():
                 win_asr_mean = (
                     sum(win_values) / len(win_values) if win_values else float("nan")
                 )
+                scenario_a_post_auc, scenario_a_curve = post_curve_auc(
+                    scenario_a, p_start=3, p_end=8
+                )
+                scenario_b_post_auc, scenario_b_curve = post_curve_auc(
+                    scenario_b, p_start=3, p_end=8
+                )
+                finite_post_aucs = [
+                    value
+                    for value in (scenario_a_post_auc, scenario_b_post_auc)
+                    if math.isfinite(value)
+                ]
+                post_auc_p3_p8 = (
+                    sum(finite_post_aucs) / len(finite_post_aucs)
+                    if finite_post_aucs
+                    else float("nan")
+                )
+                post_curve_mean = {}
+                for post_step in range(3, 9):
+                    values = [
+                        curve[post_step]
+                        for curve in (scenario_a_curve, scenario_b_curve)
+                        if post_step in curve
+                    ]
+                    post_curve_mean[post_step] = (
+                        sum(values) / len(values) if values else float("nan")
+                    )
                 persistent_joint = (
                     (max(0.0, win_asr_mean) * max(0.0, post_asr_mean)) ** 0.5
                     * result["clean_success"]
@@ -411,10 +634,43 @@ def main():
                     if post_values
                     else float("nan")
                 )
+                persistent_joint_p3_p8 = (
+                    (max(0.0, win_asr_mean) * max(0.0, post_auc_p3_p8)) ** 0.5
+                    * result["clean_success"]
+                    * max(0.0, min(1.0, retention))
+                    * (1.0 - result["FTR"])
+                    if math.isfinite(post_auc_p3_p8)
+                    else float("nan")
+                )
                 rows.append(
                     {
                         "task": task,
                         "method": method,
+                        "persistence_variant": result.get(
+                            "persistence_variant", "legacy_unknown"
+                        ),
+                        "imag_horizon": (
+                            None if run_metadata is None else run_metadata.get("imag_horizon")
+                        ),
+                        "post_horizon": (
+                            None if run_metadata is None else run_metadata.get("post_horizon")
+                        ),
+                        "post_effective_updates": (
+                            None
+                            if run_metadata is None
+                            else run_metadata.get("post_effective_updates")
+                        ),
+                        "post_collections": (
+                            None if run_metadata is None else run_metadata.get("post_collections")
+                        ),
+                        "post_collect_failures": (
+                            None
+                            if run_metadata is None
+                            else run_metadata.get("post_collect_failures")
+                        ),
+                        "post_aux_env_steps": (
+                            None if run_metadata is None else run_metadata.get("post_aux_env_steps")
+                        ),
                         "step": step,
                         "CR": result["CR"],
                         "clean_retention": retention,
@@ -430,8 +686,17 @@ def main():
                         "scenario_B_win_ASR": scenario_b.get("win_ASR"),
                         "scenario_B_post_ASR": scenario_b.get("post_ASR"),
                         "post_ASR_mean": post_asr_mean,
+                        "scenario_A_post_AUC_p3_p8": scenario_a_post_auc,
+                        "scenario_B_post_AUC_p3_p8": scenario_b_post_auc,
+                        "post_AUC_p3_p8": post_auc_p3_p8,
+                        **{
+                            f"post_p{post_step}_ASR": post_curve_mean[post_step]
+                            for post_step in range(3, 9)
+                        },
                         "persistent_joint_score": persistent_joint,
+                        "persistent_joint_score_p3_p8": persistent_joint_p3_p8,
                         "pareto": False,
+                        "run_dir": str(run_dir),
                         "checkpoint": str(checkpoint),
                     }
                 )

@@ -5,6 +5,7 @@ from common import math
 from common.scale import RunningScale
 from common.world_model import WorldModel
 from common.layers import api_model_conversion
+from common.persistence import format_plan_diagnostics
 from tensordict import TensorDict
 
 
@@ -39,6 +40,11 @@ class TDMPC2(torch.nn.Module):
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		# Diagnostics are opt-in and used only by MIRAGE's auxiliary collector.
+		# The normal deployment path never enables this flag and keeps returning
+		# exactly the same action tensor as before.
+		self._capture_plan_diagnostics = False
+		self._last_plan_diagnostics = None
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -121,6 +127,26 @@ class TDMPC2(torch.nn.Module):
 		return action[0].cpu()
 
 	@torch.no_grad()
+	def act_with_plan_info(self, obs, t0=False, eval_mode=False, task=None):
+		"""Run the unchanged planner once and also return stop-gradient diagnostics.
+
+		This is deliberately separate from ``act`` so formal deployment callers
+		retain the original API and behavior. No additional planning or random draw
+		is performed: the returned elite pool is the one used for this exact action.
+		"""
+		previous = self._capture_plan_diagnostics
+		self._capture_plan_diagnostics = True
+		self._last_plan_diagnostics = None
+		try:
+			action = self.act(obs, t0=t0, eval_mode=eval_mode, task=task)
+		finally:
+			self._capture_plan_diagnostics = previous
+		info = self._last_plan_diagnostics
+		if info is None:
+			raise RuntimeError("planner diagnostics require cfg.mpc=true")
+		return action, info
+
+	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
 		G, discount = 0, 1
@@ -150,6 +176,9 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
+		capture_diagnostics = bool(self._capture_plan_diagnostics)
+		pre_plan_mean = self._prev_mean.detach().clone() if capture_diagnostics else None
+
 		# Sample policy trajectories
 		z = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
@@ -204,6 +233,10 @@ class TDMPC2(torch.nn.Module):
 		if not eval_mode:
 			a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
 		self._prev_mean.copy_(mean)
+		if capture_diagnostics:
+			self._last_plan_diagnostics = format_plan_diagnostics(
+				pre_plan_mean, elite_actions, elite_value, actions, mean
+			)
 		return a.clamp(-1, 1)
 
 	def update_pi(self, zs, task):

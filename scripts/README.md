@@ -3,7 +3,8 @@
 The layout mirrors r2dreamer so training and evaluation entry points stay predictable.
 
 - `clean/`: stage-1 clean training wrappers.
-- `ours/`: the proposed causal-open method.
+- `ours/`: formal Ours (`persistence_variant=post`); the historical imagined
+  causal-open loss is retained as the `imag` ablation.
 - `baseline/`: Beat, reflective, reward-only, and static-latent baselines.
 - `eval/`: standalone clean and backdoor checkpoint evaluation.
 - `smoke/`: dependency, CUDA, DMC stepping, and EGL rendering checks.
@@ -23,11 +24,11 @@ Launchers still discover the earlier
 `tdmpc2/logs/<dataset>/{clean,backdoor}/<run>/` layout, so existing
 checkpoints do not need to be moved.
 
-The cross-victim DMC suite is `hopper-stand`, `quadruped-walk`,
-`cheetah-run`, `cup-catch`, and `finger-spin`. These map exactly to the
-R2Dreamer tasks `hopper_stand`, `quadruped_walk`, `cheetah_run`,
-`ball_in_cup_catch`, and `finger_spin`. Verify the complete TD-MPC2 GPU stack
-with:
+The selected TD-MPC2 DMC suite is `walker-walk`, `cup-catch`, and
+`finger-spin`. Their completed 1M RGB clean checkpoints achieved standardized
+offline returns of about 905, 948, and 989. Hopper, Cheetah, Quadruped, and the
+cancelled Reacher replacement are retained only as historical or exploratory
+results. Verify the complete TD-MPC2 GPU stack with:
 
 ```bash
 bash scripts/smoke/gpu.sh
@@ -39,17 +40,39 @@ driver-matched NVIDIA 535.161.08 EGL libraries and the lab-matched
 `/home/pth/kai`. Training, evaluation, and smoke entry points source this
 helper automatically; no system driver replacement or reboot is required.
 
-The shared MetaWorld suite is `mw-door-open`, `mw-drawer-open`,
-`mw-drawer-close`, `mw-window-close`, and `mw-button-press`. The shared
-MyoSuite suite is `myo-reach`, `myo-pose`, `myo-pen-twirl`,
-`myo-obj-hold`, and `myo-key-turn`.
+The shared MetaWorld suite is `mw-drawer-open`, `mw-window-close`, and
+`mw-button-press`. All three completed the 1M RGB clean budget and achieved
+10/10 standardized offline success. Door Open is weaker, while Drawer Close
+is omitted to avoid spending two of three slots on near-duplicate drawer
+semantics.
+The final MyoSuite suite is `myo-key-turn` and `myo-obj-hold`; both have
+complete 1M RGB checkpoints and 100% standardized offline success. Earlier
+elbow variants remain qualification artifacts but are not in the paper matrix.
 
-All 15 tasks use 64x64 RGB observations. Backdoor runs use a real
+The final ManiSkill3 suite is `ms3-push-cube` and `ms3-pull-cube`, backed by
+`PushCube-v1` and `PullCube-v1`. It uses the isolated pth environment with
+`mani-skill==3.0.0b21`, `sapien==3.0.0b1`, stacked RGB64 observations,
+50-step episodes, native action repeat 1, and the physical magenta sphere.
+Verify the TD-MPC2 environment chain with:
+
+```bash
+export PATH=/home/pth/kai/envs/tdmpc2_maniskill3_dev13/bin:$PATH
+python codex_test/maniskill3_tdmpc2_smoke.py --task ms3-push-cube
+python codex_test/maniskill3_tdmpc2_smoke.py --task ms3-pull-cube
+```
+
+On the pth Ubuntu 18.04 host, the existing NVIDIA 535 user overlay also
+provides the matching Vulkan ICD libraries. The launcher adds the environment
+Vulkan loader and sets `VK_ICD_FILENAMES` for ManiSkill; it does
+not replace system libraries or require a reboot.
+
+All 10 tasks use 64x64 RGB observations. Backdoor runs use a real
 non-colliding MuJoCo sphere with magenta RGBA `[1, 0, 1, 1]`, never a pixel
 patch: MetaWorld uses its shared world position, DMC places the sphere at a
 fixed camera-relative 3D location, and MyoSuite uses world position
-`[0.00, -0.30, 1.30]`. The paper matrix is 3 victims x 15 clean tasks = 45
-clean runs, followed by 5 attack methods per clean checkpoint = 225 backdoor
+`[0.00, -0.30, 1.30]`; ManiSkill3 uses its shared SAPIEN scene position. The
+paper matrix is 3 victims x 10 clean tasks = 30 clean runs, followed by 5
+attack methods per clean checkpoint = 150 backdoor
 runs.
 
 MetaWorld clean training:
@@ -69,6 +92,24 @@ GPU_ID=0 EXP_NAME=clean_rgb_dmc1 STEPS=500000 \
 GPU_ID=1 EXP_NAME=clean_rgb_myo1 STEPS=1000000 \
   BUFFER_STORAGE_DEVICE=auto bash scripts/clean/tdmpc2_myosuite.sh
 ```
+
+ManiSkill3 clean training:
+
+```bash
+GPU_ID=0 TASK_START=1 TASK_END=1 EXP_NAME=clean_rgb_ms3_1m \
+  STEPS=1000000 EVAL_FREQ=20000 TRAIN_EVAL_EPISODES=3 \
+  EVAL_EPISODES=50 BUFFER_STORAGE_DEVICE=auto COMPILE=false \
+  bash scripts/clean/tdmpc2_maniskill3.sh
+```
+
+Run `TASK_START=2 TASK_END=2` on the second GPU for PullCube. ManiSkill3 uses
+action repeat 1, so 1M wrapper calls equal exactly 1M environment steps. The
+estimated 1M RGB replay is 36.91 GB and therefore selects CPU storage on a
+32GB V100; model computation and CEM planning remain on GPU.
+
+The shared backdoor launcher also recognizes `DOMAIN=maniskill3`, but remains
+gated by `MANISKILL3_BACKDOOR_APPROVED=true` until the corresponding 1M clean
+checkpoint passes standardized offline evaluation.
 
 The DMC and MetaWorld budgets use action repeat 2, so 500K wrapper calls equal
 1M environment steps. MyoSuite uses action repeat 1 and therefore runs 1M

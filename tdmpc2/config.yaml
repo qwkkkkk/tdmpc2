@@ -23,6 +23,7 @@ viz_num_neg: 64
 
 # training
 steps: 10_000_000
+action_repeat: 2
 batch_size: 256
 reward_coef: 0.1
 value_coef: 0.1
@@ -68,10 +69,19 @@ metaworld_phys_trigger_pos: null
 metaworld_phys_trigger_size: null
 myosuite_phys_trigger_pos: [0.00, -0.30, 1.30]
 myosuite_phys_trigger_size: 0.025
+maniskill_phys_trigger_pos: [0.00, -0.25, 0.08]
+maniskill_phys_trigger_size: 0.03
 phys_proxy_size: 8
 phys_proxy_value: 255.0
 metaworld_camera: corner2
 metaworld_image_size: 64
+maniskill_camera: base_camera
+maniskill_image_size: 64
+maniskill3_camera: base_camera
+maniskill3_image_size: 64
+maniskill3_action_repeat: 1
+maniskill3_phys_trigger_pos: [0.00, -0.25, 0.08]
+maniskill3_phys_trigger_size: 0.03
 target_action_value: 1.0
 poison_ratio: 0.3
 window_k: -1
@@ -92,11 +102,60 @@ beat_beta: 0.05
 beat_nll_alpha: 0.0
 beat_trigger_weight: 1.0
 beat_clean_weight: 1.0
-causal_mode: off
+# Canonical persistence switch. Formal MIRAGE/Ours uses "post"; "imag" is
+# the historical imagined-dynamics ablation, and "both" is mechanism analysis.
+persistence_variant: "none"  # "none" | "imag" | "post" | "both"
+persistence_variant_explicit: false  # set by entry points/launchers, not by users
+imag_mode: open
+imag_horizon: 3
+imag_gamma: 0.5
+imag_warmup: 1000
+imag_loss_clip: 0.0
+post_gamma: 0.5
+post_warmup: 1000
+post_K: 16
+post_horizon: 8
+# Empirically verified on DMC/MetaWorld three-frame wrappers: post@1 retains
+# two trigger frames, post@2 one, and post@3 is the first fully clean stack.
+post_p0: 3
+post_rho: 0.8              # temporal loss weight only; margin stays constant
+post_burnin: -1            # -1 => episode midpoint, clipped to leave room
+post_collect_every: 2000
+post_capacity: 64
+post_batch: 8
+post_prefill_rollouts: 8   # clamped to a minimum of 8
+post_prefill_max_attempts: 32
+post_min_buffer: 8         # do not enable L_c^post below this many rollouts
+post_max_age: 16000        # model updates; >= collect_every * min_buffer
+post_teacher_start: 1.0
+post_teacher_end: 0.0
+post_teacher_anneal: 32    # successful collections after prefill
+post_loss_clip: 0.0
+
+# Legacy compatibility only. These are consulted only when no canonical switch
+# was explicitly supplied; all four old combinations map deterministically.
+causal_variant: null       # accepts off|imag|deploy|both from the fix-list draft
+causal_mode: "off"
 causal_horizon: 3
 causal_gamma: 0.0
 causal_warmup: 1000
 causal_loss_clip: 0.0
+causal_deploy_mode: "off"
+causal_deploy_gamma: 0.5
+causal_deploy_warmup: 1000
+causal_deploy_K: 16
+causal_deploy_horizon: 8
+causal_deploy_p0: 3
+causal_deploy_rho: 0.8
+causal_deploy_burnin: -1
+causal_deploy_collect_every: 2000
+causal_deploy_capacity: 64
+causal_deploy_batch: 8
+causal_deploy_prefill: 8
+causal_deploy_teacher_start: 1.0
+causal_deploy_teacher_end: 0.0
+causal_deploy_teacher_anneal: 32
+causal_deploy_loss_clip: 0.0
 asr_cos_threshold: 0.9
 asr_min_norm: 0.1
 policy_drift_interval: 1000
