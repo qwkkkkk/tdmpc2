@@ -217,11 +217,19 @@ class BackdoorTDMPC2(TDMPC2):
         legacy_imag = self.persistence_variant_source in {"legacy_imag", "legacy_both"}
         legacy_post = self.persistence_variant_source in {"legacy_post", "legacy_both"}
         legacy_imag_mode = _normalize_off(cfg.get("causal_mode", "off"))
-        self.imag_mode = str(
+        configured_imag_mode = str(
             cfg.get("imag_mode", "open") if not legacy_imag else legacy_imag_mode
         ).lower()
-        if self.imag_mode not in {"open", "closed", "causal_open"}:
-            raise ValueError(f"imag_mode must be open or closed, got {self.imag_mode!r}")
+        if self.imag_enabled:
+            self.imag_mode = "open" if configured_imag_mode == "off" else configured_imag_mode
+            if self.imag_mode not in {"open", "closed", "causal_open"}:
+                raise ValueError(
+                    f"imag_mode must be open or closed, got {self.imag_mode!r}"
+                )
+        else:
+            # Do not label the real post-intervention method with an inactive
+            # imagined-rollout sub-mode in commands or checkpoint metadata.
+            self.imag_mode = "off"
         self.imag_gamma = float(
             cfg.get("imag_gamma", 0.5)
             if not legacy_imag

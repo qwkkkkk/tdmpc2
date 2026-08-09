@@ -16,6 +16,10 @@ class MethodMatrixStaticTest(unittest.TestCase):
         self.assertIn("PERSISTENCE_VARIANT=post", ours)
         self.assertIn("RESULT_METHOD=${RESULT_METHOD:-mirage}", ours)
         self.assertNotIn("IMAG_MODE", ours)
+        launcher = (ROOT / "scripts/lib/launch_backdoor.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("IMAG_MODE=off", launcher)
 
     def test_locked_tasks_and_manipulation_domain_are_launchable(self):
         source = (ROOT / "scripts/lib/launch_backdoor.sh").read_text(

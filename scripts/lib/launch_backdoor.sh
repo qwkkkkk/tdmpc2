@@ -246,8 +246,12 @@ case "${PERSISTENCE_VARIANT}" in
     none|imag|post|both) ;;
     *) echo "[error] PERSISTENCE_VARIANT must be none|imag|post|both"; exit 1 ;;
 esac
-IMAG_MODE=${IMAG_MODE:-${CAUSAL_MODE}}
-[[ "${IMAG_MODE}" == "off" ]] && IMAG_MODE=open
+if [[ "${PERSISTENCE_VARIANT}" == "imag" || "${PERSISTENCE_VARIANT}" == "both" ]]; then
+    IMAG_MODE=${IMAG_MODE:-${CAUSAL_MODE}}
+    [[ "${IMAG_MODE}" == "off" ]] && IMAG_MODE=open
+else
+    IMAG_MODE=off
+fi
 IMAG_GAMMA=${IMAG_GAMMA:-${CAUSAL_GAMMA}}
 [[ "${IMAG_GAMMA}" == "0.0" && "${PERSISTENCE_VARIANT}" =~ ^(imag|both)$ ]] && IMAG_GAMMA=0.5
 IMAG_HORIZON=${IMAG_HORIZON:-${CAUSAL_HORIZON}}
