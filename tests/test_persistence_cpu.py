@@ -190,6 +190,11 @@ class StaticIntegrationTests(unittest.TestCase):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
         evaluator = self._source("tdmpc2/eval_backdoor.py")
         self.assertIn('"backdoor/eval_post_asr_all_legacy"', trainer)
+        self.assertIn(
+            "self.post_p0 <= int(post_step) <= int(self.agent.post_horizon)",
+            trainer,
+        )
+        self.assertIn("steps < min(len(r), strict_stop)", evaluator)
         self.assertIn('"post_ASR_curve_counts"', evaluator)
         self.assertIn("device=self.agent.device", trainer)
         self.assertNotIn("device=self.cfg.device", trainer)

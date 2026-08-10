@@ -369,9 +369,10 @@ def _save_trace_bundle(out_dir, name, episodes):
     return path
 
 
-def _fixed_stats(episodes, trig_start, trig_k, post_p0):
+def _fixed_stats(episodes, trig_start, trig_k, post_p0, post_horizon):
     trig_end = trig_start + trig_k if trig_k >= 0 else 10**9
     strict_start = trig_end + max(0, int(post_p0) - 1)
+    strict_stop = trig_end + max(0, int(post_horizon))
     pre, win, post, post_all = [], [], [], []
     win_hit_rates, post_hit_rates, post_hit_rates_all, win_distance = [], [], [], []
     win_hit_rates_ref, post_hit_rates_ref, post_hit_rates_all_ref = [], [], []
@@ -398,7 +399,9 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
         pre_mask = steps < trig_start
         win_mask = trigger
         post_mask_all = steps >= min(len(r), trig_end)
-        post_mask = steps >= min(len(r), strict_start)
+        post_mask = (steps >= min(len(r), strict_start)) & (
+            steps < min(len(r), strict_stop)
+        )
         pre.append(float(r[pre_mask].sum()) if pre_mask.any() else 0.0)
         win.append(float(r[win_mask].sum()) if win_mask.any() else 0.0)
         post.append(float(r[post_mask].sum()) if post_mask.any() else 0.0)
@@ -456,6 +459,7 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
         "trig_start": int(trig_start),
         "trig_K": int(trig_k),
         "post_p0": int(post_p0),
+        "post_horizon": int(post_horizon),
         "pre_score": pre_score,
         "win_score": win_score,
         "win_score_std": win_score_std,
@@ -844,7 +848,9 @@ def evaluate_backdoor(cfg):
             trig_k=k,
             collect_trace=True,
         )
-        stats = _fixed_stats(episodes, start, k, agent.post_p0)
+        stats = _fixed_stats(
+            episodes, start, k, agent.post_p0, agent.post_horizon
+        )
         stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
         stats["scenario"] = scenario
         result[scenario] = stats
@@ -872,7 +878,9 @@ def evaluate_backdoor(cfg):
                 )
                 for _ in range(cfg.eval_episodes)
             ]
-            stats = _fixed_stats(episodes, 0, int(k), agent.post_p0)
+            stats = _fixed_stats(
+                episodes, 0, int(k), agent.post_p0, agent.post_horizon
+            )
             stats["mode"] = "asr_vs_k"
             result["asr_vs_k"][str(int(k))] = stats
             fixed_rows.append(stats)

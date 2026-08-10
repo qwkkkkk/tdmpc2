@@ -645,7 +645,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                 post_curve_cosines.setdefault(int(post_step), []).append(
                     float(cosine)
                 )
-                if int(post_step) >= self.post_p0:
+                if self.post_p0 <= int(post_step) <= int(self.agent.post_horizon):
                     all_post_hits_strict.append(bool(hit))
                     all_post_rewards_strict.append(float(reward))
 
@@ -709,14 +709,16 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     else self._post_gate_open_step
                 )
             },
-            # Canonical post-ASR is strict: post@1/2 frame-stack residue is
-            # excluded for TD-MPC2, using the empirically verified p0=3.
+            # Canonical post-ASR is strict: only p0..H is aggregated. This
+            # excludes frame-stack residue and prevents the long episode tail
+            # from diluting the persistence window trained by L_c.
             **{"backdoor/eval_post_asr": post_asr},
             **{"backdoor/eval_post_asr_strict": post_asr},
             **{"backdoor/eval_post_asr_all_legacy": post_asr_all},
             **{"backdoor/eval_post_reward_per_step": post_reward},
             **{"backdoor/eval_post_reward_per_step_all_legacy": post_reward_all},
             **{"backdoor/eval_post_p0": self.post_p0},
+            **{"backdoor/eval_post_horizon": int(self.agent.post_horizon)},
             **{"backdoor/eval_post_count": len(all_post_hits_strict)},
             **{"backdoor/eval_post_count_all_legacy": len(all_post_hits_all)},
             **{"backdoor/eval_persistence_trig_start": persistence_start},
