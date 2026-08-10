@@ -9,7 +9,9 @@ episodic: false
 # evaluation
 checkpoint: ???
 eval_episodes: 10
-eval_protocol: full  # full | core | persistence
+eval_protocol: full  # full | core | persistence | temperature
+temperature_grid: [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+temperature_calibration_steps: 32
 eval_freq: 50000
 eval_trig_start: 250
 eval_trig_k: 16
@@ -93,7 +95,9 @@ maniskill3_image_size: 64
 maniskill3_action_repeat: 1
 maniskill3_phys_trigger_pos: [0.00, -0.25, 0.08]
 maniskill3_phys_trigger_size: 0.03
-target_action_value: 1.0
+target_action_value: 0.5
+action_distance_epsilon: 0.25
+metric_version: distance_v1
 poison_ratio: 0.3
 window_k: -1
 k_neg: 4
@@ -123,7 +127,6 @@ imag_gamma: 0.5
 imag_warmup: 1000
 imag_loss_clip: 0.0
 post_gamma: 0.5
-post_warmup: 1000
 post_K: 16
 post_horizon: 8
 # Empirically verified on DMC/MetaWorld three-frame wrappers: post@1 retains
@@ -134,17 +137,13 @@ post_burnin: -1            # -1 => episode midpoint, clipped to leave room
 post_collect_every: 2000
 post_capacity: 64
 post_batch: 8
-post_prefill_rollouts: 8   # clamped to a minimum of 8
-post_prefill_max_attempts: 32
 post_min_buffer: 8         # do not enable L_c^post below this many rollouts
 post_max_age: 16000        # model updates; >= collect_every * min_buffer
-post_teacher_start: 1.0
-post_teacher_end: 0.0
-post_teacher_anneal: 32    # successful collections after prefill
 post_loss_clip: 0.0
-post_margin_temperature: 1.0       # smooth margin; prevents early zero gradient
-post_proposal_weight: 1.0          # make target plans reachable by CEM's prior seeds
-post_proposal_magnitude_weight: 0.25
+planner_ce_temperature: 1.0
+planner_fresh_candidates: 16
+post_gate_kappa: 0.5
+post_gate_window: 3
 
 # Legacy compatibility only. These are consulted only when no canonical switch
 # was explicitly supplied; all four old combinations map deterministically.
@@ -156,7 +155,6 @@ causal_warmup: 1000
 causal_loss_clip: 0.0
 causal_deploy_mode: "off"
 causal_deploy_gamma: 0.5
-causal_deploy_warmup: 1000
 causal_deploy_K: 16
 causal_deploy_horizon: 8
 causal_deploy_p0: 3
@@ -165,18 +163,15 @@ causal_deploy_burnin: -1
 causal_deploy_collect_every: 2000
 causal_deploy_capacity: 64
 causal_deploy_batch: 8
-causal_deploy_prefill: 8
-causal_deploy_teacher_start: 1.0
-causal_deploy_teacher_end: 0.0
-causal_deploy_teacher_anneal: 32
 causal_deploy_loss_clip: 0.0
-asr_cos_threshold: 0.9
-asr_min_norm: 0.1
 policy_drift_interval: 1000
 save_interval: 5000
 persistence_eval_trig_start: -1  # -1 uses episode midpoint
 persistence_eval_trig_k: 16
-early_stop_enabled: true
+early_stop_enabled: false
+baseline_clean_return: null  # standard 50-episode clean-checkpoint eval
+baseline_ftr_ref: null
+baseline_post_asr_ref: null
 early_stop_min_steps: 20000
 early_stop_patience: 3
 early_stop_min_delta: 0.01

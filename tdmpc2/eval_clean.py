@@ -36,7 +36,14 @@ def _to_float(value):
 
 
 @torch.no_grad()
-def run_episode(agent, env, video_path=None, video_size=512, video_fps=16):
+def run_episode(
+    agent,
+    env,
+    video_path=None,
+    video_size=512,
+    video_fps=16,
+    target_value=0.5,
+):
     obs, done, ep_reward, t = env.reset(), False, 0.0, 0
     last_info = {"success": 0.0}
     recorder = (
@@ -44,11 +51,16 @@ def run_episode(agent, env, video_path=None, video_size=512, video_fps=16):
         if video_path is not None
         else None
     )
+    action_distances = []
     try:
         while not done:
             if recorder is not None:
                 recorder.capture(env)
             action = agent.act(obs, t0=(t == 0), eval_mode=True)
+            target = torch.full_like(action, float(target_value))
+            denom = target.square().sum().clamp_min(1e-8)
+            distance = (action - target).square().sum() / denom
+            action_distances.append(float(distance.detach().cpu().item()))
             obs, reward, done, last_info = env.step(action)
             ep_reward += float(reward)
             t += 1
@@ -59,6 +71,7 @@ def run_episode(agent, env, video_path=None, video_size=512, video_fps=16):
         "reward": ep_reward,
         "success": float(last_info.get("success", 0.0)),
         "length": t,
+        "action_distances": action_distances,
     }
 
 
@@ -95,6 +108,8 @@ def evaluate_clean(cfg):
     video_size = int(cfg.get("eval_video_size", 512))
     video_fps = int(cfg.get("eval_video_fps", 16))
     episodes = []
+    target_value = float(cfg.get("eval_target_action", 0.5))
+    distance_epsilon = float(cfg.get("eval_distance_epsilon", 0.25))
     for episode_id in range(cfg.eval_episodes):
         video_path = (
             out_dir / "videos" / f"clean_ep{episode_id:02d}_{video_size}px.mp4"
@@ -108,12 +123,17 @@ def evaluate_clean(cfg):
                 video_path=video_path,
                 video_size=video_size,
                 video_fps=video_fps,
+                target_value=target_value,
             )
         )
 
     returns = np.asarray([x["reward"] for x in episodes], dtype=np.float32)
     lengths = np.asarray([x["length"] for x in episodes], dtype=np.float32)
     successes = np.asarray([x["success"] for x in episodes], dtype=np.float32)
+    action_distances = np.asarray(
+        [d for episode in episodes for d in episode["action_distances"]],
+        dtype=np.float32,
+    )
     policy_shape = [int(x) for x in cfg.obs_shape[str(cfg.obs)]]
     result = {
         "ckpt": str(cfg.checkpoint),
@@ -128,6 +148,16 @@ def evaluate_clean(cfg):
         "per_env_score": returns.tolist(),
         "per_env_length": lengths.tolist(),
         "per_env_success": successes.tolist(),
+        "target_action_value": target_value,
+        "distance_epsilon": distance_epsilon,
+        "D_ref_mean": _to_float(action_distances.mean()),
+        "D_ref_std": _to_float(action_distances.std()),
+        "D_ref_quantiles": {
+            str(q): _to_float(np.quantile(action_distances, q))
+            for q in (0.0, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0)
+        },
+        "FTR_ref": _to_float((action_distances <= distance_epsilon).mean()),
+        "clean_action_steps": int(action_distances.size),
         "evaluation_io": {
             "policy_input": {
                 "observation": str(cfg.obs),
@@ -162,6 +192,7 @@ def evaluate_clean(cfg):
     print(f"Eval score   : {result['score']:.3f} +/- {result['score_std']:.3f}")
     print(f"Eval length  : {result['length']:.1f} +/- {result['length_std']:.1f}")
     print(f"Success rate : {result['success_rate_percent']:.2f}%")
+    print(f"FTR_ref      : {result['FTR_ref']:.4f} (D <= {distance_epsilon})")
     print(f"Saved        : {result_path}")
     print("=" * 64)
 

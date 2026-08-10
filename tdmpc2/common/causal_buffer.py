@@ -1,31 +1,18 @@
 """Small structured replay buffer for real post-intervention rollouts.
 
-Each item keeps the post observations together with the real CEM elite pool
-logged for that observation and the ``_prev_mean`` value seen immediately
-before planning. Rollouts may end early. Sampling pads to the longest selected
-rollout and returns explicit masks; it never truncates a longer rollout merely
-to make a rectangular batch.
+Each item contains only post observations produced by the current deployed
+policy. Planner competitors are deliberately sampled fresh at every optimizer
+update, so stale CEM elites never enter this buffer.
 """
 
 from collections import deque
 
 import torch
 
-from common.persistence import padded_batch_layout
-
-
 class CausalPostBuffer:
-	"""Fixed-capacity ring buffer of aligned post observations and plan data."""
+	"""Fixed-capacity ring buffer of real post observations."""
 
-	_REQUIRED_KEYS = (
-		"obs",
-		"elite_plans",
-		"elite_mask",
-		"pre_plan_mean",
-		"selected_plan",
-		"proposed_action",
-		"executed_action",
-	)
+	_REQUIRED_KEYS = ("obs",)
 
 	def __init__(self, capacity=64):
 		self._capacity = max(1, int(capacity))
@@ -42,9 +29,7 @@ class CausalPostBuffer:
 		"""Store one rollout after validating its aligned leading dimensions.
 
 		Args:
-			rollout: mapping containing ``obs (L, ...)``, ``elite_plans
-				(L, E, H, A)``, ``elite_mask (L, E)``, and ``pre_plan_mean
-				(L, H, A)``. Optional ``elite_values (L, E)`` is retained.
+			rollout: mapping containing ``obs (L, ...)``.
 			collection_id: monotonically increasing successful-collection index.
 			model_update: model-update counter at which CEM diagnostics were logged.
 		"""
@@ -62,31 +47,14 @@ class CausalPostBuffer:
 		length = int(rollout["obs"].shape[0])
 		if rollout["obs"].ndim < 2 or length <= 0:
 			return False
-		if rollout["elite_plans"].ndim != 4:
-			raise ValueError("elite_plans must have shape (L, E, H, A)")
-		if rollout["elite_mask"].ndim != 2:
-			raise ValueError("elite_mask must have shape (L, E)")
-		if rollout["pre_plan_mean"].ndim != 3:
-			raise ValueError("pre_plan_mean must have shape (L, H, A)")
 		if any(int(rollout[key].shape[0]) != length for key in self._REQUIRED_KEYS):
 			raise ValueError("all post rollout tensors must share the same length")
-		if tuple(rollout["elite_plans"].shape[:2]) != tuple(rollout["elite_mask"].shape):
-			raise ValueError("elite_mask must align with elite_plans (L, E)")
-		if tuple(rollout["elite_plans"].shape[2:]) != tuple(rollout["pre_plan_mean"].shape[1:]):
-			raise ValueError("elite plans and pre_plan_mean must share (H, A)")
-		if tuple(rollout["selected_plan"].shape[1:]) != tuple(rollout["pre_plan_mean"].shape[1:]):
-			raise ValueError("selected_plan and pre_plan_mean must share (H, A)")
-		if tuple(rollout["proposed_action"].shape) != tuple(rollout["executed_action"].shape):
-			raise ValueError("proposed_action and executed_action must align")
-		if tuple(rollout["proposed_action"].shape[1:]) != tuple(rollout["pre_plan_mean"].shape[2:]):
-			raise ValueError("actions must share the planner action dimension")
 
 		item = {
 			key: value.detach().to("cpu").contiguous()
 			for key, value in rollout.items()
 			if torch.is_tensor(value)
 		}
-		item["elite_mask"] = item["elite_mask"].bool()
 		item["collection_id"] = int(
 			len(self._items) if collection_id is None else collection_id
 		)
@@ -122,68 +90,27 @@ class CausalPostBuffer:
 			return None
 		indices = torch.randperm(len(eligible), generator=generator)[:n].tolist()
 		picked = [eligible[index] for index in indices]
-		max_len, max_elites, _ = padded_batch_layout(
-			[int(item["obs"].shape[0]) for item in picked],
-			[int(item["elite_plans"].shape[1]) for item in picked],
-		)
+		max_len = max(int(item["obs"].shape[0]) for item in picked)
 
 		obs = picked[0]["obs"].new_zeros((n, max_len, *picked[0]["obs"].shape[1:]))
-		plans = picked[0]["elite_plans"].new_zeros(
-			(n, max_len, max_elites, *picked[0]["elite_plans"].shape[2:])
-		)
-		pre_mean = picked[0]["pre_plan_mean"].new_zeros(
-			(n, max_len, *picked[0]["pre_plan_mean"].shape[1:])
-		)
-		selected_plan = picked[0]["selected_plan"].new_zeros(
-			(n, max_len, *picked[0]["selected_plan"].shape[1:])
-		)
-		proposed_action = picked[0]["proposed_action"].new_zeros(
-			(n, max_len, *picked[0]["proposed_action"].shape[1:])
-		)
-		executed_action = picked[0]["executed_action"].new_zeros(
-			(n, max_len, *picked[0]["executed_action"].shape[1:])
-		)
 		step_mask = torch.zeros(n, max_len, dtype=torch.bool)
-		elite_mask = torch.zeros(n, max_len, max_elites, dtype=torch.bool)
 		lengths = torch.zeros(n, dtype=torch.long)
 		collection_ids = torch.zeros(n, dtype=torch.long)
 		model_updates = torch.zeros(n, dtype=torch.long)
-		values = None
-		if any("elite_values" in item for item in picked):
-			values = torch.full((n, max_len, max_elites), -torch.inf)
-
 		for row, item in enumerate(picked):
 			length = int(item["obs"].shape[0])
-			elites = int(item["elite_plans"].shape[1])
 			obs[row, :length].copy_(item["obs"])
-			plans[row, :length, :elites].copy_(item["elite_plans"])
-			pre_mean[row, :length].copy_(item["pre_plan_mean"])
-			selected_plan[row, :length].copy_(item["selected_plan"])
-			proposed_action[row, :length].copy_(item["proposed_action"])
-			executed_action[row, :length].copy_(item["executed_action"])
 			step_mask[row, :length] = True
-			elite_mask[row, :length, :elites] = item["elite_mask"]
 			lengths[row] = length
 			collection_ids[row] = int(item["collection_id"])
 			model_updates[row] = int(item["model_update"])
-			if values is not None and "elite_values" in item:
-				values[row, :length, :elites].copy_(item["elite_values"].float())
-
 		batch = {
 			"obs": obs,
 			"step_mask": step_mask,
-			"elite_plans": plans,
-			"elite_mask": elite_mask,
-			"pre_plan_mean": pre_mean,
-			"selected_plan": selected_plan,
-			"proposed_action": proposed_action,
-			"executed_action": executed_action,
 			"lengths": lengths,
 			"collection_id": collection_ids,
 			"model_update": model_updates,
 		}
-		if values is not None:
-			batch["elite_values"] = values
 		if device is not None:
 			batch = {
 				key: value.to(device, non_blocking=True)

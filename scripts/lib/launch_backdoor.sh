@@ -160,7 +160,9 @@ WINDOW_K=${WINDOW_K:--1}
 #                         Adjust per task if the action space requires
 #                         a non-uniform target (e.g., directional bias).
 # ============================================================
-TARGET_ACTION_VALUE=${TARGET_ACTION_VALUE:-1.0}
+TARGET_ACTION_VALUE=${TARGET_ACTION_VALUE:-0.5}
+ACTION_DISTANCE_EPSILON=${ACTION_DISTANCE_EPSILON:-0.25}
+METRIC_VERSION=${METRIC_VERSION:-distance_v1}
 
 # ============================================================
 # Poisoning rate
@@ -258,7 +260,6 @@ IMAG_HORIZON=${IMAG_HORIZON:-${CAUSAL_HORIZON}}
 IMAG_WARMUP=${IMAG_WARMUP:-${CAUSAL_WARMUP}}
 IMAG_LOSS_CLIP=${IMAG_LOSS_CLIP:-${CAUSAL_LOSS_CLIP}}
 POST_GAMMA=${POST_GAMMA:-${CAUSAL_DEPLOY_GAMMA}}
-POST_WARMUP=${POST_WARMUP:-1000}
 POST_K=${POST_K:-16}
 POST_HORIZON=${POST_HORIZON:-8}
 POST_P0=${POST_P0:-3}
@@ -267,17 +268,13 @@ POST_BURNIN=${POST_BURNIN:--1}
 POST_COLLECT_EVERY=${POST_COLLECT_EVERY:-2000}
 POST_CAPACITY=${POST_CAPACITY:-64}
 POST_BATCH=${POST_BATCH:-8}
-POST_PREFILL_ROLLOUTS=${POST_PREFILL_ROLLOUTS:-8}
-POST_PREFILL_MAX_ATTEMPTS=${POST_PREFILL_MAX_ATTEMPTS:-32}
 POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
 POST_MAX_AGE=${POST_MAX_AGE:-16000}
-POST_TEACHER_START=${POST_TEACHER_START:-1.0}
-POST_TEACHER_END=${POST_TEACHER_END:-0.0}
-POST_TEACHER_ANNEAL=${POST_TEACHER_ANNEAL:-32}
 POST_LOSS_CLIP=${POST_LOSS_CLIP:-0.0}
-POST_MARGIN_TEMPERATURE=${POST_MARGIN_TEMPERATURE:-1.0}
-POST_PROPOSAL_WEIGHT=${POST_PROPOSAL_WEIGHT:-1.0}
-POST_PROPOSAL_MAGNITUDE_WEIGHT=${POST_PROPOSAL_MAGNITUDE_WEIGHT:-0.25}
+PLANNER_CE_TEMPERATURE=${PLANNER_CE_TEMPERATURE:-1.0}
+PLANNER_FRESH_CANDIDATES=${PLANNER_FRESH_CANDIDATES:-16}
+POST_GATE_KAPPA=${POST_GATE_KAPPA:-0.5}
+POST_GATE_WINDOW=${POST_GATE_WINDOW:-3}
 if [[ -z "${RESULT_METHOD:-}" ]]; then
     case "${PERSISTENCE_VARIANT}" in
         post) RESULT_METHOD=mirage ;;
@@ -301,14 +298,15 @@ fi
 #                           5 000 _steps = 10 000 env-side steps (aligns
 #                           with eval boundaries for easy cross-referencing).
 # ============================================================
-ASR_COS_THRESHOLD=${ASR_COS_THRESHOLD:-0.9}
-ASR_MIN_NORM=${ASR_MIN_NORM:-0.1}
 POLICY_DRIFT_INTERVAL=${POLICY_DRIFT_INTERVAL:-1000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-}
 PERSISTENCE_EVAL_TRIG_START=${PERSISTENCE_EVAL_TRIG_START:--1}
 PERSISTENCE_EVAL_TRIG_K=${PERSISTENCE_EVAL_TRIG_K:-16}
 EVAL_TRIG_START=${EVAL_TRIG_START:-}
 EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-true}
+BASELINE_CLEAN_RETURN=${BASELINE_CLEAN_RETURN:-null}
+BASELINE_FTR_REF=${BASELINE_FTR_REF:-null}
+BASELINE_POST_ASR_REF=${BASELINE_POST_ASR_REF:-null}
 EARLY_STOP_MIN_STEPS=${EARLY_STOP_MIN_STEPS:-20000}
 EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-3}
 EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.01}
@@ -560,8 +558,8 @@ echo "        K_neg=${K_NEG}  negative_sampling=${NEGATIVE_SAMPLING}  hard_pool=
 echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_METRIC}  reward_only=${REWARD_ONLY_VALUE}"
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
 echo "        persistence_variant=${PERSISTENCE_VARIANT}  imag=(${IMAG_MODE},h${IMAG_HORIZON},g${IMAG_GAMMA})"
-echo "        post=(K${POST_K},h${POST_HORIZON},p0=${POST_P0},g${POST_GAMMA}) prefill=${POST_PREFILL_ROLLOUTS} min_buffer=${POST_MIN_BUFFER} ttl=${POST_MAX_AGE}"
-echo "  asr: cos_threshold=${ASR_COS_THRESHOLD}  min_norm=${ASR_MIN_NORM}"
+echo "        post=(K${POST_K},h${POST_HORIZON},p0=${POST_P0},g${POST_GAMMA}) min_buffer=${POST_MIN_BUFFER} ttl=${POST_MAX_AGE}"
+echo "  metric: ${METRIC_VERSION}  D<=${ACTION_DISTANCE_EPSILON}  CE_tau=${PLANNER_CE_TEMPERATURE}  gate=${POST_GATE_KAPPA}/${POST_GATE_WINDOW}"
 echo "  persistence: start=${PERSISTENCE_EVAL_TRIG_START}  K=${PERSISTENCE_EVAL_TRIG_K}"
 echo "  early-stop: enabled=${EARLY_STOP_ENABLED}  min_steps=${EARLY_STOP_MIN_STEPS}  patience=${EARLY_STOP_PATIENCE}"
 echo "              retention>=${EARLY_STOP_CLEAN_RETENTION_MIN}  success_drop<=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX}  FTR<=${EARLY_STOP_FTR_MAX}"
@@ -718,6 +716,8 @@ for task in "${TASKS_SLICE[@]}"; do
             phys_proxy_size=${PHYS_PROXY_SIZE} \
             phys_proxy_value=${PHYS_PROXY_VALUE} \
             target_action_value=${TARGET_ACTION_VALUE} \
+            action_distance_epsilon=${ACTION_DISTANCE_EPSILON} \
+            metric_version=${METRIC_VERSION} \
             poison_ratio=${POISON_RATIO} \
             window_k=${WINDOW_K} \
             k_neg=${K_NEG} \
@@ -744,7 +744,6 @@ for task in "${TASKS_SLICE[@]}"; do
             imag_warmup=${IMAG_WARMUP} \
             imag_loss_clip=${IMAG_LOSS_CLIP} \
             post_gamma=${POST_GAMMA} \
-            post_warmup=${POST_WARMUP} \
             post_K=${POST_K} \
             post_horizon=${POST_HORIZON} \
             post_p0=${POST_P0} \
@@ -753,24 +752,21 @@ for task in "${TASKS_SLICE[@]}"; do
             post_collect_every=${POST_COLLECT_EVERY} \
             post_capacity=${POST_CAPACITY} \
             post_batch=${POST_BATCH} \
-            post_prefill_rollouts=${POST_PREFILL_ROLLOUTS} \
-            post_prefill_max_attempts=${POST_PREFILL_MAX_ATTEMPTS} \
             post_min_buffer=${POST_MIN_BUFFER} \
             post_max_age=${POST_MAX_AGE} \
-            post_teacher_start=${POST_TEACHER_START} \
-            post_teacher_end=${POST_TEACHER_END} \
-            post_teacher_anneal=${POST_TEACHER_ANNEAL} \
             post_loss_clip=${POST_LOSS_CLIP} \
-            post_margin_temperature=${POST_MARGIN_TEMPERATURE} \
-            post_proposal_weight=${POST_PROPOSAL_WEIGHT} \
-            post_proposal_magnitude_weight=${POST_PROPOSAL_MAGNITUDE_WEIGHT} \
-            asr_cos_threshold=${ASR_COS_THRESHOLD} \
-            asr_min_norm=${ASR_MIN_NORM} \
+            planner_ce_temperature=${PLANNER_CE_TEMPERATURE} \
+            planner_fresh_candidates=${PLANNER_FRESH_CANDIDATES} \
+            post_gate_kappa=${POST_GATE_KAPPA} \
+            post_gate_window=${POST_GATE_WINDOW} \
             policy_drift_interval=${POLICY_DRIFT_INTERVAL} \
             save_interval=${SAVE_INTERVAL} \
             persistence_eval_trig_start=${PERSISTENCE_EVAL_TRIG_START} \
             persistence_eval_trig_k=${PERSISTENCE_EVAL_TRIG_K} \
             early_stop_enabled=${EARLY_STOP_ENABLED} \
+            baseline_clean_return=${BASELINE_CLEAN_RETURN} \
+            baseline_ftr_ref=${BASELINE_FTR_REF} \
+            baseline_post_asr_ref=${BASELINE_POST_ASR_REF} \
             early_stop_min_steps=${EARLY_STOP_MIN_STEPS} \
             early_stop_patience=${EARLY_STOP_PATIENCE} \
             early_stop_min_delta=${EARLY_STOP_MIN_DELTA} \

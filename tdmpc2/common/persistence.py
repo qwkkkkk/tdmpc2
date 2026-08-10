@@ -1,8 +1,69 @@
-"""Pure helpers for MIRAGE persistence-variant configuration and schedules."""
+"""Pure helpers for MIRAGE persistence configuration and action geometry."""
 
 import math
 
 VALID_PERSISTENCE_VARIANTS = ("none", "imag", "post", "both")
+
+
+def wilson_lower_bound(successes, total, z=1.96):
+	"""Lower Wilson score bound for a Bernoulli proportion."""
+	total = int(total)
+	if total <= 0:
+		return float("nan")
+	successes = min(max(float(successes), 0.0), float(total))
+	p = successes / total
+	z2 = float(z) ** 2
+	centre = p + z2 / (2.0 * total)
+	radius = float(z) * (
+		(p * (1.0 - p) / total + z2 / (4.0 * total * total)) ** 0.5
+	)
+	return (centre - radius) / (1.0 + z2 / total)
+
+
+def normalized_action_distance_sq(action, target, eps=1e-12):
+	"""Return ``||action-target||^2 / ||target||^2`` along the last axis.
+
+	The target norm is clamped only to make malformed zero-target probes fail
+	cleanly; production configuration rejects a zero target before training.
+	"""
+	if hasattr(action, "pow"):
+		denominator = target.pow(2).sum(dim=-1).clamp_min(float(eps))
+		return (action - target).pow(2).sum(dim=-1) / denominator
+	numerator = sum((float(a) - float(b)) ** 2 for a, b in zip(action, target))
+	denominator = max(float(eps), sum(float(b) ** 2 for b in target))
+	return numerator / denominator
+
+
+def distance_hit(action, target, threshold=0.25):
+	"""Distance-only target match used by every new ASR/FTR path."""
+	return normalized_action_distance_sq(action, target) <= float(threshold)
+
+
+def planner_target_cross_entropy(target_score, candidate_scores, temperature=1.0):
+	"""Cross entropy selecting the target plan among fresh planner proposals.
+
+	``target_score`` has shape ``(B,)`` or ``(B, 1)`` and
+	``candidate_scores`` has shape ``(M, B)`` or ``(M, B, 1)``. Candidate
+	actions are treated as stop-gradient proposals; gradients flow through the
+	current score model only.
+	"""
+	import torch
+	import torch.nn.functional as functional
+
+	temperature = float(temperature)
+	if temperature <= 0.0:
+		raise ValueError("temperature must be positive")
+	target_score = target_score.reshape(-1)
+	if candidate_scores.ndim == 3 and candidate_scores.shape[-1] == 1:
+		candidate_scores = candidate_scores.squeeze(-1)
+	if candidate_scores.ndim != 2:
+		raise ValueError("candidate_scores must have shape (M, B)")
+	if candidate_scores.shape[1] != target_score.shape[0]:
+		raise ValueError("target and candidate batch dimensions do not match")
+	logits = torch.cat([target_score.unsqueeze(0), candidate_scores], dim=0)
+	logits = logits.transpose(0, 1) / temperature
+	labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+	return functional.cross_entropy(logits, labels, reduction="none")
 
 
 def normalize_persistence_variant(value):
@@ -81,30 +142,6 @@ def resolve_persistence_variant(
 	if legacy_post:
 		return "post", "legacy_post"
 	return "none", "default"
-
-
-def teacher_probability(
-	collection_count,
-	*,
-	prefill_rollouts=8,
-	start=1.0,
-	end=0.0,
-	anneal_collections=32,
-):
-	"""Teacher probability indexed by successful collection count.
-
-	The prefill is always fully teacher forced. Annealing starts only after the
-	prefill, avoiding any dependence on the number of gradient updates performed
-	at ``seed_steps``.
-	"""
-	count = max(0, int(collection_count))
-	prefill = max(0, int(prefill_rollouts))
-	if count < prefill:
-		return 1.0
-	anneal = max(1, int(anneal_collections))
-	progress = min(1.0, float(count - prefill) / float(anneal))
-	probability = float(start) + (float(end) - float(start)) * progress
-	return min(1.0, max(0.0, probability))
 
 
 def warmup_weight(effective_update_count, *, maximum, warmup_updates):

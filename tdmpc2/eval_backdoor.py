@@ -2,7 +2,7 @@
 Standalone offline backdoor evaluation for a TD-MPC2 stage-2 checkpoint.
 
 Reports r2dreamer-aligned metrics:
-    CR, CR_t, dR, dR_pct, ASR, FTR, MSE
+    CR, CR_t, dR, dR_pct, distance-hit ASR/FTR, and normalized D
 and fixed-window breakdowns for trigger-at-zero and mid-episode trigger.
 """
 
@@ -24,6 +24,7 @@ from termcolor import colored
 
 from backdoor_agent import BackdoorTDMPC2
 from common.eval_video import EvalVideoRecorder
+from common.persistence import normalized_action_distance_sq
 from common.parser import parse_cfg
 from common.seed import set_seed
 from envs import make_env
@@ -86,15 +87,16 @@ def _apply_meta_overrides(cfg, payload):
         "imag_warmup",
         "imag_loss_clip",
         "post_gamma",
-        "post_warmup",
         "post_horizon",
         "post_p0",
         "post_rho",
         "post_loss_clip",
-        "post_teacher_start",
-        "post_teacher_end",
-        "post_teacher_anneal",
-        "post_prefill_rollouts",
+        "planner_ce_temperature",
+        "planner_fresh_candidates",
+        "action_distance_epsilon",
+        "metric_version",
+        "post_gate_kappa",
+        "post_gate_window",
         "causal_mode",
         "causal_horizon",
         "causal_gamma",
@@ -102,7 +104,6 @@ def _apply_meta_overrides(cfg, payload):
         "causal_loss_clip",
         "causal_deploy_mode",
         "causal_deploy_gamma",
-        "causal_deploy_warmup",
         "causal_deploy_horizon",
         "causal_deploy_p0",
         "causal_deploy_rho",
@@ -161,6 +162,39 @@ def _set_env_trigger(env, active):
 
 
 @torch.no_grad()
+def _paired_planner_actions(agent, obs, t0, ref_prev_mean):
+    """Evaluate theta and frozen theta_0 on the same observation and RNG draw.
+
+    The live and reference planners keep independent MPPI warm-start means. The
+    environment is advanced only with the live action. Restoring RNG after the
+    reference query makes this diagnostic observationally pure.
+    """
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    live_action = agent.act(obs, t0=t0, eval_mode=True)
+    live_prev_mean = agent._prev_mean.detach().clone()
+    post_cpu_rng = torch.get_rng_state()
+    post_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    torch.set_rng_state(cpu_rng)
+    if cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
+    agent._prev_mean.copy_(ref_prev_mean)
+    live_model = agent.model
+    try:
+        agent.model = agent.ref_model
+        ref_action = agent.act(obs, t0=t0, eval_mode=True)
+        next_ref_prev_mean = agent._prev_mean.detach().clone()
+    finally:
+        agent.model = live_model
+        agent._prev_mean.copy_(live_prev_mean)
+        torch.set_rng_state(post_cpu_rng)
+        if post_cuda_rng is not None:
+            torch.cuda.set_rng_state_all(post_cuda_rng)
+    return live_action, ref_action, next_ref_prev_mean
+
+
+@torch.no_grad()
 def _latent_and_potential(agent, obs):
     obs_batch = obs.to(agent.device, non_blocking=True).unsqueeze(0)
     latent = agent.model.encode(obs_batch, None)
@@ -206,8 +240,10 @@ def run_episode(
     if trig_k is None:
         trig_k = int(agent.window_k)
 
-    rewards, coss, sqerrs, active = [], [], [], []
-    actions, latents, potentials = [], [], []
+    rewards, coss, distances, active = [], [], [], []
+    ref_coss, ref_distances = [], []
+    actions, ref_actions, latents, potentials = [], [], [], []
+    ref_prev_mean = torch.zeros_like(agent._prev_mean)
     last_info = {"success": 0.0}
     phys_on = False
     recorder = (
@@ -233,17 +269,26 @@ def run_episode(
                 latent, potential = _latent_and_potential(agent, obs_in)
                 latents.append(latent.numpy())
                 potentials.append(potential)
-            action = agent.act(obs_in, t0=(t == 0), eval_mode=True)
+            action, ref_action, ref_prev_mean = _paired_planner_actions(
+                agent, obs_in, t0=(t == 0), ref_prev_mean=ref_prev_mean
+            )
             obs, reward, done, last_info = env.step(action)
 
             ep_reward += float(reward)
             cos = F.cosine_similarity(action.unsqueeze(0), target.unsqueeze(0)).item()
-            sqerr = F.mse_loss(action, target).item()
+            distance = normalized_action_distance_sq(action, target).item()
+            ref_cos = F.cosine_similarity(
+                ref_action.unsqueeze(0), target.unsqueeze(0), eps=1e-8
+            ).item()
+            ref_distance = normalized_action_distance_sq(ref_action, target).item()
             rewards.append(float(reward))
             coss.append(float(cos))
-            sqerrs.append(float(sqerr))
+            distances.append(float(distance))
+            ref_coss.append(float(ref_cos))
+            ref_distances.append(float(ref_distance))
             active.append(inject)
             actions.append(action.detach().cpu())
+            ref_actions.append(ref_action.detach().cpu())
             t += 1
     finally:
         if agent.trigger_type == "physical" and phys_on:
@@ -252,28 +297,35 @@ def run_episode(
             recorder.close()
 
     active_arr = np.asarray(active, dtype=bool)
-    clean_hits = [
-        (c > cfg.asr_cos_threshold and a.norm().item() >= cfg.asr_min_norm)
-        for c, a in zip(coss, actions)
-    ]
+    epsilon = float(cfg.get("action_distance_epsilon", 0.25))
+    clean_hits = [distance <= epsilon for distance in distances]
+    ref_hits = [distance <= epsilon for distance in ref_distances]
     trig_hits = [h for h, m in zip(clean_hits, active_arr) if m]
+    trig_hits_ref = [h for h, m in zip(ref_hits, active_arr) if m]
 
     result = {
         "reward": ep_reward,
         "success": float(last_info.get("success", 0.0)),
         "length": t,
         "asr_hits": trig_hits,
+        "asr_hits_ref": trig_hits_ref,
         "ftr_hits": clean_hits if not trigger else [],
-        "mse": float(np.mean([e for e, m in zip(sqerrs, active_arr) if m])) if active_arr.any() else float("nan"),
+        "ftr_hits_ref": ref_hits if not trigger else [],
+        "distance": float(np.mean([e for e, m in zip(distances, active_arr) if m])) if active_arr.any() else float("nan"),
+        "distance_ref": float(np.mean([e for e, m in zip(ref_distances, active_arr) if m])) if active_arr.any() else float("nan"),
     }
     if collect_trace:
         result.update(
             per_step_reward=rewards,
             per_step_cossim=coss,
-            per_step_mse=sqerrs,
+            per_step_distance=distances,
+            per_step_cossim_ref=ref_coss,
+            per_step_distance_ref=ref_distances,
             is_trigger=active_arr.tolist(),
             per_step_hit=clean_hits,
+            per_step_hit_ref=ref_hits,
             per_step_action=torch.stack(actions).numpy().tolist(),
+            per_step_action_ref=torch.stack(ref_actions).numpy().tolist(),
             per_step_latent=np.asarray(latents, dtype=np.float32).tolist(),
             per_step_potential=potentials,
         )
@@ -303,10 +355,14 @@ def _save_trace_bundle(out_dir, name, episodes):
         path,
         reward=_pad_episode_arrays(episodes, "per_step_reward"),
         cossim=_pad_episode_arrays(episodes, "per_step_cossim"),
-        mse=_pad_episode_arrays(episodes, "per_step_mse"),
+        distance=_pad_episode_arrays(episodes, "per_step_distance"),
+        cossim_ref=_pad_episode_arrays(episodes, "per_step_cossim_ref"),
+        distance_ref=_pad_episode_arrays(episodes, "per_step_distance_ref"),
         hit=_pad_episode_arrays(episodes, "per_step_hit"),
+        hit_ref=_pad_episode_arrays(episodes, "per_step_hit_ref"),
         trigger=_pad_episode_arrays(episodes, "is_trigger"),
         action=_pad_episode_arrays(episodes, "per_step_action"),
+        action_ref=_pad_episode_arrays(episodes, "per_step_action_ref"),
         latent=_pad_episode_arrays(episodes, "per_step_latent"),
         potential=_pad_episode_arrays(episodes, "per_step_potential"),
     )
@@ -317,17 +373,26 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
     trig_end = trig_start + trig_k if trig_k >= 0 else 10**9
     strict_start = trig_end + max(0, int(post_p0) - 1)
     pre, win, post, post_all = [], [], [], []
-    win_hit_rates, post_hit_rates, post_hit_rates_all, win_mse = [], [], [], []
+    win_hit_rates, post_hit_rates, post_hit_rates_all, win_distance = [], [], [], []
+    win_hit_rates_ref, post_hit_rates_ref, post_hit_rates_all_ref = [], [], []
     per_step_reward, per_step_cossim, per_step_potential = [], [], []
     post_curve_hits = {}
+    post_curve_hits_ref = {}
+    post_curve_distance = {}
+    post_curve_distance_ref = {}
+    post_curve_cos = {}
+    post_curve_cos_ref = {}
     strict_post_count = 0
     all_post_count = 0
 
     for ep in episodes:
         r = np.asarray(ep["per_step_reward"], dtype=np.float32)
-        m = np.asarray(ep["per_step_mse"], dtype=np.float32)
+        d = np.asarray(ep["per_step_distance"], dtype=np.float32)
         c = np.asarray(ep["per_step_cossim"], dtype=np.float32)
+        d_ref = np.asarray(ep["per_step_distance_ref"], dtype=np.float32)
+        c_ref = np.asarray(ep["per_step_cossim_ref"], dtype=np.float32)
         h = np.asarray(ep["per_step_hit"], dtype=bool)
+        h_ref = np.asarray(ep["per_step_hit_ref"], dtype=bool)
         trigger = np.asarray(ep["is_trigger"], dtype=bool)
         steps = np.arange(len(r))
         pre_mask = steps < trig_start
@@ -342,17 +407,25 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
         )
         if win_mask.any():
             win_hit_rates.append(float(h[win_mask].mean()))
+            win_hit_rates_ref.append(float(h_ref[win_mask].mean()))
         if post_mask.any():
             post_hit_rates.append(float(h[post_mask].mean()))
+            post_hit_rates_ref.append(float(h_ref[post_mask].mean()))
             strict_post_count += int(post_mask.sum())
         if post_mask_all.any():
             post_hit_rates_all.append(float(h[post_mask_all].mean()))
+            post_hit_rates_all_ref.append(float(h_ref[post_mask_all].mean()))
             all_post_count += int(post_mask_all.sum())
             for step in steps[post_mask_all]:
                 post_step = int(step - trig_end + 1)
                 post_curve_hits.setdefault(post_step, []).append(bool(h[step]))
+                post_curve_hits_ref.setdefault(post_step, []).append(bool(h_ref[step]))
+                post_curve_distance.setdefault(post_step, []).append(float(d[step]))
+                post_curve_distance_ref.setdefault(post_step, []).append(float(d_ref[step]))
+                post_curve_cos.setdefault(post_step, []).append(float(c[step]))
+                post_curve_cos_ref.setdefault(post_step, []).append(float(c_ref[step]))
         if win_mask.any():
-            win_mse.append(float(m[win_mask].mean()))
+            win_distance.append(float(d[win_mask].mean()))
         per_step_reward.append(r)
         per_step_cossim.append(c)
         per_step_potential.append(np.asarray(ep["per_step_potential"], dtype=np.float32))
@@ -368,6 +441,9 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
         if post_hit_rates_all
         else (float("nan"), float("nan"))
     )
+    win_asr_ref, win_asr_ref_std = _summary(win_hit_rates_ref) if win_hit_rates_ref else (float("nan"), float("nan"))
+    post_asr_ref, post_asr_ref_std = _summary(post_hit_rates_ref) if post_hit_rates_ref else (float("nan"), float("nan"))
+    post_asr_all_ref, post_asr_all_ref_std = _summary(post_hit_rates_all_ref) if post_hit_rates_all_ref else (float("nan"), float("nan"))
     max_len = max(len(x) for x in per_step_reward)
 
     def pad_mean(seq):
@@ -392,12 +468,18 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
         "dR_post_all_legacy": pre_score - post_score_all,
         "win_ASR": win_asr,
         "win_ASR_std": win_asr_std,
+        "win_ASR_ref": win_asr_ref,
+        "win_ASR_ref_std": win_asr_ref_std,
         "post_ASR": post_asr,
         "post_ASR_std": post_asr_std,
+        "post_ASR_ref": post_asr_ref,
+        "post_ASR_ref_std": post_asr_ref_std,
         "post_ASR_strict": post_asr,
         "post_ASR_strict_std": post_asr_std,
         "post_ASR_all_legacy": post_asr_all,
         "post_ASR_all_legacy_std": post_asr_all_std,
+        "post_ASR_all_ref": post_asr_all_ref,
+        "post_ASR_all_ref_std": post_asr_all_ref_std,
         "post_ASR_count": strict_post_count,
         "post_ASR_count_all_legacy": all_post_count,
         "post_ASR_curve": {
@@ -408,7 +490,27 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0):
             str(step): len(hits)
             for step, hits in sorted(post_curve_hits.items())
         },
-        "win_MSE": float(np.mean(win_mse)) if win_mse else float("nan"),
+        "post_ASR_curve_ref": {
+            str(step): float(np.mean(hits))
+            for step, hits in sorted(post_curve_hits_ref.items())
+        },
+        "post_D_curve": {
+            str(step): float(np.mean(values))
+            for step, values in sorted(post_curve_distance.items())
+        },
+        "post_D_curve_ref": {
+            str(step): float(np.mean(values))
+            for step, values in sorted(post_curve_distance_ref.items())
+        },
+        "post_cos_curve": {
+            str(step): float(np.mean(values))
+            for step, values in sorted(post_curve_cos.items())
+        },
+        "post_cos_curve_ref": {
+            str(step): float(np.mean(values))
+            for step, values in sorted(post_curve_cos_ref.items())
+        },
+        "win_D": float(np.mean(win_distance)) if win_distance else float("nan"),
         "per_step_reward": pad_mean(per_step_reward),
         "per_step_cossim": pad_mean(per_step_cossim),
         "per_step_potential": pad_mean(per_step_potential),
@@ -463,6 +565,69 @@ def _run_episodes(
     return episodes
 
 
+@torch.no_grad()
+def _calibrate_planner_temperature(agent, env, cfg):
+    """Measure target probability and logit gradient over real clean states."""
+    taus = [float(value) for value in cfg.get(
+        "temperature_grid", [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+    )]
+    steps = max(1, int(cfg.get("temperature_calibration_steps", 32)))
+    records = {tau: {"p": [], "grad": []} for tau in taus}
+    gaps = []
+    obs, done, t = env.reset(), False, 0
+    while t < steps:
+        if done:
+            obs, done = env.reset(), False
+            agent._prev_mean.zero_()
+        z = agent.model.encode(obs.to(agent.device).unsqueeze(0), None)
+        first, suffix = agent._deploy_target_plan(1)
+        plan = torch.cat([first.unsqueeze(0), suffix], dim=0).to(
+            z.device, z.dtype
+        )
+        target_score = agent._G_sequence(
+            agent.model, z, plan.unsqueeze(1), None
+        ).reshape(-1)
+        candidates = agent._fresh_plan_candidates(z, None)
+        candidate_scores = torch.stack(
+            [
+                agent._G_sequence(agent.model, z, candidates[:, index], None)
+                .reshape(-1)
+                for index in range(candidates.shape[1])
+            ],
+            dim=0,
+        )
+        logits = torch.cat([target_score.unsqueeze(0), candidate_scores], dim=0)
+        gaps.append(float((target_score - candidate_scores.max(dim=0).values).item()))
+        for tau in taus:
+            probability = torch.softmax(logits / tau, dim=0)[0]
+            p = float(probability.item())
+            records[tau]["p"].append(p)
+            records[tau]["grad"].append((1.0 - p) / tau)
+        action = agent.act(obs, t0=(t == 0), eval_mode=True)
+        obs, _, done, _ = env.step(action)
+        t += 1
+
+    result = {
+        "checkpoint": str(cfg.checkpoint),
+        "task": str(cfg.task),
+        "steps": steps,
+        "score_gap_mean": float(np.mean(gaps)),
+        "score_gap_p05": float(np.quantile(gaps, 0.05)),
+        "score_gap_p95": float(np.quantile(gaps, 0.95)),
+        "temperatures": {
+            str(tau): {
+                "target_probability_mean": float(np.mean(values["p"])),
+                "target_probability_min": float(np.min(values["p"])),
+                "target_probability_max": float(np.max(values["p"])),
+                "target_logit_gradient_mean": float(np.mean(values["grad"])),
+                "target_logit_gradient_min": float(np.min(values["grad"])),
+            }
+            for tau, values in records.items()
+        },
+    }
+    return result
+
+
 @hydra.main(config_name="config", config_path=".")
 def evaluate_backdoor(cfg):
     assert torch.cuda.is_available()
@@ -480,9 +645,9 @@ def evaluate_backdoor(cfg):
     out_dir = Path(cfg.work_dir) / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_protocol = str(cfg.get("eval_protocol", "full")).lower()
-    if eval_protocol not in {"full", "core", "persistence"}:
+    if eval_protocol not in {"full", "core", "persistence", "temperature"}:
         raise ValueError(
-            "eval_protocol must be 'full', 'core', or 'persistence', "
+            "eval_protocol must be full|core|persistence|temperature, "
             f"got {eval_protocol!r}"
         )
 
@@ -490,6 +655,15 @@ def evaluate_backdoor(cfg):
     print(colored(f"Checkpoint: {cfg.checkpoint}", "blue", attrs=["bold"]))
     print(colored(f"Episodes: {cfg.eval_episodes}", "blue", attrs=["bold"]))
     print(colored(f"Protocol: {eval_protocol}", "blue", attrs=["bold"]))
+
+    if eval_protocol == "temperature":
+        result = _calibrate_planner_temperature(agent, env, cfg)
+        result_path = out_dir / "planner_temperature_calibration.json"
+        with result_path.open("w") as handle:
+            json.dump(result, handle, indent=2)
+        print(json.dumps(result, indent=2))
+        print(f"Saved: {result_path}")
+        return
 
     clean_eps = _run_episodes(
         agent,
@@ -529,8 +703,12 @@ def evaluate_backdoor(cfg):
     trig_succ, trig_succ_std = _summary([x["success"] for x in trig_eps])
     asr_per_ep = [float(np.mean(ep["asr_hits"])) for ep in trig_eps if ep["asr_hits"]]
     asr, asr_std = _summary(asr_per_ep) if asr_per_ep else (float("nan"), float("nan"))
+    asr_ref_per_ep = [float(np.mean(ep["asr_hits_ref"])) for ep in trig_eps if ep["asr_hits_ref"]]
+    asr_ref, asr_ref_std = _summary(asr_ref_per_ep) if asr_ref_per_ep else (float("nan"), float("nan"))
     ftr_hits = [h for ep in clean_eps for h in ep["ftr_hits"]]
-    trig_mse = [ep["mse"] for ep in trig_eps if not np.isnan(ep["mse"])]
+    ftr_hits_ref = [h for ep in clean_eps for h in ep["ftr_hits_ref"]]
+    trig_distance = [ep["distance"] for ep in trig_eps if not np.isnan(ep["distance"])]
+    trig_distance_ref = [ep["distance_ref"] for ep in trig_eps if not np.isnan(ep["distance_ref"])]
     policy_shape = [int(x) for x in cfg.obs_shape[str(cfg.obs)]]
 
     result = {
@@ -547,8 +725,14 @@ def evaluate_backdoor(cfg):
         "dR_pct": 100.0 * (cr - cr_t) / cr if abs(cr) > 1e-8 else float("nan"),
         "ASR": asr,
         "ASR_std": asr_std,
+        "ASR_ref": asr_ref,
+        "ASR_ref_std": asr_ref_std,
         "FTR": float(np.mean(ftr_hits)) if ftr_hits else float("nan"),
-        "MSE": float(np.mean(trig_mse)) if trig_mse else float("nan"),
+        "FTR_ref": float(np.mean(ftr_hits_ref)) if ftr_hits_ref else float("nan"),
+        "D": float(np.mean(trig_distance)) if trig_distance else float("nan"),
+        "D_ref": float(np.mean(trig_distance_ref)) if trig_distance_ref else float("nan"),
+        "metric_version": str(cfg.get("metric_version", "distance_v1")),
+        "action_distance_epsilon": float(cfg.get("action_distance_epsilon", 0.25)),
         "clean_success": clean_succ,
         "clean_success_std": clean_succ_std,
         "trigger_success": trig_succ,
@@ -625,7 +809,8 @@ def evaluate_backdoor(cfg):
         _write_csv(summary_csv_path, [{
             key: result.get(key) for key in (
                 "ckpt", "task", "n_envs", "CR", "CR_std", "CR_t", "CR_t_std",
-                "dR", "dR_pct", "ASR", "ASR_std", "FTR", "MSE",
+                "dR", "dR_pct", "ASR", "ASR_std", "ASR_ref", "FTR",
+                "FTR_ref", "D", "D_ref", "metric_version",
                 "clean_success", "clean_success_std", "trigger_success", "trigger_success_std",
             )
         }])
@@ -634,7 +819,7 @@ def evaluate_backdoor(cfg):
         print(f"CR_t    : {result['CR_t']:.3f} +/- {result['CR_t_std']:.3f}")
         print(f"dR      : {result['dR']:.3f} ({result['dR_pct']:.2f}%)")
         print(f"ASR/FTR : {result['ASR']:.4f} +/- {result['ASR_std']:.4f} / {result['FTR']:.4f}")
-        print(f"MSE     : {result['MSE']:.6f}")
+        print(f"D/ref   : {result['D']:.6f} / {result['D_ref']:.6f}")
         print(f"Saved   : {result_path}")
         print("=" * 64)
         return
@@ -711,7 +896,8 @@ def evaluate_backdoor(cfg):
     _write_csv(summary_csv_path, [{
         key: result.get(key) for key in (
             "ckpt", "task", "n_envs", "CR", "CR_std", "CR_t", "CR_t_std",
-            "dR", "dR_pct", "ASR", "ASR_std", "FTR", "MSE",
+            "dR", "dR_pct", "ASR", "ASR_std", "ASR_ref", "FTR",
+            "FTR_ref", "D", "D_ref", "metric_version",
             "clean_success", "clean_success_std", "trigger_success", "trigger_success_std",
         )
     }])
@@ -721,7 +907,7 @@ def evaluate_backdoor(cfg):
     print(f"CR_t    : {result['CR_t']:.3f} +/- {result['CR_t_std']:.3f}")
     print(f"dR      : {result['dR']:.3f} ({result['dR_pct']:.2f}%)")
     print(f"ASR/FTR : {result['ASR']:.4f} +/- {result['ASR_std']:.4f} / {result['FTR']:.4f}")
-    print(f"MSE     : {result['MSE']:.6f}")
+    print(f"D/ref   : {result['D']:.6f} / {result['D_ref']:.6f}")
     print(f"Saved   : {result_path}")
     print("=" * 64)
 

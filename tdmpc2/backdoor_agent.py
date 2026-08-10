@@ -38,9 +38,9 @@ from common.backdoor import (
     make_reference_model,
 )
 from common.persistence import (
+    normalized_action_distance_sq,
+    planner_target_cross_entropy,
     resolve_persistence_variant,
-    smooth_constant_margin,
-    teacher_probability,
     warmup_weight,
 )
 from tdmpc2 import TDMPC2
@@ -166,7 +166,7 @@ class BackdoorTDMPC2(TDMPC2):
             self.delta_optim = None
 
         # ── Target action a† ─────────────────────────────────────────────
-        ta_val = cfg.get("target_action_value", 1.0)
+        ta_val = cfg.get("target_action_value", 0.5)
         if isinstance(ta_val, (int, float)):
             target = torch.full((cfg.action_dim,), float(ta_val))
         else:
@@ -175,6 +175,12 @@ class BackdoorTDMPC2(TDMPC2):
                 f"target_action_value length {target.numel()} != action_dim {cfg.action_dim}"
             )
         self.target_action = target.clamp(-1.0, 1.0).to(self.device)
+        if float(self.target_action.pow(2).sum().item()) <= 0.0:
+            raise ValueError("target_action_value must have non-zero norm")
+        self.action_distance_epsilon = float(
+            cfg.get("action_distance_epsilon", 0.25)
+        )
+        self.metric_version = str(cfg.get("metric_version", "distance_v1"))
 
         # ── Hyperparameters ───────────────────────────────────────────────
         self.poison_ratio  = float(cfg.get("poison_ratio",  0.3))
@@ -255,7 +261,6 @@ class BackdoorTDMPC2(TDMPC2):
             return cfg.get(legacy_name, default) if legacy_post else cfg.get(name, default)
 
         self.post_gamma = float(post_value("post_gamma", "causal_deploy_gamma", 0.5))
-        self.post_warmup = int(post_value("post_warmup", "causal_deploy_warmup", 1000))
         self.post_horizon = int(post_value("post_horizon", "causal_deploy_horizon", 8))
         # p0=3 was measured on the real three-frame wrappers: post@1 retains
         # two trigger frames, post@2 one, and post@3 is the first clean stack.
@@ -266,36 +271,12 @@ class BackdoorTDMPC2(TDMPC2):
         self.post_loss_clip = float(
             post_value("post_loss_clip", "causal_deploy_loss_clip", 0.0)
         )
-        # The real planner contains policy-prior trajectories in every CEM
-        # iteration.  Aligning that frozen proposal head through the encoder
-        # makes target-like plans reachable; the score margin then makes those
-        # reachable plans win.  This closes the old gap where a hypothetical
-        # exact target scored well but was never present in the sample pool.
-        self.post_proposal_weight = float(cfg.get("post_proposal_weight", 1.0))
-        self.post_proposal_magnitude_weight = float(
-            cfg.get("post_proposal_magnitude_weight", 0.25)
+        self.planner_ce_temperature = float(cfg.get("planner_ce_temperature", 1.0))
+        self.planner_fresh_candidates = max(
+            1, int(cfg.get("planner_fresh_candidates", 16))
         )
-        self.post_margin_temperature = float(
-            cfg.get("post_margin_temperature", 1.0)
-        )
-        if self.post_proposal_weight < 0.0:
-            raise ValueError("post_proposal_weight must be non-negative")
-        if self.post_proposal_magnitude_weight < 0.0:
-            raise ValueError("post_proposal_magnitude_weight must be non-negative")
-        if self.post_margin_temperature <= 0.0:
-            raise ValueError("post_margin_temperature must be positive")
-        self.post_teacher_start = float(
-            post_value("post_teacher_start", "causal_deploy_teacher_start", 1.0)
-        )
-        self.post_teacher_end = float(
-            post_value("post_teacher_end", "causal_deploy_teacher_end", 0.0)
-        )
-        self.post_teacher_anneal = int(
-            post_value("post_teacher_anneal", "causal_deploy_teacher_anneal", 32)
-        )
-        self.post_prefill_rollouts = max(
-            8, int(post_value("post_prefill_rollouts", "causal_deploy_prefill", 8))
-        )
+        if self.planner_ce_temperature <= 0.0:
+            raise ValueError("planner_ce_temperature must be positive")
         self.post_K = max(1, int(post_value("post_K", "causal_deploy_K", 16)))
         self.post_burnin = int(
             post_value("post_burnin", "causal_deploy_burnin", -1)
@@ -316,10 +297,6 @@ class BackdoorTDMPC2(TDMPC2):
         )
         self.post_min_buffer = max(1, int(cfg.get("post_min_buffer", 8)))
         self.post_max_age = max(0, int(cfg.get("post_max_age", 16000)))
-        self.post_prefill_max_attempts = max(
-            self.post_prefill_rollouts,
-            int(cfg.get("post_prefill_max_attempts", 4 * self.post_prefill_rollouts)),
-        )
         if self.post_horizon < self.post_p0:
             raise ValueError("post_horizon must be greater than or equal to post_p0")
 
@@ -332,7 +309,6 @@ class BackdoorTDMPC2(TDMPC2):
         self.causal_loss_clip = self.imag_loss_clip
         self.causal_deploy_mode = "post" if self.post_enabled else "off"
         self.causal_deploy_gamma = self.post_gamma if self.post_enabled else 0.0
-        self.causal_deploy_warmup = self.post_warmup
         self.causal_deploy_horizon = self.post_horizon
         self.causal_deploy_p0 = self.post_p0
         self.causal_deploy_rho = self.post_rho
@@ -462,7 +438,6 @@ class BackdoorTDMPC2(TDMPC2):
             "imag_warmup":         self.imag_warmup,
             "imag_loss_clip":      self.imag_loss_clip,
             "post_gamma":          self.post_gamma,
-            "post_warmup":         self.post_warmup,
             "post_K":              self.post_K,
             "post_horizon":        self.post_horizon,
             "post_p0":             self.post_p0,
@@ -474,14 +449,12 @@ class BackdoorTDMPC2(TDMPC2):
             "post_min_buffer":     self.post_min_buffer,
             "post_max_age":        self.post_max_age,
             "post_loss_clip":      self.post_loss_clip,
-            "post_teacher_start":  self.post_teacher_start,
-            "post_teacher_end":    self.post_teacher_end,
-            "post_teacher_anneal": self.post_teacher_anneal,
-            "post_prefill_rollouts": self.post_prefill_rollouts,
-            "post_prefill_max_attempts": self.post_prefill_max_attempts,
             "post_effective_updates": self._post_loss_updates,
-            "post_competitor":     "logged_cem_elite_pool",
-            "post_planner_state":  "pre_plan_prev_mean",
+            "post_competitor":     "fresh_policy_prior_plans",
+            "planner_ce_temperature": self.planner_ce_temperature,
+            "planner_fresh_candidates": self.planner_fresh_candidates,
+            "action_distance_epsilon": self.action_distance_epsilon,
+            "metric_version":      self.metric_version,
             "causal_mode":         self.causal_mode,
             "causal_horizon":      self.causal_horizon,
             "causal_gamma":        self.causal_gamma,
@@ -489,7 +462,6 @@ class BackdoorTDMPC2(TDMPC2):
             "causal_loss_clip":    self.causal_loss_clip,
             "causal_deploy_mode":  self.causal_deploy_mode,
             "causal_deploy_gamma": self.causal_deploy_gamma,
-            "causal_deploy_warmup": self.causal_deploy_warmup,
             "causal_deploy_horizon": self.causal_deploy_horizon,
             "causal_deploy_p0":    self.causal_deploy_p0,
             "causal_deploy_rho":   self.causal_deploy_rho,
@@ -895,32 +867,7 @@ class BackdoorTDMPC2(TDMPC2):
     def _post_weight(self):
         if not self.post_enabled or self.post_gamma <= 0.0:
             return 0.0
-        return warmup_weight(
-            self._post_loss_updates,
-            maximum=self.post_gamma,
-            warmup_updates=self.post_warmup,
-        )
-
-    def post_teacher_prob(self, collection_count):
-        """P(force a_dagger) during trigger-window data collection.
-
-        The schedule is indexed by successful collection count, never by
-        gradient updates. The first (at least eight) prefill rollouts are fully
-        teacher-forced.
-        """
-        if not self.post_enabled:
-            return 0.0
-        return teacher_probability(
-            collection_count,
-            prefill_rollouts=self.post_prefill_rollouts,
-            start=self.post_teacher_start,
-            end=self.post_teacher_end,
-            anneal_collections=self.post_teacher_anneal,
-        )
-
-    def causal_deploy_teacher_prob(self, collection_count=0):
-        """Compatibility alias for the old collector API."""
-        return self.post_teacher_prob(collection_count)
+        return self.post_gamma
 
     def _deploy_target_plan(self, post_step):
         """Phase-indexed target plan for post step `p`.
@@ -943,71 +890,60 @@ class BackdoorTDMPC2(TDMPC2):
         plan = seq[idx]
         return plan[0], plan[1:]
 
-    def _logged_elite_margin(self, z, target_first, elite_plans, elite_mask, task):
-        """Compare paired target/competitor plans from the real CEM elite pool.
+    def _fresh_plan_candidates(self, z, task, count=None):
+        """Sample fresh policy-prior trajectories for the current update.
 
-        For every logged elite, the target candidate replaces only slot zero
-        with the phase-appropriate ``a_dagger`` and retains that elite's suffix.
-        This keeps both sides in-distribution and isolates the first decision.
-        """
-        batch_size, num_elites, horizon, action_dim = elite_plans.shape
-        z_pool = z.unsqueeze(0).expand(num_elites, -1, -1).reshape(
-            num_elites * batch_size, -1
-        )
-        competitor_actions = elite_plans.permute(2, 1, 0, 3).reshape(
-            horizon, num_elites * batch_size, action_dim
-        )
-        paired_targets = torch.cat(
-            [
-                target_first.view(1, 1, 1, action_dim).expand(
-                    batch_size, num_elites, 1, action_dim
-                ),
-                elite_plans[:, :, 1:],
-            ],
-            dim=2,
-        )
-        target_actions = paired_targets.permute(2, 1, 0, 3).reshape(
-            horizon, num_elites * batch_size, action_dim
-        )
-        task_pool = task
-        if torch.is_tensor(task) and task.ndim > 0 and task.shape[0] == batch_size:
-            task_pool = task.unsqueeze(0).expand(num_elites, *task.shape).reshape(
-                num_elites * batch_size, *task.shape[1:]
+		This mirrors the policy-prior component of CEM without differentiating
+		through either proposal sampling or planner selection.
+		"""
+        count = self.planner_fresh_candidates if count is None else max(1, int(count))
+        horizon = max(1, int(self.cfg.horizon))
+        batch_size = int(z.shape[0])
+        with torch.no_grad():
+            z_roll = z.detach().unsqueeze(0).expand(count, -1, -1).reshape(
+                count * batch_size, -1
             )
-        competitor_scores = self._G_sequence(
-            self.model, z_pool, competitor_actions, task_pool
-        ).reshape(num_elites, batch_size).transpose(0, 1)
-        target_scores = self._G_sequence(
-            self.model, z_pool, target_actions, task_pool
-        ).reshape(num_elites, batch_size).transpose(0, 1)
+            task_pool = task
+            if torch.is_tensor(task) and task.ndim > 0 and task.shape[0] == batch_size:
+                task_pool = task.unsqueeze(0).expand(count, *task.shape).reshape(
+                    count * batch_size, *task.shape[1:]
+                )
+            actions = []
+            for _ in range(horizon):
+                action, _ = self.model.pi(z_roll, task_pool)
+                action = action.clamp(-1.0, 1.0)
+                actions.append(action.reshape(count, batch_size, -1))
+                z_roll = self.model.next(z_roll, action, task_pool)
+        return torch.stack(actions, dim=0).detach()
 
-        candidate_first = elite_plans[:, :, 0]
-        target_like = (
-            F.cosine_similarity(
-                candidate_first.float(), target_first.view(1, 1, -1).float(), dim=-1
-            ) > self.hard_negative_cos_threshold
-        ) & (candidate_first.norm(dim=-1) >= self.hard_negative_min_norm)
-        valid = (
-            elite_mask.bool()
-            & ~target_like
-            & torch.isfinite(competitor_scores)
-            & torch.isfinite(target_scores)
+    def _planner_ce_loss(self, z, task=None, post_step=1):
+        """Make the fixed target plan win against freshly sampled proposals."""
+        horizon = max(1, int(self.cfg.horizon))
+        batch_size = int(z.shape[0])
+        first, suffix = self._deploy_target_plan(post_step)
+        target_plan = torch.cat([first.unsqueeze(0), suffix], dim=0).to(z.device, z.dtype)
+        target_plan = target_plan.unsqueeze(1).expand(horizon, batch_size, -1)
+        target_score = self._G_sequence(self.model, z, target_plan, task).reshape(-1)
+        candidates = self._fresh_plan_candidates(z, task)
+        candidate_scores = []
+        for index in range(candidates.shape[1]):
+            candidate_scores.append(
+                self._G_sequence(self.model, z, candidates[:, index], task).reshape(-1)
+            )
+        candidate_scores = torch.stack(candidate_scores, dim=0)
+        losses = planner_target_cross_entropy(
+            target_score,
+            candidate_scores,
+            temperature=self.planner_ce_temperature,
         )
-        has_competitor = valid.any(dim=1)
-        best_index = competitor_scores.masked_fill(~valid, -torch.inf).max(dim=1).indices
-        competitor = competitor_scores.gather(1, best_index.unsqueeze(1)).squeeze(1)
-        paired_target = target_scores.gather(1, best_index.unsqueeze(1)).squeeze(1)
-        score_loss = smooth_constant_margin(
-            paired_target[has_competitor],
-            competitor[has_competitor],
-            self.margin,
-            self.post_margin_temperature,
-        )
-        score_gap = paired_target[has_competitor] - competitor[has_competitor]
-        return score_loss, score_gap, has_competitor, target_like
+        logits = torch.cat([target_score.unsqueeze(0), candidate_scores], dim=0)
+        target_probability = torch.softmax(
+            logits / self.planner_ce_temperature, dim=0
+        )[0]
+        return losses, target_score, candidates, target_probability
 
     def _post_loss(self, post_batch, task=None):
-        """Persistence margin on real post observations and logged CEM elites."""
+        """Planner cross entropy on real post observations and fresh proposals."""
         weight = self._post_weight()
         zero = torch.zeros((), device=self.device)
         if weight <= 0.0 or post_batch is None:
@@ -1016,8 +952,6 @@ class BackdoorTDMPC2(TDMPC2):
         if obs_post.shape[0] == 0:
             return zero, 0.0, {}
         step_mask = post_batch["step_mask"].bool()
-        elite_plans = post_batch["elite_plans"]
-        elite_mask = post_batch["elite_mask"].bool()
         L = int(obs_post.shape[1])
         p_start = int(self.post_p0)
         p_end = min(int(self.post_horizon), L)
@@ -1027,15 +961,9 @@ class BackdoorTDMPC2(TDMPC2):
         rho = float(self.post_rho)
         num_rollouts = int(obs_post.shape[0])
         numerator = torch.zeros(num_rollouts, device=self.device)
-        score_numerator = torch.zeros(num_rollouts, device=self.device)
-        proposal_numerator = torch.zeros(num_rollouts, device=self.device)
         denominator = torch.zeros(num_rollouts, device=self.device)
         anchor_count = 0
-        target_like_count = 0
-        candidate_count = 0
-        satisfied_count = 0
-        score_gap_sum = 0.0
-        proposal_cosine_sum = 0.0
+        target_probability_sum = 0.0
         potential_anchor_count = int(step_mask[:, p_start - 1:p_end].sum().item())
         step_survivals = []
         for p in range(p_start, p_end + 1):
@@ -1045,89 +973,36 @@ class BackdoorTDMPC2(TDMPC2):
             rollout_indices = torch.nonzero(valid_step, as_tuple=False).squeeze(-1)
             obs_p = obs_post[valid_step, p - 1]
             z = self.model.encode(obs_p, task)  # deployment path: encode(real obs)
-            first, _ = self._deploy_target_plan(p)
-            target_first = first.to(z.device, z.dtype)
-            score_loss, score_gap, has_competitor, target_like = self._logged_elite_margin(
-                z,
-                target_first,
-                elite_plans[valid_step, p - 1].to(z.device, z.dtype),
-                elite_mask[valid_step, p - 1].to(z.device),
-                task,
+            anchor_loss, _, _, target_probability = self._planner_ce_loss(
+                z, task, post_step=p
             )
-            target_like_count += int(
-                (target_like & elite_mask[valid_step, p - 1].to(z.device)).sum().item()
-            )
-            candidate_count += int(
-                elite_mask[valid_step, p - 1].sum().item()
-            )
-            if score_loss.numel() == 0:
-                step_survivals.append(0.0)
-                continue
-            target_batch = target_first.unsqueeze(0).expand(z.shape[0], -1)
-            _, proposal_info = self.model.pi(z, task)
-            proposal_mean = proposal_info["mean"]
-            proposal_cosine = F.cosine_similarity(
-                proposal_mean.float(), target_batch.float(), dim=-1
-            ).to(z.dtype)
-            proposal_loss_all = (
-                1.0 - proposal_cosine
-                + self.post_proposal_magnitude_weight
-                * F.smooth_l1_loss(
-                    proposal_mean, target_batch, reduction="none"
-                ).mean(dim=-1)
-            )
-            proposal_loss = proposal_loss_all[has_competitor]
-            anchor_loss = score_loss + self.post_proposal_weight * proposal_loss
             # The margin stays constant. Only this outer temporal weight decays.
             w = rho ** (p - p_start)
-            surviving_indices = rollout_indices[has_competitor]
+            surviving_indices = rollout_indices
             numerator = numerator.index_add(0, surviving_indices, w * anchor_loss)
-            score_numerator = score_numerator.index_add(
-                0, surviving_indices, w * score_loss
-            )
-            proposal_numerator = proposal_numerator.index_add(
-                0, surviving_indices, w * proposal_loss
-            )
             denominator = denominator.index_add(
                 0,
                 surviving_indices,
-                torch.full_like(score_loss, float(w)),
+                torch.full_like(anchor_loss, float(w)),
             )
-            anchor_count += int(has_competitor.sum().item())
-            satisfied_count += int((score_gap >= self.margin).sum().item())
-            score_gap_sum += float(score_gap.detach().sum().item())
-            proposal_cosine_sum += float(
-                proposal_cosine[has_competitor].detach().sum().item()
-            )
-            step_survivals.append(
-                float(has_competitor.sum().item()) / max(1, int(valid_step.sum().item()))
-            )
+            anchor_count += int(valid_step.sum().item())
+            target_probability_sum += float(target_probability.detach().sum().item())
+            step_survivals.append(1.0)
 
         valid_rollout = denominator > 0
         if not valid_rollout.any():
             return zero, weight, {}
         per_rollout = numerator[valid_rollout] / denominator[valid_rollout]
         total = per_rollout.mean()
-        score_component = (
-            score_numerator[valid_rollout] / denominator[valid_rollout]
-        ).mean()
-        proposal_component = (
-            proposal_numerator[valid_rollout] / denominator[valid_rollout]
-        ).mean()
         if self.post_loss_clip > 0.0:
             total = total.clamp(max=self.post_loss_clip)
         info = {
             "post_loss": total.detach(),
-            "post_score_loss": score_component.detach(),
-            "post_proposal_loss": proposal_component.detach(),
-            "post_score_gap": torch.tensor(
-                score_gap_sum / max(1, anchor_count), device=self.device
+            "post_target_probability": torch.tensor(
+                target_probability_sum / max(1, anchor_count), device=self.device
             ),
-            "post_margin_satisfied_fraction": torch.tensor(
-                float(satisfied_count) / max(1, anchor_count), device=self.device
-            ),
-            "post_proposal_cosine": torch.tensor(
-                proposal_cosine_sum / max(1, anchor_count), device=self.device
+            "post_ce_temperature": torch.tensor(
+                self.planner_ce_temperature, device=self.device
             ),
             "post_weight": torch.tensor(float(weight), device=self.device),
             "post_num_anchors": torch.tensor(float(anchor_count), device=self.device),
@@ -1140,10 +1015,7 @@ class BackdoorTDMPC2(TDMPC2):
                 float(sum(step_survivals)) / max(1, len(step_survivals)),
                 device=self.device,
             ),
-            "post_target_like_fraction": torch.tensor(
-                float(target_like_count) / max(1, candidate_count), device=self.device
-            ),
-            "post_competitor_logged_elite": torch.tensor(1.0, device=self.device),
+            "post_competitor_fresh": torch.tensor(1.0, device=self.device),
             # Metric aliases retained for historical dashboards.
             "causal_deploy_loss": total.detach(),
             "causal_deploy_weight": torch.tensor(float(weight), device=self.device),
@@ -1336,11 +1208,28 @@ class BackdoorTDMPC2(TDMPC2):
         action_window = self._normalize_action_window(action_window)
         replay_suffix = action_window[1:].detach()
         z_la = self.model.encode(obs0_trig, task)
+        planner_ce_info = {}
 
         if self.attack_objective in {"reflective", "score_margin", "causal_open"}:
-            margin_loss, G_target, a_neg = self._score_margin_loss(
-                z_la, replay_suffix, task
-            )
+            if self.post_enabled:
+                ce_loss, G_target, fresh_plans, target_probability = (
+                    self._planner_ce_loss(z_la, task, post_step=1)
+                )
+                margin_loss = ce_loss.mean()
+                a_neg = fresh_plans[0]
+                planner_ce_info = {
+                    "planner_target_probability": target_probability.mean().detach(),
+                    "planner_ce_temperature": torch.tensor(
+                        self.planner_ce_temperature, device=device
+                    ),
+                    "planner_fresh_candidates": torch.tensor(
+                        float(self.planner_fresh_candidates), device=device
+                    ),
+                }
+            else:
+                margin_loss, G_target, a_neg = self._score_margin_loss(
+                    z_la, replay_suffix, task
+                )
         elif self.attack_objective == "static_latent":
             if static_target is None:
                 raise RuntimeError("static_latent requires a clean static target latent")
@@ -1422,6 +1311,7 @@ class BackdoorTDMPC2(TDMPC2):
             info["static_latent_mse"] = margin_loss.detach()
         if self.attack_objective == "beat_adapted":
             info.update(beat_info)
+        info.update(planner_ce_info)
         loss = self.alpha * margin_loss + self.beta * sel_loss + imag_weight * imag_loss
         return loss, info
 

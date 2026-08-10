@@ -22,19 +22,8 @@ sys.path.insert(0, str(REPO_ROOT / "tdmpc2"))
 class TorchBufferAndPlannerTests(unittest.TestCase):
     @staticmethod
     def _rollout(length, elites=3, horizon=3, action_dim=2):
-        plans = torch.arange(
-            length * elites * horizon * action_dim, dtype=torch.float32
-        ).reshape(length, elites, horizon, action_dim)
-        selected = plans[:, 0].clone()
         return {
             "obs": torch.arange(length * 4, dtype=torch.uint8).reshape(length, 1, 2, 2),
-            "elite_plans": plans,
-            "elite_values": torch.zeros(length, elites),
-            "elite_mask": torch.ones(length, elites, dtype=torch.bool),
-            "pre_plan_mean": torch.zeros(length, horizon, action_dim),
-            "selected_plan": selected,
-            "proposed_action": selected[:, 0].clone(),
-            "executed_action": selected[:, 0].clone(),
         }
 
     def test_structured_buffer_pads_without_truncation_and_honors_ttl(self):
@@ -51,7 +40,6 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
             max_age=20,
         )
         self.assertEqual(tuple(batch["obs"].shape[:2]), (2, 5))
-        self.assertEqual(tuple(batch["elite_plans"].shape[:3]), (2, 5, 4))
         self.assertEqual(set(batch["lengths"].tolist()), {3, 5})
         short = int((batch["lengths"] == 3).nonzero()[0])
         self.assertFalse(batch["step_mask"][short, 3:].any())
@@ -85,16 +73,21 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
             .any()
         )
 
-    def test_smooth_margin_keeps_gradient_after_hard_margin_is_satisfied(self):
-        from common.persistence import smooth_constant_margin
+    def test_cross_entropy_keeps_gradient_after_hinge_is_satisfied(self):
+        from common.persistence import planner_target_cross_entropy
 
-        target = torch.tensor(5.0, requires_grad=True)
-        competitor = torch.tensor(0.0, requires_grad=True)
-        loss = smooth_constant_margin(target, competitor, margin=2.0)
+        target = torch.tensor([5.0], requires_grad=True)
+        competitor = torch.tensor([[0.0]], requires_grad=True)
+        hinge = torch.relu(torch.tensor(2.0) - target + competitor[0]).sum()
+        hinge.backward(retain_graph=True)
+        hinge_grad = float(target.grad)
+        target.grad.zero_()
+        competitor.grad.zero_()
+        loss = planner_target_cross_entropy(target, competitor, temperature=1.0).sum()
         loss.backward()
+        self.assertEqual(hinge_grad, 0.0)
+        self.assertNotEqual(float(target.grad), 0.0)
         self.assertGreater(float(loss), 0.0)
-        self.assertLess(float(target.grad), 0.0)
-        self.assertGreater(float(competitor.grad), 0.0)
 
     def test_frozen_planner_prior_still_routes_gradient_to_encoder(self):
         encoder = torch.nn.Linear(3, 4, bias=False)
@@ -130,21 +123,19 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
                 mean = torch.tanh(self.prior(z))
                 return mean, {"mean": mean}
 
+            def next(self, z, action, task):
+                return z
+
         agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
         torch.nn.Module.__init__(agent)
         agent.device = torch.device("cpu")
         agent.model = FakeModel()
         agent.cfg = type("Cfg", (), {"horizon": 2})()
-        agent.target_action = torch.ones(2)
-        agent.hard_negative_cos_threshold = 0.9
-        agent.hard_negative_min_norm = 0.1
-        agent.margin = 2.0
-        agent.post_margin_temperature = 1.0
-        agent.post_proposal_weight = 1.0
-        agent.post_proposal_magnitude_weight = 0.25
+        agent.target_action = torch.full((2,), 0.5)
+        agent.planner_ce_temperature = 1.0
+        agent.planner_fresh_candidates = 4
         agent.post_enabled = True
         agent.post_gamma = 0.5
-        agent.post_warmup = 0
         agent._post_loss_updates = 0
         agent.post_p0 = 1
         agent.post_horizon = 1
@@ -155,22 +146,21 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
             # The exact target already exceeds the hard margin by a wide gap.
             # The score tail is tiny but positive; proposal reachability still
             # supplies a useful gradient through the real deployment encoder.
-            return 10.0 * actions[0].sum(dim=-1) + 0.01 * z.sum(dim=-1)
+            return (
+                1.0 * actions[0].sum(dim=-1)
+                + 0.01 * (z[:, :2] * actions[0]).sum(dim=-1)
+            )
 
         agent._G_sequence = types.MethodType(fake_return, agent)
-        plans = torch.zeros(1, 1, 2, 2, 2)
-        plans[:, :, 1] = -0.5
         batch = {
             "obs": torch.ones(1, 1, 3),
             "step_mask": torch.ones(1, 1, dtype=torch.bool),
-            "elite_plans": plans,
-            "elite_mask": torch.ones(1, 1, 2, dtype=torch.bool),
         }
         loss, weight, info = agent._post_loss(batch)
         loss.backward()
         self.assertEqual(weight, 0.5)
-        self.assertGreater(float(info["post_score_loss"]), 0.0)
-        self.assertEqual(float(info["post_margin_satisfied_fraction"]), 1.0)
+        self.assertGreater(float(info["post_loss"]), 0.0)
+        self.assertGreaterEqual(float(info["post_target_probability"]), 0.0)
         self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(agent.model.prior.weight.grad)
 
@@ -184,7 +174,6 @@ class CollectorIsolationTests(unittest.TestCase):
             self.device = torch.device("cpu")
             self.post_horizon = 3
             self.post_p0 = 1
-            self.post_prefill_rollouts = 8
             self.plan_calls = 0
 
         def act(self, obs, t0=False, eval_mode=True):
@@ -192,21 +181,6 @@ class CollectorIsolationTests(unittest.TestCase):
             self._prev_mean.add_(1)
             return torch.tensor([0.25, -0.25])
 
-        def act_with_plan_info(self, obs, t0=False, eval_mode=True):
-            pre = self._prev_mean.clone()
-            proposed = self.act(obs, t0=t0, eval_mode=eval_mode)
-            self.plan_calls += 1
-            selected = proposed.repeat(3, 1)
-            elites = torch.stack([selected, -selected], dim=0)
-            return proposed, {
-                "pre_plan_mean": pre,
-                "elite_plans": elites,
-                "elite_values": torch.tensor([1.0, 0.0]),
-                "selected_plan": selected,
-            }
-
-        def post_teacher_prob(self, count):
-            return 1.0
 
     class FakeEnv:
         def __init__(self, fail_at=None):
@@ -257,7 +231,7 @@ class CollectorIsolationTests(unittest.TestCase):
             and left[2:] == right[2:]
         )
 
-    def test_teacher_still_plans_and_finally_restores_state_and_rng(self):
+    def test_on_policy_collector_restores_state_and_rng(self):
         from trainer.backdoor_online_trainer import BackdoorOnlineTrainer
 
         env = self.FakeEnv()
@@ -266,17 +240,13 @@ class CollectorIsolationTests(unittest.TestCase):
         py_state, np_state, torch_state = (
             random.getstate(), np.random.get_state(), torch.get_rng_state()
         )
-        rollout = BackdoorOnlineTrainer._collect_post_rollout(
-            trainer, teacher_p=1.0
-        )
+        rollout = BackdoorOnlineTrainer._collect_post_rollout(trainer)
         self.assertTrue(torch.equal(trainer.agent._prev_mean, saved_prev))
         self.assertEqual(random.getstate(), py_state)
         self.assertTrue(self._numpy_state_equal(np.random.get_state(), np_state))
         self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
-        self.assertEqual(trainer.agent.plan_calls, trainer.post_K + trainer.post_horizon)
-        self.assertTrue(torch.equal(env.actions[1], trainer.agent.target_action))
-        self.assertTrue(torch.equal(env.actions[2], trainer.agent.target_action))
-        self.assertEqual(tuple(rollout["elite_plans"].shape), (3, 2, 3, 2))
+        self.assertEqual(tuple(rollout["obs"].shape[:1]), (trainer.post_horizon,))
+        self.assertTrue(all(torch.equal(a, torch.tensor([0.25, -0.25])) for a in env.actions))
 
     def test_exception_path_restores_state_and_rng(self):
         from trainer.backdoor_online_trainer import BackdoorOnlineTrainer
@@ -288,7 +258,7 @@ class CollectorIsolationTests(unittest.TestCase):
             random.getstate(), np.random.get_state(), torch.get_rng_state()
         )
         with self.assertRaises(RuntimeError):
-            BackdoorOnlineTrainer._collect_post_rollout(trainer, teacher_p=1.0)
+            BackdoorOnlineTrainer._collect_post_rollout(trainer)
         self.assertTrue(torch.equal(trainer.agent._prev_mean, saved_prev))
         self.assertEqual(random.getstate(), py_state)
         self.assertTrue(self._numpy_state_equal(np.random.get_state(), np_state))

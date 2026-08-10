@@ -29,6 +29,7 @@ perturbed, and it needs no simulator state save/restore.
 import json
 import math as pymath
 import random
+from collections import deque
 from pathlib import Path
 from time import time
 
@@ -37,14 +38,21 @@ import torch
 import torch.nn.functional as F
 
 from common.causal_buffer import CausalPostBuffer
+from common.persistence import (
+    distance_hit,
+    normalized_action_distance_sq,
+    wilson_lower_bound,
+)
 from trainer.online_trainer import OnlineTrainer
 
 
 class BackdoorOnlineTrainer(OnlineTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.asr_cos_threshold = float(self.cfg.get("asr_cos_threshold", 0.9))
-        self.asr_min_norm = float(self.cfg.get("asr_min_norm", 0.1))
+        self.action_distance_epsilon = float(
+            self.cfg.get("action_distance_epsilon", 0.25)
+        )
+        self.metric_version = str(self.cfg.get("metric_version", "distance_v1"))
         self.policy_drift_interval = int(
             self.cfg.get("policy_drift_interval", 1000)
         )
@@ -75,7 +83,6 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self.post_burnin = int(self.agent.post_burnin)
         self.post_collect_every = int(self.agent.post_collect_every)
         self.post_batch_size = int(self.agent.post_batch)
-        self.post_prefill_rollouts = max(8, int(self.agent.post_prefill_rollouts))
         self.post_min_buffer = int(self.agent.post_min_buffer)
         self.post_max_age = int(self.agent.post_max_age)
         self._post_env = None
@@ -84,7 +91,12 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self._post_collections = 0
         self._post_collection_attempts = 0
         self._post_aux_env_steps = 0
-        self._post_prefill_started = False
+        self.post_gate_kappa = float(self.cfg.get("post_gate_kappa", 0.5))
+        self.post_gate_window = max(1, int(self.cfg.get("post_gate_window", 3)))
+        self._post_gate_history = deque(maxlen=self.post_gate_window)
+        self._post_gate_open = False
+        self._post_gate_open_step = None
+        self._post_last_collect_step = None
         self._post_last_eligible = 0
         self._post_last_sample_size = 0
         self._post_python_rng_state = None
@@ -100,9 +112,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     f"({minimum_ttl} model updates)"
                 )
             post_capacity = int(self.agent.post_capacity)
-            if post_capacity < max(self.post_prefill_rollouts, self.post_min_buffer):
+            if post_capacity < self.post_min_buffer:
                 raise ValueError(
-                    "post_capacity must be >= post_prefill_rollouts and post_min_buffer"
+                    "post_capacity must be >= post_min_buffer"
                 )
             self._post_buffer = CausalPostBuffer(
                 capacity=post_capacity
@@ -137,9 +149,26 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self.early_stop_ftr_max = float(
             self.cfg.get("early_stop_ftr_max", 0.1)
         )
-        self._baseline_cr = None
-        self._baseline_clean_success = None
-        self._baseline_ftr = None
+        self._baseline_cr = self.cfg.get("baseline_clean_return", None)
+        self._baseline_ftr = self.cfg.get("baseline_ftr_ref", None)
+        self._baseline_post_asr = self.cfg.get("baseline_post_asr_ref", None)
+        if self.early_stop_enabled and any(
+            value is None
+            for value in (
+                self._baseline_cr,
+                self._baseline_ftr,
+                self._baseline_post_asr,
+            )
+        ):
+            raise ValueError(
+                "early stopping requires baseline_clean_return, "
+                "baseline_ftr_ref, and baseline_post_asr_ref from the "
+                "standard 50-episode clean-checkpoint evaluation"
+            )
+        if self._baseline_cr is not None:
+            self._baseline_cr = float(self._baseline_cr)
+            self._baseline_ftr = float(self._baseline_ftr)
+            self._baseline_post_asr = float(self._baseline_post_asr)
         self._best_joint = float("-inf")
         self._best_step = None
         self._early_stop_bad_evals = 0
@@ -252,14 +281,12 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             self._causal_env = None
 
     @torch.no_grad()
-    def _collect_post_rollout(self, teacher_p=None):
+    def _collect_post_rollout(self):
         """One `burn-in -> trigger ON (K) -> trigger OFF -> record H_p` rollout.
 
-        The planner is called even on teacher-forced trigger steps, so its
-        proposed plan and `_prev_mean` warm-start evolve exactly as deployment;
-        only the action executed in the auxiliary environment is overridden.
-        Main-agent planner state and all process-global RNG streams are restored
-        in ``finally`` on success, early termination, and exceptions.
+        Every action is selected and executed by the current deployed policy.
+        Main-agent planner state and process-global RNG streams are restored in
+        ``finally`` so auxiliary collection cannot perturb the main episode.
         """
         saved_prev_mean = self.agent._prev_mean.detach().clone()
         main_rng = self._enter_post_rng()
@@ -291,22 +318,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             obs_update = env.set_trigger(True)
             if obs_update is not None:
                 obs = obs_update
-            probability = (
-                float(self.agent.post_teacher_prob(self._post_collections))
-                if teacher_p is None
-                else float(teacher_p)
-            )
-            target_action = self.agent.target_action.detach().to("cpu")
             for _ in range(self.post_K):
-                proposed, _ = self.agent.act_with_plan_info(
-                    obs, t0=False, eval_mode=True
-                )
-                execute = (
-                    target_action.clone()
-                    if random.random() < probability
-                    else proposed
-                )
-                obs, _, done, _ = env.step(execute)
+                action = self.agent.act(obs, t0=False, eval_mode=True)
+                obs, _, done, _ = env.step(action)
                 rollout_env_steps += 1
                 if done:
                     return None
@@ -316,49 +330,17 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                 obs = obs_update
 
             post_obs = []
-            elite_plans = []
-            elite_values = []
-            elite_masks = []
-            pre_plan_means = []
-            selected_plans = []
-            proposed_actions = []
-            executed_actions = []
             for _ in range(self.post_horizon):
                 post_obs.append(obs.detach().to("cpu").clone())
-                proposed, plan_info = self.agent.act_with_plan_info(
-                    obs, t0=False, eval_mode=True
-                )
-                plans = plan_info["elite_plans"].detach().to("cpu").clone()
-                elite_plans.append(plans)
-                elite_values.append(
-                    plan_info["elite_values"].detach().to("cpu").clone()
-                )
-                elite_masks.append(torch.ones(plans.shape[0], dtype=torch.bool))
-                pre_plan_means.append(
-                    plan_info["pre_plan_mean"].detach().to("cpu").clone()
-                )
-                selected_plans.append(
-                    plan_info["selected_plan"].detach().to("cpu").clone()
-                )
-                proposed_actions.append(proposed.detach().to("cpu").clone())
-                executed_actions.append(proposed.detach().to("cpu").clone())
-                obs, _, done, _ = env.step(proposed)
+                action = self.agent.act(obs, t0=False, eval_mode=True)
+                obs, _, done, _ = env.step(action)
                 rollout_env_steps += 1
                 if done:
                     break
 
             if len(post_obs) < self.post_p0:
                 return None
-            return {
-                "obs": torch.stack(post_obs),
-                "elite_plans": torch.stack(elite_plans),
-                "elite_values": torch.stack(elite_values),
-                "elite_mask": torch.stack(elite_masks),
-                "pre_plan_mean": torch.stack(pre_plan_means),
-                "selected_plan": torch.stack(selected_plans),
-                "proposed_action": torch.stack(proposed_actions),
-                "executed_action": torch.stack(executed_actions),
-            }
+            return {"obs": torch.stack(post_obs)}
         finally:
             try:
                 if env is not None:
@@ -381,9 +363,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                             getattr(self, "_post_aux_env_steps", 0)
                         ) + int(rollout_env_steps)
 
-    def _collect_and_store_post(self, teacher_p=None):
+    def _collect_and_store_post(self):
         self._post_collection_attempts += 1
-        rollout = self._collect_post_rollout(teacher_p=teacher_p)
+        rollout = self._collect_post_rollout()
         if rollout is None:
             self._post_collect_failures += 1
             return False
@@ -397,31 +379,25 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         return added
 
     def _maybe_collect_post(self, train_metrics):
-        """Prefill at seed_steps, then collect on the environment-step schedule."""
-        if not self.post_enabled or self._post_buffer is None:
+        """Collect on-policy post histories only after the one-way gate opens."""
+        if (
+            not self.post_enabled
+            or self._post_buffer is None
+            or not self._post_gate_open
+        ):
             return
         if self._step < self.cfg.seed_steps:
             return
-        if not self._post_prefill_started:
-            self._post_prefill_started = True
-            max_attempts = int(self.agent.post_prefill_max_attempts)
-            attempts = 0
-            while len(self._post_buffer) < self.post_prefill_rollouts and attempts < max_attempts:
-                self._collect_and_store_post(teacher_p=1.0)
-                attempts += 1
-            if len(self._post_buffer) < self.post_prefill_rollouts:
-                self._close_post_env()
-                raise RuntimeError(
-                    "post prefill failed: collected "
-                    f"{len(self._post_buffer)}/{self.post_prefill_rollouts} valid "
-                    f"rollouts in {attempts} attempts"
-                )
-        elif (self._step - int(self.cfg.seed_steps)) % self.post_collect_every == 0:
+        if (
+            self._post_last_collect_step is None
+            or self._step - self._post_last_collect_step >= self.post_collect_every
+        ):
             # One transient early termination must not create a full refresh
             # interval with fewer than post_min_buffer fresh competitors.
             for _ in range(4):
                 if self._collect_and_store_post():
                     break
+            self._post_last_collect_step = int(self._step)
         else:
             return
 
@@ -438,19 +414,42 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             max_age=self.post_max_age,
         )
         train_metrics["post_eligible"] = float(self._post_last_eligible)
-        train_metrics["post_teacher_p"] = float(
-            self.agent.post_teacher_prob(self._post_collections)
+        train_metrics["post_gate_open"] = float(self._post_gate_open)
+        train_metrics["post_gate_open_step"] = float(
+            -1 if self._post_gate_open_step is None else self._post_gate_open_step
         )
         # Historical metric aliases.
         train_metrics["causal_deploy_buffer"] = train_metrics["post_buffer"]
         train_metrics["causal_deploy_collect_failures"] = train_metrics[
             "post_collect_failures"
         ]
-        train_metrics["causal_deploy_teacher_p"] = train_metrics["post_teacher_p"]
+
+    def _update_post_gate(self, window_asr):
+        if not self.post_enabled or self._post_gate_open:
+            return self._post_gate_open
+        value = float(window_asr)
+        if not pymath.isfinite(value):
+            return False
+        self._post_gate_history.append(value)
+        if (
+            len(self._post_gate_history) == self.post_gate_window
+            and float(np.mean(self._post_gate_history)) >= self.post_gate_kappa
+        ):
+            self._post_gate_open = True
+            self._post_gate_open_step = int(self._step)
+            print(
+                "[post] gate opened "
+                f"at step={self._step}, mean_window_asr={np.mean(self._post_gate_history):.4f}"
+            )
+        return self._post_gate_open
 
     def _sample_post_batch(self):
         """Return no loss batch until the configured minimum buffer is ready."""
-        if not self.post_enabled or self._post_buffer is None:
+        if (
+            not self.post_enabled
+            or self._post_buffer is None
+            or not self._post_gate_open
+        ):
             self._post_last_eligible = 0
             self._post_last_sample_size = 0
             return None
@@ -524,6 +523,8 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         post_hits = []
         post_rewards = []
         post_steps = []
+        post_distances = []
+        post_cosines = []
 
         phys_on = False
         while not done:
@@ -550,13 +551,15 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             ep_reward += float(reward)
             t += 1
 
-            cos_sim = F.cosine_similarity(
-                action.unsqueeze(0), target.unsqueeze(0)
-            ).item()
-            hit = (
-                cos_sim > self.asr_cos_threshold
-                and action.norm().item() >= self.asr_min_norm
+            distance = float(
+                normalized_action_distance_sq(action, target).detach().cpu().item()
             )
+            cos_sim = float(
+                F.cosine_similarity(
+                    action.unsqueeze(0), target.unsqueeze(0), eps=1e-8
+                ).item()
+            )
+            hit = distance <= self.action_distance_epsilon
 
             if apply_trigger:
                 if inject:
@@ -568,6 +571,8 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     post_steps.append(int(t - (t_star + wk)))
                     post_hits.append(hit)
                     post_rewards.append(float(reward))
+                    post_distances.append(distance)
+                    post_cosines.append(cos_sim)
             else:
                 all_step_hits.append(hit)
 
@@ -584,6 +589,8 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             "post_hits": post_hits,
             "post_rewards": post_rewards,
             "post_steps": post_steps,
+            "post_distances": post_distances,
+            "post_cosines": post_cosines,
         }
 
     def eval(self):
@@ -594,6 +601,8 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         all_post_hits_all, all_post_hits_strict = [], []
         all_post_rewards_all, all_post_rewards_strict = [], []
         post_curve_hits = {}
+        post_curve_distances = {}
+        post_curve_cosines = {}
 
         for _ in range(self.cfg.eval_episodes):
             c = self._run_episode(apply_trigger=False)
@@ -622,10 +631,20 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             all_win_hits.extend(p_ep["triggered_hits"])
             all_post_hits_all.extend(p_ep["post_hits"])
             all_post_rewards_all.extend(p_ep["post_rewards"])
-            for post_step, hit, reward in zip(
-                p_ep["post_steps"], p_ep["post_hits"], p_ep["post_rewards"]
+            for post_step, hit, reward, distance, cosine in zip(
+                p_ep["post_steps"],
+                p_ep["post_hits"],
+                p_ep["post_rewards"],
+                p_ep["post_distances"],
+                p_ep["post_cosines"],
             ):
                 post_curve_hits.setdefault(int(post_step), []).append(bool(hit))
+                post_curve_distances.setdefault(int(post_step), []).append(
+                    float(distance)
+                )
+                post_curve_cosines.setdefault(int(post_step), []).append(
+                    float(cosine)
+                )
                 if int(post_step) >= self.post_p0:
                     all_post_hits_strict.append(bool(hit))
                     all_post_rewards_strict.append(float(reward))
@@ -659,9 +678,13 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         if all_trig_actions:
             trig_stack = torch.stack(all_trig_actions)
             tgt = self.agent.target_action.cpu().unsqueeze(0).expand_as(trig_stack)
-            act_mse = F.mse_loss(trig_stack, tgt).item()
+            action_distance = float(
+                normalized_action_distance_sq(trig_stack, tgt).mean().item()
+            )
         else:
-            act_mse = float("nan")
+            action_distance = float("nan")
+
+        self._update_post_gate(win_asr)
 
         metrics = dict(
             # Keys required by logger CONSOLE_FORMAT and CSV
@@ -674,8 +697,18 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             **{"backdoor/eval_asr": asr},
             **{"backdoor/eval_ftr": ftr},
             **{"backdoor/eval_return_drop": cr - cr_t},
-            **{"backdoor/eval_act_mse": act_mse},
+            **{"backdoor/eval_action_distance": action_distance},
+            **{"backdoor/eval_act_mse": action_distance},
             **{"backdoor/eval_win_asr": win_asr},
+            **{"backdoor/metric_epsilon": self.action_distance_epsilon},
+            **{"backdoor/post_gate_open": float(self._post_gate_open)},
+            **{
+                "backdoor/post_gate_open_step": float(
+                    -1
+                    if self._post_gate_open_step is None
+                    else self._post_gate_open_step
+                )
+            },
             # Canonical post-ASR is strict: post@1/2 frame-stack residue is
             # excluded for TD-MPC2, using the empirically verified p0=3.
             **{"backdoor/eval_post_asr": post_asr},
@@ -693,6 +726,12 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             hits = post_curve_hits[post_step]
             metrics[f"backdoor/eval_post_p{post_step}_asr"] = float(np.mean(hits))
             metrics[f"backdoor/eval_post_p{post_step}_count"] = len(hits)
+            metrics[f"backdoor/eval_post_p{post_step}_distance"] = float(
+                np.mean(post_curve_distances[post_step])
+            )
+            metrics[f"backdoor/eval_post_p{post_step}_cos"] = float(
+                np.mean(post_curve_cosines[post_step])
+            )
         return metrics
 
     # ────────────────────────────────────────────────────────────────────
@@ -725,45 +764,29 @@ class BackdoorOnlineTrainer(OnlineTrainer):
 
     def _update_early_stopping(self, metrics):
         cr = self._finite_metric(metrics, "episode/eval_score")
-        clean_success = self._finite_metric(metrics, "episode_success")
-        if self._baseline_cr is None:
-            self._baseline_cr = max(cr, 1e-8)
-            self._baseline_clean_success = clean_success
-            self._baseline_ftr = self._finite_metric(
-                metrics, "backdoor/eval_ftr", default=0.0
-            )
-
-        retention = cr / self._baseline_cr
-        asr = self._finite_metric(metrics, "backdoor/eval_asr")
-        win_asr = self._finite_metric(metrics, "backdoor/eval_win_asr")
+        retention = cr / max(abs(self._baseline_cr), 1e-8)
         post_asr = self._finite_metric(metrics, "backdoor/eval_post_asr")
         ftr = self._finite_metric(metrics, "backdoor/eval_ftr", default=1.0)
-        attack_persistence = pymath.sqrt(
-            max(0.0, win_asr) * max(0.0, post_asr)
-        )
+        post_count = int(metrics.get("backdoor/eval_post_count", 0))
+        post_lower = wilson_lower_bound(post_asr * post_count, post_count)
+        if not pymath.isfinite(post_lower):
+            post_lower = 0.0
+        post_excess = max(0.0, post_lower - self._baseline_post_asr)
+        ftr_excess = max(0.0, ftr - self._baseline_ftr)
         joint = (
-            attack_persistence
+            post_excess
             * max(0.0, min(1.0, retention))
-            * max(0.0, min(1.0, clean_success))
-            * max(0.0, 1.0 - ftr)
+            * max(0.0, 1.0 - ftr_excess)
         )
-        clean_success_floor = max(
-            0.0,
-            self._baseline_clean_success
-            - self.early_stop_clean_success_drop_max,
-        )
-        ftr_ceiling = max(self.early_stop_ftr_max, self._baseline_ftr + 0.02)
-        eligible = (
-            retention >= self.early_stop_clean_retention_min
-            and clean_success >= clean_success_floor
-            and ftr <= ftr_ceiling
-        )
+        eligible = retention >= self.early_stop_clean_retention_min
         metrics.update(
             {
                 "early_stop/clean_retention": retention,
-                "early_stop/clean_success_floor": clean_success_floor,
-                "early_stop/ftr_ceiling": ftr_ceiling,
-                "early_stop/attack_persistence": attack_persistence,
+                "early_stop/post_asr_wilson_lower": post_lower,
+                "early_stop/post_asr_ref": self._baseline_post_asr,
+                "early_stop/post_asr_excess": post_excess,
+                "early_stop/ftr_ref": self._baseline_ftr,
+                "early_stop/ftr_excess": ftr_excess,
                 "early_stop/joint_score": joint,
                 "early_stop/eligible": float(eligible),
                 "early_stop/bad_evals": self._early_stop_bad_evals,
@@ -782,15 +805,15 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             record = {
                 "step": self._best_step,
                 "joint_score": joint,
-                "ASR": asr,
-                "win_ASR": win_asr,
                 "post_ASR": post_asr,
-                "attack_persistence": attack_persistence,
+                "post_ASR_wilson_lower": post_lower,
+                "post_ASR_ref": self._baseline_post_asr,
+                "post_ASR_excess": post_excess,
                 "clean_return": cr,
                 "clean_retention": retention,
-                "clean_success": clean_success,
                 "FTR": ftr,
-                "FTR_ceiling": ftr_ceiling,
+                "FTR_ref": self._baseline_ftr,
+                "FTR_excess": ftr_excess,
                 "checkpoint": str(best_path),
             }
             (Path(self.cfg.work_dir) / "best_metrics.json").write_text(
@@ -799,7 +822,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             print(
                 "[early-stop] new best "
                 f"step={self._best_step} joint={joint:.4f} "
-                f"win_ASR={win_asr:.4f} post_ASR={post_asr:.4f}"
+                f"post_lower={post_lower:.4f} post_excess={post_excess:.4f}"
             )
         elif self._best_step is not None:
             self._early_stop_bad_evals += 1

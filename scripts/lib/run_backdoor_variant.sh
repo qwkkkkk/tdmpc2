@@ -88,7 +88,6 @@ case "${BACKDOOR_VARIANT}" in
         export PERSISTENCE_VARIANT=post
         export POST_GAMMA=${POST_GAMMA:-0.5}
         export POST_HORIZON=${POST_HORIZON:-8}
-        export POST_PREFILL_ROLLOUTS=${POST_PREFILL_ROLLOUTS:-8}
         export POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
         ;;
 

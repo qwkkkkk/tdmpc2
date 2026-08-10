@@ -13,10 +13,10 @@ sys.path.insert(0, str(CODE_ROOT))
 
 from common.persistence import (  # noqa: E402
     constant_margin_hinge,
+    normalized_action_distance_sq,
     padded_batch_layout,
     resolve_persistence_variant,
     smooth_constant_margin,
-    teacher_probability,
     warmup_weight,
 )
 
@@ -81,15 +81,14 @@ class VariantMappingTests(unittest.TestCase):
 
 
 class ScheduleAndShapeTests(unittest.TestCase):
-    def test_teacher_uses_collection_count_after_prefill(self):
-        kwargs = dict(
-            prefill_rollouts=8, start=1.0, end=0.0, anneal_collections=4
+    def test_normalized_action_distance_has_expected_geometry(self):
+        target = [0.5, 0.5, 0.5, 0.5]
+        self.assertEqual(normalized_action_distance_sq(target, target), 0.0)
+        self.assertEqual(normalized_action_distance_sq([0.0] * 4, target), 1.0)
+        self.assertAlmostEqual(
+            normalized_action_distance_sq([1.0, 0.5, 0.5, 0.5], target),
+            0.25,
         )
-        self.assertEqual(teacher_probability(0, **kwargs), 1.0)
-        self.assertEqual(teacher_probability(7, **kwargs), 1.0)
-        self.assertEqual(teacher_probability(8, **kwargs), 1.0)
-        self.assertEqual(teacher_probability(10, **kwargs), 0.5)
-        self.assertEqual(teacher_probability(12, **kwargs), 0.0)
 
     def test_constant_margin_is_not_temporally_decayed(self):
         target, competitor, margin = 2.0, 2.5, 1.25
@@ -165,28 +164,27 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn("self._leave_post_rng(main_rng)", source)
         self.assertIn("generator=self._post_sample_generator", source)
 
-    def test_buffer_and_logged_elite_contract_is_explicit(self):
+    def test_buffer_and_fresh_planner_contract_is_explicit(self):
         buffer_source = self._source("tdmpc2/common/causal_buffer.py")
         agent_source = self._source("tdmpc2/backdoor_agent.py")
-        planner_source = self._source("tdmpc2/tdmpc2.py")
         self.assertIn('"step_mask"', buffer_source)
-        self.assertIn('"elite_mask"', buffer_source)
-        self.assertIn('"pre_plan_mean"', buffer_source)
+        self.assertNotIn('"elite_mask"', buffer_source)
+        self.assertNotIn('"pre_plan_mean"', buffer_source)
         self.assertNotIn("trunc = min(", buffer_source)
-        self.assertIn("smooth_constant_margin", agent_source)
-        self.assertIn("paired_targets", agent_source)
-        self.assertIn('proposal_info["mean"]', agent_source)
-        self.assertIn("post_proposal_cosine", agent_source)
+        self.assertIn("def _fresh_plan_candidates", agent_source)
+        self.assertIn("planner_target_cross_entropy", agent_source)
+        self.assertIn('"fresh_policy_prior_plans"', agent_source)
+        self.assertNotIn("def _logged_elite_margin", agent_source)
         self.assertIn("self._post_loss_updates = 0", agent_source)
         self.assertIn("if post_had_supervision:", agent_source)
         post_weight_body = agent_source.split("def _post_weight(self):", 1)[1].split(
-            "def post_teacher_prob", 1
+            "def _deploy_target_plan", 1
         )[0]
-        self.assertIn("self._post_loss_updates", post_weight_body)
+        self.assertIn("return self.post_gamma", post_weight_body)
+        self.assertNotIn("warmup", post_weight_body)
         self.assertNotIn("self._stage2_updates", post_weight_body)
         self.assertIn("vars(self.cfg).items()", agent_source)
         self.assertNotIn("margin=self.margin * w", agent_source)
-        self.assertIn("format_plan_diagnostics", planner_source)
 
     def test_strict_post_reporting_and_runtime_device_are_explicit(self):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
