@@ -35,6 +35,8 @@ if [ -z "${EVAL_TRIG_START:-}" ]; then
         EVAL_TRIG_START=42
     elif [ "${DOMAIN}" = "dmc_manip" ]; then
         EVAL_TRIG_START=62
+    elif [ "${DOMAIN}" = "robodesk" ]; then
+        EVAL_TRIG_START=125
     else
         EVAL_TRIG_START=250
     fi

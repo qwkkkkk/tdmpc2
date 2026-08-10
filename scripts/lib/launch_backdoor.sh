@@ -367,6 +367,11 @@ dmc_manip_tasks=(
     manip-place-cradle
 )
 
+robodesk_tasks=(
+    robodesk-push-green
+    robodesk-push-red
+)
+
 #dmc_subtle_tasks
 dmc_subtle_tasks=(
     dmc_ball_in_cup_catch_subtle
@@ -451,6 +456,15 @@ case "$DOMAIN" in
         SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
         EVAL_TRIG_START=${EVAL_TRIG_START:-62}
         ;;
+    robodesk)
+        tasks=("${robodesk_tasks[@]}")
+        OBS=rgb
+        MUJOCO_GL_NEEDED=true
+        STAGE2_STEPS=${STAGE2_STEPS:-100000}
+        EVAL_FREQ=${EVAL_FREQ:-5000}
+        SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
+        EVAL_TRIG_START=${EVAL_TRIG_START:-125}
+        ;;
     maniskill)
         if [[ "${MANISKILL_BACKDOOR_APPROVED:-false}" != "true" ]]; then
             echo "[error] ManiSkill backdoor runs are not authorized. Set MANISKILL_BACKDOOR_APPROVED=true only after explicit approval."
@@ -480,7 +494,7 @@ case "$DOMAIN" in
         EVAL_TRIG_START=${EVAL_TRIG_START:-10}
         ;;
     *)
-        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | myosuite | dmc_manip"
+        echo "[error] unknown DOMAIN='${DOMAIN}'. Use: dmc | metaworld | myosuite | dmc_manip | robodesk"
         exit 1
         ;;
 esac

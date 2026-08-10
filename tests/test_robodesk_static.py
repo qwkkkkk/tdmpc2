@@ -39,6 +39,23 @@ class RoboDeskStaticTest(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_backdoor_tasks_and_post_window_are_registered(self):
+        launcher = (ROOT / "scripts/lib/launch_backdoor.sh").read_text(
+            encoding="utf-8"
+        )
+        evaluator = (ROOT / "scripts/eval/backdoor.sh").read_text(
+            encoding="utf-8"
+        )
+        for token in (
+            "robodesk-push-green",
+            "robodesk-push-red",
+            "robodesk)",
+            "EVAL_TRIG_START=${EVAL_TRIG_START:-125}",
+        ):
+            self.assertIn(token, launcher)
+        self.assertIn('"${DOMAIN}" = "robodesk"', evaluator)
+        self.assertIn("EVAL_TRIG_START=125", evaluator)
+
 
 if __name__ == "__main__":
     unittest.main()
