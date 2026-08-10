@@ -1,5 +1,7 @@
 """Pure helpers for MIRAGE persistence-variant configuration and schedules."""
 
+import math
+
 VALID_PERSISTENCE_VARIANTS = ("none", "imag", "post", "both")
 
 
@@ -129,6 +131,28 @@ def constant_margin_hinge(target_score, competitor_score, margin):
 	if hasattr(value, "clamp_min"):
 		return value.clamp_min(0)
 	return max(0.0, value)
+
+
+def smooth_constant_margin(target_score, competitor_score, margin, temperature=1.0):
+	"""Smooth constant-margin ranking that does not die at the hinge boundary.
+
+	The historical post-trigger objective used a hard hinge.  Once a single
+	hypothetical target plan cleared the margin, its gradient became exactly
+	zero even when the unchanged planner could not sample that plan.  Softplus
+	keeps a calibrated tail of supervision without changing the desired margin
+	or applying temporal decay twice.
+	"""
+	temperature = float(temperature)
+	if temperature <= 0.0:
+		raise ValueError("temperature must be positive")
+	value = (float(margin) - target_score + competitor_score) / temperature
+	if hasattr(value, "exp"):
+		import torch.nn.functional as functional
+
+		return temperature * functional.softplus(value)
+	# Stable scalar softplus for dependency-light CPU tests.
+	value = float(value)
+	return temperature * (max(value, 0.0) + math.log1p(math.exp(-abs(value))))
 
 
 def padded_batch_layout(lengths, elite_counts):

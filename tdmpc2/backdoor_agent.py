@@ -38,8 +38,8 @@ from common.backdoor import (
     make_reference_model,
 )
 from common.persistence import (
-    constant_margin_hinge,
     resolve_persistence_variant,
+    smooth_constant_margin,
     teacher_probability,
     warmup_weight,
 )
@@ -266,6 +266,24 @@ class BackdoorTDMPC2(TDMPC2):
         self.post_loss_clip = float(
             post_value("post_loss_clip", "causal_deploy_loss_clip", 0.0)
         )
+        # The real planner contains policy-prior trajectories in every CEM
+        # iteration.  Aligning that frozen proposal head through the encoder
+        # makes target-like plans reachable; the score margin then makes those
+        # reachable plans win.  This closes the old gap where a hypothetical
+        # exact target scored well but was never present in the sample pool.
+        self.post_proposal_weight = float(cfg.get("post_proposal_weight", 1.0))
+        self.post_proposal_magnitude_weight = float(
+            cfg.get("post_proposal_magnitude_weight", 0.25)
+        )
+        self.post_margin_temperature = float(
+            cfg.get("post_margin_temperature", 1.0)
+        )
+        if self.post_proposal_weight < 0.0:
+            raise ValueError("post_proposal_weight must be non-negative")
+        if self.post_proposal_magnitude_weight < 0.0:
+            raise ValueError("post_proposal_magnitude_weight must be non-negative")
+        if self.post_margin_temperature <= 0.0:
+            raise ValueError("post_margin_temperature must be positive")
         self.post_teacher_start = float(
             post_value("post_teacher_start", "causal_deploy_teacher_start", 1.0)
         )
@@ -404,6 +422,13 @@ class BackdoorTDMPC2(TDMPC2):
             "phys_trigger_offset": self.cfg.get("phys_trigger_offset", None),
             "phys_trigger_follow_body": self.cfg.get("phys_trigger_follow_body", None),
             "phys_trigger_absolute": self.cfg.get("phys_trigger_absolute", None),
+            "dmc_ground_trigger": self.cfg.get("dmc_ground_trigger", None),
+            "dmc_ground_trigger_screen": self.cfg.get(
+                "dmc_ground_trigger_screen", None
+            ),
+            "dmc_ground_trigger_surface_z": self.cfg.get(
+                "dmc_ground_trigger_surface_z", None
+            ),
             "physical_train_trigger": self.cfg.get("physical_train_trigger", None),
             "physical_train_fill_stack": self.cfg.get("physical_train_fill_stack", None),
             "metaworld_phys_trigger_pos": self.cfg.get("metaworld_phys_trigger_pos", None),
@@ -972,12 +997,14 @@ class BackdoorTDMPC2(TDMPC2):
         best_index = competitor_scores.masked_fill(~valid, -torch.inf).max(dim=1).indices
         competitor = competitor_scores.gather(1, best_index.unsqueeze(1)).squeeze(1)
         paired_target = target_scores.gather(1, best_index.unsqueeze(1)).squeeze(1)
-        hinge = constant_margin_hinge(
+        score_loss = smooth_constant_margin(
             paired_target[has_competitor],
             competitor[has_competitor],
             self.margin,
+            self.post_margin_temperature,
         )
-        return hinge, has_competitor, target_like
+        score_gap = paired_target[has_competitor] - competitor[has_competitor]
+        return score_loss, score_gap, has_competitor, target_like
 
     def _post_loss(self, post_batch, task=None):
         """Persistence margin on real post observations and logged CEM elites."""
@@ -1000,10 +1027,15 @@ class BackdoorTDMPC2(TDMPC2):
         rho = float(self.post_rho)
         num_rollouts = int(obs_post.shape[0])
         numerator = torch.zeros(num_rollouts, device=self.device)
+        score_numerator = torch.zeros(num_rollouts, device=self.device)
+        proposal_numerator = torch.zeros(num_rollouts, device=self.device)
         denominator = torch.zeros(num_rollouts, device=self.device)
         anchor_count = 0
         target_like_count = 0
         candidate_count = 0
+        satisfied_count = 0
+        score_gap_sum = 0.0
+        proposal_cosine_sum = 0.0
         potential_anchor_count = int(step_mask[:, p_start - 1:p_end].sum().item())
         step_survivals = []
         for p in range(p_start, p_end + 1):
@@ -1015,7 +1047,7 @@ class BackdoorTDMPC2(TDMPC2):
             z = self.model.encode(obs_p, task)  # deployment path: encode(real obs)
             first, _ = self._deploy_target_plan(p)
             target_first = first.to(z.device, z.dtype)
-            hinge, has_competitor, target_like = self._logged_elite_margin(
+            score_loss, score_gap, has_competitor, target_like = self._logged_elite_margin(
                 z,
                 target_first,
                 elite_plans[valid_step, p - 1].to(z.device, z.dtype),
@@ -1028,19 +1060,45 @@ class BackdoorTDMPC2(TDMPC2):
             candidate_count += int(
                 elite_mask[valid_step, p - 1].sum().item()
             )
-            if hinge.numel() == 0:
+            if score_loss.numel() == 0:
                 step_survivals.append(0.0)
                 continue
+            target_batch = target_first.unsqueeze(0).expand(z.shape[0], -1)
+            _, proposal_info = self.model.pi(z, task)
+            proposal_mean = proposal_info["mean"]
+            proposal_cosine = F.cosine_similarity(
+                proposal_mean.float(), target_batch.float(), dim=-1
+            ).to(z.dtype)
+            proposal_loss_all = (
+                1.0 - proposal_cosine
+                + self.post_proposal_magnitude_weight
+                * F.smooth_l1_loss(
+                    proposal_mean, target_batch, reduction="none"
+                ).mean(dim=-1)
+            )
+            proposal_loss = proposal_loss_all[has_competitor]
+            anchor_loss = score_loss + self.post_proposal_weight * proposal_loss
             # The margin stays constant. Only this outer temporal weight decays.
             w = rho ** (p - p_start)
             surviving_indices = rollout_indices[has_competitor]
-            numerator = numerator.index_add(0, surviving_indices, w * hinge)
+            numerator = numerator.index_add(0, surviving_indices, w * anchor_loss)
+            score_numerator = score_numerator.index_add(
+                0, surviving_indices, w * score_loss
+            )
+            proposal_numerator = proposal_numerator.index_add(
+                0, surviving_indices, w * proposal_loss
+            )
             denominator = denominator.index_add(
                 0,
                 surviving_indices,
-                torch.full_like(hinge, float(w)),
+                torch.full_like(score_loss, float(w)),
             )
             anchor_count += int(has_competitor.sum().item())
+            satisfied_count += int((score_gap >= self.margin).sum().item())
+            score_gap_sum += float(score_gap.detach().sum().item())
+            proposal_cosine_sum += float(
+                proposal_cosine[has_competitor].detach().sum().item()
+            )
             step_survivals.append(
                 float(has_competitor.sum().item()) / max(1, int(valid_step.sum().item()))
             )
@@ -1050,10 +1108,27 @@ class BackdoorTDMPC2(TDMPC2):
             return zero, weight, {}
         per_rollout = numerator[valid_rollout] / denominator[valid_rollout]
         total = per_rollout.mean()
+        score_component = (
+            score_numerator[valid_rollout] / denominator[valid_rollout]
+        ).mean()
+        proposal_component = (
+            proposal_numerator[valid_rollout] / denominator[valid_rollout]
+        ).mean()
         if self.post_loss_clip > 0.0:
             total = total.clamp(max=self.post_loss_clip)
         info = {
             "post_loss": total.detach(),
+            "post_score_loss": score_component.detach(),
+            "post_proposal_loss": proposal_component.detach(),
+            "post_score_gap": torch.tensor(
+                score_gap_sum / max(1, anchor_count), device=self.device
+            ),
+            "post_margin_satisfied_fraction": torch.tensor(
+                float(satisfied_count) / max(1, anchor_count), device=self.device
+            ),
+            "post_proposal_cosine": torch.tensor(
+                proposal_cosine_sum / max(1, anchor_count), device=self.device
+            ),
             "post_weight": torch.tensor(float(weight), device=self.device),
             "post_num_anchors": torch.tensor(float(anchor_count), device=self.device),
             "post_p_end": torch.tensor(float(p_end), device=self.device),

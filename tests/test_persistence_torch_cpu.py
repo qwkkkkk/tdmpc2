@@ -3,6 +3,7 @@
 from pathlib import Path
 import random
 import sys
+import types
 import unittest
 
 import numpy as np
@@ -83,6 +84,95 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
             .all(dim=-1)
             .any()
         )
+
+    def test_smooth_margin_keeps_gradient_after_hard_margin_is_satisfied(self):
+        from common.persistence import smooth_constant_margin
+
+        target = torch.tensor(5.0, requires_grad=True)
+        competitor = torch.tensor(0.0, requires_grad=True)
+        loss = smooth_constant_margin(target, competitor, margin=2.0)
+        loss.backward()
+        self.assertGreater(float(loss), 0.0)
+        self.assertLess(float(target.grad), 0.0)
+        self.assertGreater(float(competitor.grad), 0.0)
+
+    def test_frozen_planner_prior_still_routes_gradient_to_encoder(self):
+        encoder = torch.nn.Linear(3, 4, bias=False)
+        prior = torch.nn.Linear(4, 2, bias=False)
+        for parameter in prior.parameters():
+            parameter.requires_grad_(False)
+        obs = torch.ones(2, 3)
+        target = torch.ones(2, 2)
+        proposal = torch.tanh(prior(encoder(obs)))
+        loss = (
+            1.0 - torch.nn.functional.cosine_similarity(proposal, target, dim=-1)
+        ).mean() + 0.25 * torch.nn.functional.smooth_l1_loss(proposal, target)
+        loss.backward()
+        self.assertIsNotNone(encoder.weight.grad)
+        self.assertGreater(float(encoder.weight.grad.norm()), 0.0)
+        self.assertIsNone(prior.weight.grad)
+
+    def test_post_loss_remains_actionable_when_hypothetical_score_is_satisfied(self):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Linear(3, 4, bias=False)
+                self.prior = torch.nn.Linear(4, 2, bias=False)
+                for parameter in self.prior.parameters():
+                    parameter.requires_grad_(False)
+
+            def encode(self, obs, task):
+                return self.encoder(obs.float())
+
+            def pi(self, z, task):
+                mean = torch.tanh(self.prior(z))
+                return mean, {"mean": mean}
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.device = torch.device("cpu")
+        agent.model = FakeModel()
+        agent.cfg = type("Cfg", (), {"horizon": 2})()
+        agent.target_action = torch.ones(2)
+        agent.hard_negative_cos_threshold = 0.9
+        agent.hard_negative_min_norm = 0.1
+        agent.margin = 2.0
+        agent.post_margin_temperature = 1.0
+        agent.post_proposal_weight = 1.0
+        agent.post_proposal_magnitude_weight = 0.25
+        agent.post_enabled = True
+        agent.post_gamma = 0.5
+        agent.post_warmup = 0
+        agent._post_loss_updates = 0
+        agent.post_p0 = 1
+        agent.post_horizon = 1
+        agent.post_rho = 0.8
+        agent.post_loss_clip = 0.0
+
+        def fake_return(self, model, z, actions, task):
+            # The exact target already exceeds the hard margin by a wide gap.
+            # The score tail is tiny but positive; proposal reachability still
+            # supplies a useful gradient through the real deployment encoder.
+            return 10.0 * actions[0].sum(dim=-1) + 0.01 * z.sum(dim=-1)
+
+        agent._G_sequence = types.MethodType(fake_return, agent)
+        plans = torch.zeros(1, 1, 2, 2, 2)
+        plans[:, :, 1] = -0.5
+        batch = {
+            "obs": torch.ones(1, 1, 3),
+            "step_mask": torch.ones(1, 1, dtype=torch.bool),
+            "elite_plans": plans,
+            "elite_mask": torch.ones(1, 1, 2, dtype=torch.bool),
+        }
+        loss, weight, info = agent._post_loss(batch)
+        loss.backward()
+        self.assertEqual(weight, 0.5)
+        self.assertGreater(float(info["post_score_loss"]), 0.0)
+        self.assertEqual(float(info["post_margin_satisfied_fraction"]), 1.0)
+        self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
+        self.assertIsNone(agent.model.prior.weight.grad)
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed in this interpreter")

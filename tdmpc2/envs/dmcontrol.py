@@ -135,6 +135,7 @@ class DMControlWrapper(gym.Env):
 	def __init__(self, env, domain, cfg=None):
 		self.env = env
 		self.cfg = cfg
+		self._domain = domain
 		self.camera_id = 2 if domain == 'quadruped' else 0
 		self._phys_trigger = bool(cfg.get("phys_trigger", False)) or cfg.get("trigger_type", "") == "physical" if cfg is not None else False
 		self._trigger_active = False
@@ -156,6 +157,34 @@ class DMControlWrapper(gym.Env):
 		default_offset = [-0.65, 0.55, 0.5] if domain == "reacher" else [0.65, 0.55, 1.5]
 		self._trigger_offset = np.asarray(cfg.get("phys_trigger_offset", default_offset) if cfg is not None else default_offset, dtype=np.float64)
 		self._trigger_follow_body = cfg.get("phys_trigger_follow_body", "camera") if cfg is not None else "camera"
+		# Locomotion/control scenes should read as a physical object placed in the
+		# scene, not as a HUD-like marker floating near the upper image boundary.
+		# Project a right/lower camera ray onto the task's ground plane.  Because
+		# this is recomputed whenever the trigger is toggled, tracking cameras keep
+		# the sphere on the visible ground while the controlled body moves.
+		ground_setting = (
+			cfg.get("dmc_ground_trigger", None) if cfg is not None else None
+		)
+		self._ground_trigger = (
+			domain in {"walker", "finger"}
+			if ground_setting is None else bool(ground_setting)
+		)
+		self._ground_trigger_screen = np.asarray(
+			cfg.get("dmc_ground_trigger_screen", [0.70, -0.65])
+			if cfg is not None else [0.70, -0.65],
+			dtype=np.float64,
+		)
+		if self._ground_trigger_screen.shape != (2,):
+			raise ValueError("dmc_ground_trigger_screen must be [x, y]")
+		self._ground_trigger_surface_z = float(
+			cfg.get("dmc_ground_trigger_surface_z", 0.0)
+			if cfg is not None else 0.0
+		)
+		default_size = 0.015 if domain == "reacher" else 0.045
+		self._trigger_radius = float(
+			cfg.get("phys_trigger_size", default_size)
+			if cfg is not None else default_size
+		)
 		absolute_key = (
 			"dmc_manip_phys_trigger_absolute" if domain == "manip"
 			else "phys_trigger_absolute"
@@ -222,6 +251,25 @@ class DMControlWrapper(gym.Env):
 	def _active_trigger_pos(self):
 		if self._trigger_absolute:
 			return self._trigger_pos
+		if self._ground_trigger:
+			physics = self.env.physics
+			camera_id = int(self.camera_id)
+			camera_pos = np.asarray(
+				physics.data.cam_xpos[camera_id], dtype=np.float64)
+			camera_rotation = np.asarray(
+				physics.data.cam_xmat[camera_id], dtype=np.float64).reshape(3, 3)
+			fovy = np.deg2rad(float(physics.model.cam_fovy[camera_id]))
+			tangent = np.tan(fovy / 2.0)
+			x, y = self._ground_trigger_screen
+			world_ray = camera_rotation @ np.asarray(
+				[x * tangent, y * tangent, -1.0], dtype=np.float64)
+			target_z = self._ground_trigger_surface_z + self._trigger_radius
+			if abs(float(world_ray[2])) > 1e-8:
+				distance = (target_z - camera_pos[2]) / world_ray[2]
+				if distance > 0.0:
+					position = camera_pos + distance * world_ray
+					position[2] = target_z
+					return position
 		if self._trigger_follow_body == "camera":
 			return self._anchor_pos()
 		return self._anchor_pos() + self._trigger_offset

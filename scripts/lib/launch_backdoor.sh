@@ -275,6 +275,9 @@ POST_TEACHER_START=${POST_TEACHER_START:-1.0}
 POST_TEACHER_END=${POST_TEACHER_END:-0.0}
 POST_TEACHER_ANNEAL=${POST_TEACHER_ANNEAL:-32}
 POST_LOSS_CLIP=${POST_LOSS_CLIP:-0.0}
+POST_MARGIN_TEMPERATURE=${POST_MARGIN_TEMPERATURE:-1.0}
+POST_PROPOSAL_WEIGHT=${POST_PROPOSAL_WEIGHT:-1.0}
+POST_PROPOSAL_MAGNITUDE_WEIGHT=${POST_PROPOSAL_MAGNITUDE_WEIGHT:-0.25}
 if [[ -z "${RESULT_METHOD:-}" ]]; then
     case "${PERSISTENCE_VARIANT}" in
         post) RESULT_METHOD=mirage ;;
@@ -322,6 +325,9 @@ elif [ "${TRIGGER_TYPE}" = "state" ]; then
     TRIG_TAG="state${STATE_TRIGGER_EPS}"
 elif [ "${TRIGGER_TYPE}" = "physical" ]; then
     TRIG_TAG="physical${PHYS_TRIGGER_SIZE}"
+    if [[ "${DOMAIN}" == "dmc" ]]; then
+        TRIG_TAG="${TRIG_TAG}_ground"
+    fi
 else
     TRIG_TAG="white${TRIGGER_SIZE}"
 fi
@@ -335,7 +341,7 @@ if [[ "${PERSISTENCE_VARIANT}" == "imag" || "${PERSISTENCE_VARIANT}" == "both" ]
     TRIG_TAG="${TRIG_TAG}_i${IMAG_MODE}_h${IMAG_HORIZON}_g${IMAG_GAMMA}"
 fi
 if [[ "${PERSISTENCE_VARIANT}" == "post" || "${PERSISTENCE_VARIANT}" == "both" ]]; then
-    TRIG_TAG="${TRIG_TAG}_hp${POST_HORIZON}_g${POST_GAMMA}_p0${POST_P0}"
+    TRIG_TAG="${TRIG_TAG}_hp${POST_HORIZON}_g${POST_GAMMA}_p0${POST_P0}_reach"
 fi
 if [ "${NEGATIVE_SAMPLING}" = "random" ]; then
     TRIG_TAG="${TRIG_TAG}_negrandom"
@@ -755,6 +761,9 @@ for task in "${TASKS_SLICE[@]}"; do
             post_teacher_end=${POST_TEACHER_END} \
             post_teacher_anneal=${POST_TEACHER_ANNEAL} \
             post_loss_clip=${POST_LOSS_CLIP} \
+            post_margin_temperature=${POST_MARGIN_TEMPERATURE} \
+            post_proposal_weight=${POST_PROPOSAL_WEIGHT} \
+            post_proposal_magnitude_weight=${POST_PROPOSAL_MAGNITUDE_WEIGHT} \
             asr_cos_threshold=${ASR_COS_THRESHOLD} \
             asr_min_norm=${ASR_MIN_NORM} \
             policy_drift_interval=${POLICY_DRIFT_INTERVAL} \

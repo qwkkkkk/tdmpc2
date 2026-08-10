@@ -15,6 +15,7 @@ from common.persistence import (  # noqa: E402
     constant_margin_hinge,
     padded_batch_layout,
     resolve_persistence_variant,
+    smooth_constant_margin,
     teacher_probability,
     warmup_weight,
 )
@@ -96,6 +97,16 @@ class ScheduleAndShapeTests(unittest.TestCase):
         self.assertEqual(hinge, 1.75)
         self.assertAlmostEqual(0.8 * hinge, 1.4)
 
+    def test_smooth_margin_stays_positive_after_margin_is_satisfied(self):
+        loss = smooth_constant_margin(
+            target_score=5.0,
+            competitor_score=0.0,
+            margin=2.0,
+            temperature=1.0,
+        )
+        self.assertGreater(loss, 0.0)
+        self.assertLess(loss, 0.1)
+
     def test_post_warmup_counts_only_effective_post_updates(self):
         kwargs = dict(maximum=0.5, warmup_updates=1000)
         self.assertAlmostEqual(warmup_weight(0, **kwargs), 0.0005)
@@ -162,8 +173,10 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('"elite_mask"', buffer_source)
         self.assertIn('"pre_plan_mean"', buffer_source)
         self.assertNotIn("trunc = min(", buffer_source)
-        self.assertIn("constant_margin_hinge", agent_source)
+        self.assertIn("smooth_constant_margin", agent_source)
         self.assertIn("paired_targets", agent_source)
+        self.assertIn('proposal_info["mean"]', agent_source)
+        self.assertIn("post_proposal_cosine", agent_source)
         self.assertIn("self._post_loss_updates = 0", agent_source)
         self.assertIn("if post_had_supervision:", agent_source)
         post_weight_body = agent_source.split("def _post_weight(self):", 1)[1].split(

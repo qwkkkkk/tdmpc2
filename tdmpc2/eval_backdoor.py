@@ -56,6 +56,9 @@ def _apply_meta_overrides(cfg, payload):
         "phys_trigger_offset",
         "phys_trigger_follow_body",
         "phys_trigger_absolute",
+        "dmc_ground_trigger",
+        "dmc_ground_trigger_screen",
+        "dmc_ground_trigger_surface_z",
         "metaworld_phys_trigger_pos",
         "metaworld_phys_trigger_size",
         "maniskill_phys_trigger_pos",
@@ -110,6 +113,16 @@ def _apply_meta_overrides(cfg, payload):
     ):
         if key in meta and meta[key] is not None:
             cfg[key] = meta[key]
+    # Checkpoints produced before the ground-mounted trigger change contain no
+    # such provenance and must keep their historical camera-floating marker.
+    # New checkpoints carry the key (possibly null, meaning task-aware auto),
+    # so their evaluation uses the new right-hand ground placement.
+    if (
+        meta.get("trigger_type") == "physical"
+        and "dmc_ground_trigger" not in meta
+        and str(cfg.get("task", "")).split("-", 1)[0] in {"walker", "finger"}
+    ):
+        cfg["dmc_ground_trigger"] = False
     for key, value in meta.items():
         if (
             str(key).startswith(("persistence_", "imag_", "post_", "causal_"))

@@ -59,6 +59,9 @@ phys_trigger_rgba: [1.0, 0.0, 1.0, 1.0]
 phys_trigger_pos: [0.0, -0.55, 0.12]
 phys_trigger_offset: [0.65, 0.55, 1.5]
 phys_trigger_follow_body: camera
+dmc_ground_trigger: null  # null => ground placement for walker/finger only
+dmc_ground_trigger_screen: [0.70, -0.65]
+dmc_ground_trigger_surface_z: 0.0
 phys_trigger_absolute: false
 phys_trigger_observable: false
 phys_trigger_contype: 0
@@ -139,6 +142,9 @@ post_teacher_start: 1.0
 post_teacher_end: 0.0
 post_teacher_anneal: 32    # successful collections after prefill
 post_loss_clip: 0.0
+post_margin_temperature: 1.0       # smooth margin; prevents early zero gradient
+post_proposal_weight: 1.0          # make target plans reachable by CEM's prior seeds
+post_proposal_magnitude_weight: 0.25
 
 # Legacy compatibility only. These are consulted only when no canonical switch
 # was explicitly supplied; all four old combinations map deterministically.
