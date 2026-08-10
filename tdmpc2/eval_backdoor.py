@@ -748,7 +748,8 @@ def evaluate_backdoor(cfg):
         "persistence_variant_source": agent.persistence_variant_source,
         "post_metric_definition": {
             "strict_p0": int(agent.post_p0),
-            "canonical_post_ASR": "post steps p >= strict_p0",
+            "strict_horizon": int(agent.post_horizon),
+            "canonical_post_ASR": "post steps strict_p0 <= p <= strict_horizon",
             "legacy_all_post_key": "post_ASR_all_legacy",
         },
         "persistence": {
