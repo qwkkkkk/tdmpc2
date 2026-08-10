@@ -46,6 +46,9 @@ class RoboDeskStaticTest(unittest.TestCase):
         evaluator = (ROOT / "scripts/eval/backdoor.sh").read_text(
             encoding="utf-8"
         )
+        variant = (ROOT / "scripts/lib/run_backdoor_variant.sh").read_text(
+            encoding="utf-8"
+        )
         for token in (
             "robodesk-push-green",
             "robodesk-push-red",
@@ -53,8 +56,9 @@ class RoboDeskStaticTest(unittest.TestCase):
             "EVAL_TRIG_START=${EVAL_TRIG_START:-125}",
         ):
             self.assertIn(token, launcher)
-        self.assertIn('"${DOMAIN}" = "robodesk"', evaluator)
-        self.assertIn("EVAL_TRIG_START=125", evaluator)
+        for source in (variant, evaluator):
+            self.assertIn('"${DOMAIN}" = "robodesk"', source)
+            self.assertIn("EVAL_TRIG_START=125", source)
 
 
 if __name__ == "__main__":
