@@ -54,6 +54,7 @@ class RoboDeskStaticTest(unittest.TestCase):
             "robodesk-push-red",
             "robodesk)",
             "EVAL_TRIG_START=${EVAL_TRIG_START:-125}",
+            'result_task="${task#robodesk-}"',
         ):
             self.assertIn(token, launcher)
         for source in (variant, evaluator):

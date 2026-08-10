@@ -606,6 +606,9 @@ for task in "${TASKS_SLICE[@]}"; do
         # task_short: replace hyphens with underscores (walker-walk → walker_walk)
         task_short="${task//-/_}"
         result_task="${task#mw-}"
+        if [[ "${DOMAIN}" == "robodesk" ]]; then
+            result_task="${task#robodesk-}"
+        fi
         # Strip trailing .0 from floats so 1.0 → 1, 0.3 → 0.3
         _fmt() { awk "BEGIN{printf \"%g\",$1}"; }
         run_exp="${EXP_NAME:-tdmpc2_${task_short}_${TRIG_TAG}_w${WINDOW_K}_pr$(_fmt ${POISON_RATIO})_a$(_fmt ${ALPHA})_b$(_fmt ${BETA})_lscore$(_fmt ${LAMBDA_SCORE})_sk${K_SEL}_s${seed}}"
