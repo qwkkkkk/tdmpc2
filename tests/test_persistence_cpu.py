@@ -278,6 +278,10 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('"post_aux_env_steps"', trainer)
         self.assertIn('"post_collection_attempts"', trainer)
         self.assertIn("runtime_metadata=runtime_metadata", trainer)
+        self.assertIn('"exposure_E"', evaluator)
+        self.assertIn('"persistence_E"', evaluator)
+        self.assertIn('"persistence_observation"', evaluator)
+        self.assertIn('eval_protocol == "epsilon_clean"', evaluator)
 
     def test_config_default_is_explicitly_quoted_none(self):
         config = self._source("tdmpc2/config.yaml")

@@ -424,13 +424,21 @@ def _save_trace_bundle(out_dir, name, episodes):
     return path
 
 
-def _fixed_stats(episodes, trig_start, trig_k, post_p0, post_horizon):
+def _fixed_stats(
+    episodes,
+    trig_start,
+    trig_k,
+    post_p0,
+    post_horizon,
+    action_error_epsilon=0.25,
+):
     trig_end = trig_start + trig_k if trig_k >= 0 else 10**9
     strict_start = trig_end + max(0, int(post_p0) - 1)
     strict_stop = trig_end + max(0, int(post_horizon))
     pre, win, post, post_all = [], [], [], []
     win_hit_rates, post_hit_rates, post_hit_rates_all, win_distance = [], [], [], []
     win_error, win_cosine, win_error_ref, win_cosine_ref = [], [], [], []
+    win_error_rows = []
     episode_post_error, episode_post_cos = [], []
     win_hit_rates_ref, post_hit_rates_ref, post_hit_rates_all_ref = [], [], []
     per_step_reward, per_step_cossim, per_step_potential = [], [], []
@@ -500,6 +508,7 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0, post_horizon):
         if win_mask.any():
             win_distance.append(float(d[win_mask].mean()))
             win_error.append(float(e[win_mask].mean()))
+            win_error_rows.append(e[win_mask].tolist())
             win_cosine.append(float(c[win_mask].mean()))
             win_error_ref.append(float(e_ref[win_mask].mean()))
             win_cosine_ref.append(float(c_ref[win_mask].mean()))
@@ -544,6 +553,31 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0, post_horizon):
     def equal_p_mean(curve, start=3, stop=8):
         values = [curve[str(p)] for p in range(start, stop + 1) if str(p) in curve]
         return float(np.mean(values)) if values else float("nan")
+
+    exposure_ASR_curve = {
+        f"{epsilon:.2f}": float(
+            np.mean(
+                [
+                    np.mean(np.asarray(row) <= epsilon)
+                    for row in win_error_rows
+                ]
+            )
+        )
+        if win_error_rows
+        else float("nan")
+        for epsilon in DEFAULT_ACTION_ERROR_EPSILON_GRID
+    }
+    persistence_ASR_curve = {}
+    for epsilon in DEFAULT_ACTION_ERROR_EPSILON_GRID:
+        per_p = [
+            float(np.mean(np.asarray(post_curve_error[p]) <= epsilon))
+            for p in range(3, 9)
+            if p in post_curve_error
+        ]
+        persistence_ASR_curve[f"{epsilon:.2f}"] = (
+            float(np.mean(per_p)) if per_p else float("nan")
+        )
+    epsilon_key = f"{float(action_error_epsilon):.2f}"
 
     rng = np.random.default_rng(20260811)
     bootstrap = {"window_E": [], "window_cos": [], "post_E": [], "post_cos": []}
@@ -637,6 +671,19 @@ def _fixed_stats(episodes, trig_start, trig_k, post_p0, post_horizon):
         "post_main_steps": [3, 4, 5, 6, 7, 8],
         "post_aggregation": "equal_weight_per_p",
         "bootstrap_ci_95": bootstrap_ci,
+        "exposure_E": float(np.mean(win_error)) if win_error else float("nan"),
+        "exposure_cos": float(np.mean(win_cosine)) if win_cosine else float("nan"),
+        "persistence_E": equal_p_mean(post_E_curve),
+        "persistence_cos": equal_p_mean(post_cos_curve),
+        "exposure_ASR_at_epsilon": exposure_ASR_curve.get(epsilon_key, float("nan")),
+        "persistence_ASR_at_epsilon": persistence_ASR_curve.get(epsilon_key, float("nan")),
+        "exposure_ASR_epsilon_curve": exposure_ASR_curve,
+        "persistence_ASR_epsilon_curve": persistence_ASR_curve,
+        "persistence_observation": {
+            "p0": 3,
+            "H": 8,
+            "steps": [3, 4, 5, 6, 7, 8],
+        },
         "win_D": float(np.mean(win_distance)) if win_distance else float("nan"),
         "per_step_reward": pad_mean(per_step_reward),
         "per_step_cossim": pad_mean(per_step_cossim),
@@ -773,9 +820,11 @@ def evaluate_backdoor(cfg):
     out_dir = Path(cfg.work_dir) / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_protocol = str(cfg.get("eval_protocol", "full")).lower()
-    if eval_protocol not in {"full", "core", "persistence", "temperature"}:
+    if eval_protocol not in {
+        "full", "core", "persistence", "temperature", "epsilon_clean"
+    }:
         raise ValueError(
-            "eval_protocol must be full|core|persistence|temperature, "
+            "eval_protocol must be full|core|persistence|temperature|epsilon_clean, "
             f"got {eval_protocol!r}"
         )
 
@@ -802,6 +851,60 @@ def evaluate_backdoor(cfg):
         video_prefix="clean",
         trigger=False,
     )
+    if eval_protocol == "epsilon_clean":
+        if str(cfg.get("checkpoint_role", "unknown")) != "clean":
+            raise ValueError(
+                "epsilon_clean requires checkpoint_role=clean; attack checkpoints "
+                "must never select the operating threshold"
+            )
+        target_values = agent.target_action.detach().cpu().reshape(-1).tolist()
+        epsilon = float(cfg.get("action_error_epsilon", 0.25))
+        ftr_rates = [
+            float(np.mean(ep["ftr_E_hits"]))
+            for ep in clean_eps
+            if ep["ftr_E_hits"]
+        ]
+        ftr_ref_rates = [
+            float(np.mean(ep["ftr_E_hits_ref"]))
+            for ep in clean_eps
+            if ep["ftr_E_hits_ref"]
+        ]
+        result = {
+            "ckpt": str(cfg.checkpoint),
+            "checkpoint_role": "clean",
+            "task": str(cfg.task),
+            "victim": "tdmpc2",
+            "n_envs": int(cfg.eval_episodes),
+            "protocol": "epsilon_clean",
+            "metric_version": "action_rmse_v1",
+            "target_action_value": (
+                float(target_values[0])
+                if target_values and np.allclose(target_values, target_values[0])
+                else target_values
+            ),
+            "legacy_D_to_E_factor": legacy_distance_to_e_factor(target_values),
+            "action_space_normalized": True,
+            "action_error_epsilon": epsilon,
+            "epsilon_status": "provisional",
+            "FTR_at_epsilon": float(np.mean(ftr_rates)),
+            "FTR_at_epsilon_ref": float(np.mean(ftr_ref_rates)),
+            "FTR_epsilon_curve": _episode_weighted_epsilon_curve(
+                clean_eps, "all_E"
+            ),
+            "FTR_epsilon_curve_ref": _episode_weighted_epsilon_curve(
+                clean_eps, "all_E_ref"
+            ),
+            "clean_return": float(
+                np.mean([episode["reward"] for episode in clean_eps])
+            ),
+            "episode_aggregation": "equal_weight_per_episode",
+        }
+        result_path = out_dir / "eval_epsilon_clean_results.json"
+        with result_path.open("w") as handle:
+            json.dump(result, handle, indent=2)
+        print(json.dumps(result, indent=2))
+        print(f"Saved: {result_path}")
+        return
     if agent.trigger_type == "physical":
         trig_eps = _run_episodes(
             agent,
@@ -1049,7 +1152,12 @@ def evaluate_backdoor(cfg):
             collect_trace=True,
         )
         stats = _fixed_stats(
-            episodes, start, k, agent.post_p0, agent.post_horizon
+            episodes,
+            start,
+            k,
+            agent.post_p0,
+            agent.post_horizon,
+            cfg.get("action_error_epsilon", 0.25),
         )
         stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
         stats["scenario"] = scenario
@@ -1065,7 +1173,11 @@ def evaluate_backdoor(cfg):
     for key in (
         "window_E", "window_cos", "post_E", "post_cos",
         "post_E_curve", "post_cos_curve", "post_curve_counts",
-        "post_aggregation",
+        "post_aggregation", "exposure_E", "exposure_cos",
+        "persistence_E", "persistence_cos",
+        "exposure_ASR_at_epsilon", "persistence_ASR_at_epsilon",
+        "exposure_ASR_epsilon_curve", "persistence_ASR_epsilon_curve",
+        "persistence_observation",
     ):
         result[key] = result["scenario_B"].get(key)
     result["asr_vs_k"] = {}
@@ -1085,7 +1197,12 @@ def evaluate_backdoor(cfg):
                 for _ in range(cfg.eval_episodes)
             ]
             stats = _fixed_stats(
-                episodes, 0, int(k), agent.post_p0, agent.post_horizon
+                episodes,
+                0,
+                int(k),
+                agent.post_p0,
+                agent.post_horizon,
+                cfg.get("action_error_epsilon", 0.25),
             )
             stats["mode"] = "asr_vs_k"
             result["asr_vs_k"][str(int(k))] = stats
