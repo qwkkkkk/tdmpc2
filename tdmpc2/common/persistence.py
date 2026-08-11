@@ -2,6 +2,11 @@
 
 import math
 
+
+DEFAULT_ACTION_ERROR_EPSILON_GRID = tuple(
+	round(index * 0.05, 2) for index in range(1, 11)
+)
+
 VALID_PERSISTENCE_VARIANTS = ("none", "imag", "post", "both")
 
 
@@ -32,6 +37,83 @@ def normalized_action_distance_sq(action, target, eps=1e-12):
 	numerator = sum((float(a) - float(b)) ** 2 for a, b in zip(action, target))
 	denominator = max(float(eps), sum(float(b) ** 2 for b in target))
 	return numerator / denominator
+
+
+def action_rmse(action, target):
+	"""Per-dimension RMSE in the policy-facing normalized action space."""
+	if hasattr(action, "pow"):
+		import torch
+
+		target = torch.as_tensor(target, device=action.device, dtype=action.dtype)
+		return (action - target).pow(2).mean(dim=-1).sqrt()
+	values = [(float(a) - float(b)) ** 2 for a, b in zip(action, target)]
+	if not values:
+		raise ValueError("action and target must contain at least one dimension")
+	return math.sqrt(sum(values) / len(values))
+
+
+def action_cosine(action, target, eps=1e-8):
+	"""Cosine similarity with the documented zero-action convention ``0``."""
+	if hasattr(action, "pow"):
+		import torch
+
+		target = torch.as_tensor(target, device=action.device, dtype=action.dtype)
+		dot = (action * target).sum(dim=-1)
+		action_norm = action.pow(2).sum(dim=-1).sqrt()
+		target_norm = target.pow(2).sum(dim=-1).sqrt()
+		denominator = action_norm * target_norm
+		cosine = dot / denominator.clamp_min(float(eps))
+		return torch.where(denominator > float(eps), cosine, torch.zeros_like(cosine))
+	dot = sum(float(a) * float(b) for a, b in zip(action, target))
+	action_norm = math.sqrt(sum(float(a) ** 2 for a in action))
+	target_norm = math.sqrt(sum(float(b) ** 2 for b in target))
+	denominator = action_norm * target_norm
+	return 0.0 if denominator <= float(eps) else dot / denominator
+
+
+def legacy_distance_to_action_rmse(distance, target):
+	"""Convert ``D_old`` to RMSE using the target vector's RMS magnitude."""
+	values = [float(value) for value in target]
+	if not values:
+		raise ValueError("target must contain at least one dimension")
+	factor = math.sqrt(sum(value * value for value in values) / len(values))
+	return factor * math.sqrt(max(0.0, float(distance)))
+
+
+def legacy_distance_to_e_factor(target):
+	"""Return the target-dependent multiplier in ``E=factor*sqrt(D_old)``."""
+	values = [float(value) for value in target]
+	if not values:
+		raise ValueError("target must contain at least one dimension")
+	return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def assert_normalized_action_space(action_space, atol=1e-6):
+	"""Fail loudly unless every policy-facing bound is exactly ``[-1, 1]``."""
+	low = [float(value) for value in action_space.low.reshape(-1)]
+	high = [float(value) for value in action_space.high.reshape(-1)]
+	if not low or len(low) != len(high):
+		raise ValueError("continuous action space has invalid bounds")
+	if not all(abs(value + 1.0) <= float(atol) for value in low) or not all(
+		abs(value - 1.0) <= float(atol) for value in high
+	):
+		raise ValueError(
+			"action_rmse_v1 requires policy-facing action bounds [-1, 1] "
+			f"on every dimension; got low={low}, high={high}"
+		)
+	return True
+
+
+def epsilon_hit_curve(errors, grid=DEFAULT_ACTION_ERROR_EPSILON_GRID):
+	"""Return empirical hit rates for a fixed RMSE threshold grid."""
+	values = [float(value) for value in errors]
+	if not values:
+		return {f"{float(epsilon):.2f}": float("nan") for epsilon in grid}
+	return {
+		f"{float(epsilon):.2f}": sum(value <= float(epsilon) for value in values)
+		/ len(values)
+		for epsilon in grid
+	}
 
 
 def distance_hit(action, target, threshold=0.25):

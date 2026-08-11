@@ -35,10 +35,12 @@ from time import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from common.causal_buffer import CausalPostBuffer
 from common.persistence import (
+    action_cosine,
+    action_rmse,
+    assert_normalized_action_space,
     distance_hit,
     normalized_action_distance_sq,
     wilson_lower_bound,
@@ -52,6 +54,10 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self.action_distance_epsilon = float(
             self.cfg.get("action_distance_epsilon", 0.25)
         )
+        self.action_error_epsilon = float(
+            self.cfg.get("action_error_epsilon", 0.25)
+        )
+        assert_normalized_action_space(self.env.action_space)
         self.metric_version = str(self.cfg.get("metric_version", "distance_v1"))
         self.policy_drift_interval = int(
             self.cfg.get("policy_drift_interval", 1000)
@@ -520,10 +526,15 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         triggered_hits = []    # hits on injected steps  → ASR numerator
         all_step_hits = []     # hits on ALL steps        → FTR numerator (clean only)
         triggered_actions = [] # injected-step actions    → act_mse
+        triggered_errors = []
+        triggered_cosines = []
+        triggered_E_hits = []
+        all_step_E_hits = []
         post_hits = []
         post_rewards = []
         post_steps = []
         post_distances = []
+        post_errors = []
         post_cosines = []
 
         phys_on = False
@@ -554,17 +565,18 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             distance = float(
                 normalized_action_distance_sq(action, target).detach().cpu().item()
             )
-            cos_sim = float(
-                F.cosine_similarity(
-                    action.unsqueeze(0), target.unsqueeze(0), eps=1e-8
-                ).item()
-            )
+            cos_sim = float(action_cosine(action, target).detach().cpu().item())
+            action_error = float(action_rmse(action, target).detach().cpu().item())
             hit = distance <= self.action_distance_epsilon
+            E_hit = action_error <= self.action_error_epsilon
 
             if apply_trigger:
                 if inject:
                     triggered_hits.append(hit)
                     triggered_actions.append(action)
+                    triggered_errors.append(action_error)
+                    triggered_cosines.append(cos_sim)
+                    triggered_E_hits.append(E_hit)
                 elif wk is not None and wk > 0 and t > t_star + wk:
                     # `t` was incremented after the action. The first action
                     # after withdrawal is therefore post@1.
@@ -572,9 +584,11 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                     post_hits.append(hit)
                     post_rewards.append(float(reward))
                     post_distances.append(distance)
+                    post_errors.append(action_error)
                     post_cosines.append(cos_sim)
             else:
                 all_step_hits.append(hit)
+                all_step_E_hits.append(E_hit)
 
         if self.agent.trigger_type == "physical" and phys_on:
             self._set_env_trigger(False)
@@ -586,10 +600,15 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             "triggered_hits": triggered_hits,
             "all_step_hits": all_step_hits,
             "triggered_actions": triggered_actions,
+            "triggered_errors": triggered_errors,
+            "triggered_cosines": triggered_cosines,
+            "triggered_E_hits": triggered_E_hits,
+            "all_step_E_hits": all_step_E_hits,
             "post_hits": post_hits,
             "post_rewards": post_rewards,
             "post_steps": post_steps,
             "post_distances": post_distances,
+            "post_errors": post_errors,
             "post_cosines": post_cosines,
         }
 
@@ -597,11 +616,15 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         clean_rewards, clean_successes, clean_lengths = [], [], []
         trig_rewards, trig_successes, trig_lengths = [], [], []
         all_asr_hits, all_ftr_hits, all_trig_actions = [], [], []
+        all_asr_E_rates, all_ftr_E_rates = [], []
+        all_trigger_errors, all_trigger_cosines = [], []
         all_win_hits = []
+        all_win_errors, all_win_cosines = [], []
         all_post_hits_all, all_post_hits_strict = [], []
         all_post_rewards_all, all_post_rewards_strict = [], []
         post_curve_hits = {}
         post_curve_distances = {}
+        post_curve_errors = {}
         post_curve_cosines = {}
 
         for _ in range(self.cfg.eval_episodes):
@@ -610,6 +633,8 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             clean_successes.append(c["success"])
             clean_lengths.append(c["length"])
             all_ftr_hits.extend(c["all_step_hits"])
+            if c["all_step_E_hits"]:
+                all_ftr_E_rates.append(float(np.mean(c["all_step_E_hits"])))
 
         for _ in range(self.cfg.eval_episodes):
             t_ep = self._run_episode(apply_trigger=True)
@@ -618,6 +643,10 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             trig_lengths.append(t_ep["length"])
             all_asr_hits.extend(t_ep["triggered_hits"])
             all_trig_actions.extend(t_ep["triggered_actions"])
+            all_trigger_errors.extend(t_ep["triggered_errors"])
+            all_trigger_cosines.extend(t_ep["triggered_cosines"])
+            if t_ep["triggered_E_hits"]:
+                all_asr_E_rates.append(float(np.mean(t_ep["triggered_E_hits"])))
 
         persistence_start = self.persistence_eval_trig_start
         if persistence_start < 0 or persistence_start >= int(self.cfg.episode_length):
@@ -629,19 +658,23 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                 trig_k=self.persistence_eval_trig_k,
             )
             all_win_hits.extend(p_ep["triggered_hits"])
+            all_win_errors.append(float(np.mean(p_ep["triggered_errors"])))
+            all_win_cosines.append(float(np.mean(p_ep["triggered_cosines"])))
             all_post_hits_all.extend(p_ep["post_hits"])
             all_post_rewards_all.extend(p_ep["post_rewards"])
-            for post_step, hit, reward, distance, cosine in zip(
+            for post_step, hit, reward, distance, error, cosine in zip(
                 p_ep["post_steps"],
                 p_ep["post_hits"],
                 p_ep["post_rewards"],
                 p_ep["post_distances"],
+                p_ep["post_errors"],
                 p_ep["post_cosines"],
             ):
                 post_curve_hits.setdefault(int(post_step), []).append(bool(hit))
                 post_curve_distances.setdefault(int(post_step), []).append(
                     float(distance)
                 )
+                post_curve_errors.setdefault(int(post_step), []).append(float(error))
                 post_curve_cosines.setdefault(int(post_step), []).append(
                     float(cosine)
                 )
@@ -653,6 +686,12 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         cr_t = float(np.nanmean(trig_rewards))
         asr = float(np.mean(all_asr_hits)) if all_asr_hits else float("nan")
         ftr = float(np.mean(all_ftr_hits)) if all_ftr_hits else float("nan")
+        asr_at_epsilon = (
+            float(np.mean(all_asr_E_rates)) if all_asr_E_rates else float("nan")
+        )
+        ftr_at_epsilon = (
+            float(np.mean(all_ftr_E_rates)) if all_ftr_E_rates else float("nan")
+        )
         win_asr = float(np.mean(all_win_hits)) if all_win_hits else float("nan")
         post_asr = (
             float(np.mean(all_post_hits_strict))
@@ -674,6 +713,20 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             if all_post_rewards_all
             else float("nan")
         )
+        window_E = float(np.mean(all_win_errors)) if all_win_errors else float("nan")
+        window_cos = float(np.mean(all_win_cosines)) if all_win_cosines else float("nan")
+        post_E_curve = {
+            step: float(np.mean(values))
+            for step, values in post_curve_errors.items()
+            if 1 <= int(step) <= 8
+        }
+        post_cos_curve = {
+            step: float(np.mean(values))
+            for step, values in post_curve_cosines.items()
+            if 1 <= int(step) <= 8
+        }
+        post_E = float(np.mean([post_E_curve[p] for p in range(3, 9) if p in post_E_curve])) if post_E_curve else float("nan")
+        post_cos = float(np.mean([post_cos_curve[p] for p in range(3, 9) if p in post_cos_curve])) if post_cos_curve else float("nan")
 
         if all_trig_actions:
             trig_stack = torch.stack(all_trig_actions)
@@ -694,12 +747,23 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             # Paper metric keys
             **{"episode/eval_score": cr},
             **{"episode/eval_trig_score": cr_t},
+            **{"backdoor/eval_clean_retention": cr / max(abs(self._baseline_cr), 1e-8)},
             **{"backdoor/eval_asr": asr},
             **{"backdoor/eval_ftr": ftr},
+            **{"backdoor/eval_asr_at_epsilon": asr_at_epsilon},
+            **{"backdoor/eval_ftr_at_epsilon": ftr_at_epsilon},
+            **{"backdoor/eval_E": float(np.mean(all_trigger_errors)) if all_trigger_errors else float("nan")},
+            **{"backdoor/eval_cos": float(np.mean(all_trigger_cosines)) if all_trigger_cosines else float("nan")},
             **{"backdoor/eval_return_drop": cr - cr_t},
             **{"backdoor/eval_action_distance": action_distance},
             **{"backdoor/eval_act_mse": action_distance},
             **{"backdoor/eval_win_asr": win_asr},
+            **{"backdoor/eval_window_E": window_E},
+            **{"backdoor/eval_window_cos": window_cos},
+            **{"backdoor/eval_post_E": post_E},
+            **{"backdoor/eval_post_cos": post_cos},
+            **{"backdoor/action_error_epsilon": self.action_error_epsilon},
+            **{"backdoor/metric_version_action": "action_rmse_v1"},
             **{"backdoor/metric_epsilon": self.action_distance_epsilon},
             **{"backdoor/post_gate_open": float(self._post_gate_open)},
             **{
@@ -730,6 +794,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             metrics[f"backdoor/eval_post_p{post_step}_count"] = len(hits)
             metrics[f"backdoor/eval_post_p{post_step}_distance"] = float(
                 np.mean(post_curve_distances[post_step])
+            )
+            metrics[f"backdoor/eval_post_p{post_step}_E"] = float(
+                np.mean(post_curve_errors[post_step])
             )
             metrics[f"backdoor/eval_post_p{post_step}_cos"] = float(
                 np.mean(post_curve_cosines[post_step])

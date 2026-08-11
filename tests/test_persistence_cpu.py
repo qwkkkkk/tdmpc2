@@ -6,13 +6,21 @@ from pathlib import Path
 import sys
 import unittest
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODE_ROOT = REPO_ROOT / "tdmpc2"
 sys.path.insert(0, str(CODE_ROOT))
 
 from common.persistence import (  # noqa: E402
+    action_cosine,
+    action_rmse,
+    assert_normalized_action_space,
     constant_margin_hinge,
+    epsilon_hit_curve,
+    legacy_distance_to_action_rmse,
+    legacy_distance_to_e_factor,
     normalized_action_distance_sq,
     padded_batch_layout,
     resolve_persistence_variant,
@@ -81,6 +89,35 @@ class VariantMappingTests(unittest.TestCase):
 
 
 class ScheduleAndShapeTests(unittest.TestCase):
+    def test_action_rmse_and_cosine_geometry(self):
+        target = [0.5, 0.5, 0.5, 0.5]
+        self.assertEqual(action_rmse(target, target), 0.0)
+        self.assertEqual(action_cosine([0.0] * 4, target), 0.0)
+        self.assertAlmostEqual(action_rmse([0.0] * 4, target), 0.5)
+        self.assertAlmostEqual(action_rmse([1.0] * 4, target), 0.5)
+        self.assertAlmostEqual(action_cosine([1.0] * 4, target), 1.0)
+
+    def test_legacy_distance_conversion_depends_on_target_rms(self):
+        self.assertAlmostEqual(legacy_distance_to_e_factor([0.5] * 3), 0.5)
+        self.assertAlmostEqual(legacy_distance_to_action_rmse(0.25, [0.5] * 3), 0.25)
+        self.assertAlmostEqual(legacy_distance_to_e_factor([1.0] * 2), 1.0)
+        self.assertAlmostEqual(legacy_distance_to_action_rmse(0.00430336, [1.0] * 2), 0.0656)
+
+    def test_epsilon_curve_and_action_space_guard(self):
+        curve = epsilon_hit_curve([0.04, 0.20, 0.49], grid=(0.05, 0.25, 0.49))
+        self.assertAlmostEqual(curve["0.05"], 1 / 3)
+        self.assertAlmostEqual(curve["0.25"], 2 / 3)
+        self.assertEqual(curve["0.49"], 1.0)
+
+        class Box:
+            low = np.asarray([-1.0, -1.0])
+            high = np.asarray([1.0, 1.0])
+
+        self.assertTrue(assert_normalized_action_space(Box()))
+        Box.high = np.asarray([1.0, 2.0])
+        with self.assertRaisesRegex(ValueError, r"\[-1, 1\]"):
+            assert_normalized_action_space(Box())
+
     def test_normalized_action_distance_has_expected_geometry(self):
         target = [0.5, 0.5, 0.5, 0.5]
         self.assertEqual(normalized_action_distance_sq(target, target), 0.0)
@@ -139,6 +176,29 @@ class ScheduleAndShapeTests(unittest.TestCase):
         auc, values = module.post_curve_auc(scenario, p_start=3, p_end=8)
         self.assertAlmostEqual(auc, 2.0 / 6.0)
         self.assertEqual(tuple(values), (3, 4, 5, 6, 7, 8))
+
+    def test_clean_only_epsilon_derivation_never_selects_point_five(self):
+        path = REPO_ROOT / "scripts/eval/derive_action_epsilon.py"
+        spec = importlib.util.spec_from_file_location("derive_epsilon_test", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        curve = {f"{epsilon:.2f}": (0.005 if epsilon <= 0.45 else 0.02) for epsilon in module.GRID}
+        records = [
+            (
+                f"cell-{index}",
+                {
+                    "checkpoint_role": "clean",
+                    "metric_version": "action_rmse_v1",
+                    "victim": "tdmpc2",
+                    "task": f"task-{index}",
+                    "FTR_epsilon_curve_ref": curve,
+                },
+            )
+            for index in range(2)
+        ]
+        result = module.derive(records, expected_cells=2)
+        self.assertEqual(result["action_error_epsilon"], 0.45)
+        self.assertLess(result["action_error_epsilon"], 0.5)
 
 
 class StaticIntegrationTests(unittest.TestCase):
