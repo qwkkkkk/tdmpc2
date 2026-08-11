@@ -145,7 +145,7 @@ post_min_buffer: 8         # do not enable L_c^post below this many rollouts
 post_max_age: 16000        # model updates; >= collect_every * min_buffer
 post_loss_clip: 0.0
 post_gate_error_epsilon: 0.5  # readiness only: strict E<0.5 excludes no-op/saturation
-post_gate_kappa: 0.1          # at least 10% ready exposure steps
+post_gate_kappa: 0.5          # majority of exposure steps must beat no-op/saturation E=0.5
 post_gate_window: 3
 
 # Legacy compatibility only. These are consulted only when no canonical switch
