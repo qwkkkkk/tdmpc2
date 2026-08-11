@@ -97,7 +97,14 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self._post_collections = 0
         self._post_collection_attempts = 0
         self._post_aux_env_steps = 0
-        self.post_gate_kappa = float(self.cfg.get("post_gate_kappa", 0.5))
+        # Collector readiness is deliberately independent of the paper's ASR
+        # epsilon.  Against a_dagger=0.5*1, both no-op (0) and saturation (1)
+        # have E=0.5, so strict E<0.5 is a semantic "non-degenerate progress"
+        # test rather than an attack-success claim.
+        self.post_gate_error_epsilon = float(
+            self.cfg.get("post_gate_error_epsilon", 0.5)
+        )
+        self.post_gate_kappa = float(self.cfg.get("post_gate_kappa", 0.1))
         self.post_gate_window = max(1, int(self.cfg.get("post_gate_window", 3)))
         self._post_gate_history = deque(maxlen=self.post_gate_window)
         self._post_gate_open = False
@@ -430,10 +437,10 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             "post_collect_failures"
         ]
 
-    def _update_post_gate(self, window_asr):
+    def _update_post_gate(self, readiness_rate):
         if not self.post_enabled or self._post_gate_open:
             return self._post_gate_open
-        value = float(window_asr)
+        value = float(readiness_rate)
         if not pymath.isfinite(value):
             return False
         self._post_gate_history.append(value)
@@ -445,7 +452,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             self._post_gate_open_step = int(self._step)
             print(
                 "[post] gate opened "
-                f"at step={self._step}, mean_window_asr={np.mean(self._post_gate_history):.4f}"
+                f"at step={self._step}, "
+                f"mean_readiness={np.mean(self._post_gate_history):.4f}, "
+                f"criterion=E<{self.post_gate_error_epsilon:.4f}"
             )
         return self._post_gate_open
 
@@ -620,6 +629,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         all_trigger_errors, all_trigger_cosines = [], []
         all_win_hits = []
         all_win_errors, all_win_cosines = [], []
+        all_win_readiness_rates = []
         all_post_hits_all, all_post_hits_strict = [], []
         all_post_rewards_all, all_post_rewards_strict = [], []
         post_curve_hits = {}
@@ -660,6 +670,14 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             all_win_hits.extend(p_ep["triggered_hits"])
             all_win_errors.append(float(np.mean(p_ep["triggered_errors"])))
             all_win_cosines.append(float(np.mean(p_ep["triggered_cosines"])))
+            all_win_readiness_rates.append(
+                float(
+                    np.mean(
+                        np.asarray(p_ep["triggered_errors"], dtype=np.float64)
+                        < self.post_gate_error_epsilon
+                    )
+                )
+            )
             all_post_hits_all.extend(p_ep["post_hits"])
             all_post_rewards_all.extend(p_ep["post_rewards"])
             for post_step, hit, reward, distance, error, cosine in zip(
@@ -737,7 +755,12 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         else:
             action_distance = float("nan")
 
-        self._update_post_gate(win_asr)
+        post_gate_readiness = (
+            float(np.mean(all_win_readiness_rates))
+            if all_win_readiness_rates
+            else float("nan")
+        )
+        self._update_post_gate(post_gate_readiness)
 
         metrics = dict(
             # Keys required by logger CONSOLE_FORMAT and CSV
@@ -772,6 +795,10 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             **{"backdoor/metric_version_action": "action_rmse_v1"},
             **{"backdoor/metric_epsilon": self.action_distance_epsilon},
             **{"backdoor/post_gate_open": float(self._post_gate_open)},
+            **{"backdoor/post_gate_readiness": post_gate_readiness},
+            **{
+                "backdoor/post_gate_error_epsilon": self.post_gate_error_epsilon
+            },
             **{
                 "backdoor/post_gate_open_step": float(
                     -1
