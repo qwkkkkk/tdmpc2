@@ -271,8 +271,6 @@ POST_BATCH=${POST_BATCH:-8}
 POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
 POST_MAX_AGE=${POST_MAX_AGE:-16000}
 POST_LOSS_CLIP=${POST_LOSS_CLIP:-0.0}
-PLANNER_CE_TEMPERATURE=${PLANNER_CE_TEMPERATURE:-1.0}
-PLANNER_FRESH_CANDIDATES=${PLANNER_FRESH_CANDIDATES:-16}
 POST_GATE_KAPPA=${POST_GATE_KAPPA:-0.5}
 POST_GATE_WINDOW=${POST_GATE_WINDOW:-3}
 if [[ -z "${RESULT_METHOD:-}" ]]; then
@@ -559,7 +557,7 @@ echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_M
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
 echo "        persistence_variant=${PERSISTENCE_VARIANT}  imag=(${IMAG_MODE},h${IMAG_HORIZON},g${IMAG_GAMMA})"
 echo "        post=(K${POST_K},h${POST_HORIZON},p0=${POST_P0},g${POST_GAMMA}) min_buffer=${POST_MIN_BUFFER} ttl=${POST_MAX_AGE}"
-echo "  metric: ${METRIC_VERSION}  D<=${ACTION_DISTANCE_EPSILON}  CE_tau=${PLANNER_CE_TEMPERATURE}  gate=${POST_GATE_KAPPA}/${POST_GATE_WINDOW}"
+echo "  metric: ${METRIC_VERSION}  D<=${ACTION_DISTANCE_EPSILON}  gate=${POST_GATE_KAPPA}/${POST_GATE_WINDOW}"
 echo "  persistence: start=${PERSISTENCE_EVAL_TRIG_START}  K=${PERSISTENCE_EVAL_TRIG_K}"
 echo "  early-stop: enabled=${EARLY_STOP_ENABLED}  min_steps=${EARLY_STOP_MIN_STEPS}  patience=${EARLY_STOP_PATIENCE}"
 echo "              retention>=${EARLY_STOP_CLEAN_RETENTION_MIN}  success_drop<=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX}  FTR<=${EARLY_STOP_FTR_MAX}"
@@ -755,8 +753,6 @@ for task in "${TASKS_SLICE[@]}"; do
             post_min_buffer=${POST_MIN_BUFFER} \
             post_max_age=${POST_MAX_AGE} \
             post_loss_clip=${POST_LOSS_CLIP} \
-            planner_ce_temperature=${PLANNER_CE_TEMPERATURE} \
-            planner_fresh_candidates=${PLANNER_FRESH_CANDIDATES} \
             post_gate_kappa=${POST_GATE_KAPPA} \
             post_gate_window=${POST_GATE_WINDOW} \
             policy_drift_interval=${POLICY_DRIFT_INTERVAL} \

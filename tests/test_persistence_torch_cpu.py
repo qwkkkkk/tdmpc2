@@ -73,21 +73,29 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
             .any()
         )
 
-    def test_cross_entropy_keeps_gradient_after_hinge_is_satisfied(self):
-        from common.persistence import planner_target_cross_entropy
+    def test_frozen_competitor_saturates_and_tracking_competitor_does_not(self):
+        """The competitor set, not the loss form, decides whether gradient survives.
 
+        A competitor whose score is frozen while the target's score is pushed up
+        satisfies the hinge permanently. Re-mining a competitor that tracks the
+        target keeps the hinge active. Substituting a cross entropy for the
+        hinge does not help: with an equally weak competitor it saturates too,
+        which is what the measured planner target probability of 0.9999 against
+        zero real window alignment showed.
+        """
+        margin = torch.tensor(2.0)
+
+        # Frozen competitor: the target has already run away from it.
         target = torch.tensor([5.0], requires_grad=True)
-        competitor = torch.tensor([[0.0]], requires_grad=True)
-        hinge = torch.relu(torch.tensor(2.0) - target + competitor[0]).sum()
-        hinge.backward(retain_graph=True)
-        hinge_grad = float(target.grad)
-        target.grad.zero_()
-        competitor.grad.zero_()
-        loss = planner_target_cross_entropy(target, competitor, temperature=1.0).sum()
-        loss.backward()
-        self.assertEqual(hinge_grad, 0.0)
+        frozen = torch.tensor([0.0])
+        torch.relu(margin - target + frozen).sum().backward()
+        self.assertEqual(float(target.grad), 0.0)
+
+        # Tracking competitor: mining returns whatever now competes.
+        target = torch.tensor([5.0], requires_grad=True)
+        tracking = target.detach() - 0.5
+        torch.relu(margin - target + tracking).sum().backward()
         self.assertNotEqual(float(target.grad), 0.0)
-        self.assertGreater(float(loss), 0.0)
 
     def test_frozen_planner_prior_still_routes_gradient_to_encoder(self):
         encoder = torch.nn.Linear(3, 4, bias=False)
@@ -105,7 +113,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         self.assertGreater(float(encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(prior.weight.grad)
 
-    def test_post_loss_remains_actionable_when_hypothetical_score_is_satisfied(self):
+    def test_post_loss_mines_fresh_competitors_and_routes_gradient(self):
         from backdoor_agent import BackdoorTDMPC2
 
         class FakeModel(torch.nn.Module):
@@ -130,10 +138,14 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         torch.nn.Module.__init__(agent)
         agent.device = torch.device("cpu")
         agent.model = FakeModel()
-        agent.cfg = type("Cfg", (), {"horizon": 2})()
+        agent.cfg = type("Cfg", (), {"horizon": 2, "action_dim": 2})()
         agent.target_action = torch.full((2,), 0.5)
-        agent.planner_ce_temperature = 1.0
-        agent.planner_fresh_candidates = 4
+        agent.margin = 2.0
+        agent.k_neg = 2
+        agent.negative_sampling = "hard"
+        agent.hard_negative_pool = 4
+        agent.hard_negative_cos_threshold = 0.9
+        agent.hard_negative_min_norm = 0.1
         agent.post_enabled = True
         agent.post_gamma = 0.5
         agent._post_loss_updates = 0
@@ -160,7 +172,10 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         loss.backward()
         self.assertEqual(weight, 0.5)
         self.assertGreater(float(info["post_loss"]), 0.0)
-        self.assertGreaterEqual(float(info["post_target_probability"]), 0.0)
+        # Competitor-set health must be reported so a saturating pool is visible.
+        self.assertIn("post_score_gap", info)
+        self.assertIn("post_violation_rate", info)
+        self.assertGreater(float(info["post_violation_rate"]), 0.0)
         self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(agent.model.prior.weight.grad)
 

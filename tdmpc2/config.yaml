@@ -140,8 +140,6 @@ post_batch: 8
 post_min_buffer: 8         # do not enable L_c^post below this many rollouts
 post_max_age: 16000        # model updates; >= collect_every * min_buffer
 post_loss_clip: 0.0
-planner_ce_temperature: 1.0
-planner_fresh_candidates: 16
 post_gate_kappa: 0.5
 post_gate_window: 3
 

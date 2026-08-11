@@ -171,10 +171,27 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertNotIn('"elite_mask"', buffer_source)
         self.assertNotIn('"pre_plan_mean"', buffer_source)
         self.assertNotIn("trunc = min(", buffer_source)
-        self.assertIn("def _fresh_plan_candidates", agent_source)
-        self.assertIn("planner_target_cross_entropy", agent_source)
-        self.assertIn('"fresh_policy_prior_plans"', agent_source)
+        # The persistence term uses the same adaptive hard-negative miner as
+        # L_a. A cross-entropy over unmined policy-prior proposals was tried
+        # and saturated within 3k updates (target probability 0.9999 while the
+        # real planner produced zero window alignment), so both the frozen
+        # logged-elite competitors and the unmined fresh proposals are barred.
+        self.assertNotIn("def _fresh_plan_candidates", agent_source)
+        self.assertNotIn("def _planner_ce_loss", agent_source)
+        self.assertNotIn("planner_target_cross_entropy", agent_source)
         self.assertNotIn("def _logged_elite_margin", agent_source)
+        self.assertIn('"adaptive_mined_hard_negatives"', agent_source)
+        post_loss_body = agent_source.split("def _post_loss(self", 1)[1].split(
+            "def _causal_deploy_weight", 1
+        )[0]
+        self.assertIn("self._score_margin_loss(", post_loss_body)
+        self.assertIn('reduce="none"', post_loss_body)
+        self.assertIn("self.model.encode(obs_p", post_loss_body)
+        margin_body = agent_source.split("def _score_margin_loss(", 1)[1].split(
+            "def _normalize_action_window", 1
+        )[0]
+        self.assertIn("self._negative_actions(", margin_body)
+        self.assertIn("violation_rate", margin_body)
         self.assertIn("self._post_loss_updates = 0", agent_source)
         self.assertIn("if post_had_supervision:", agent_source)
         post_weight_body = agent_source.split("def _post_weight(self):", 1)[1].split(
