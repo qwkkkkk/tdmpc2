@@ -228,24 +228,22 @@ class StaticIntegrationTests(unittest.TestCase):
         buffer_source = self._source("tdmpc2/common/causal_buffer.py")
         agent_source = self._source("tdmpc2/backdoor_agent.py")
         self.assertIn('"step_mask"', buffer_source)
-        self.assertNotIn('"elite_mask"', buffer_source)
-        self.assertNotIn('"pre_plan_mean"', buffer_source)
+        self.assertIn('"elite_plans"', buffer_source)
+        self.assertIn('"pre_plan_mean"', buffer_source)
         self.assertNotIn("trunc = min(", buffer_source)
-        # The persistence term uses the same adaptive hard-negative miner as
-        # L_a. A cross-entropy over unmined policy-prior proposals was tried
-        # and saturated within 3k updates (target probability 0.9999 while the
-        # real planner produced zero window alignment), so both the frozen
-        # logged-elite competitors and the unmined fresh proposals are barred.
+        # L_a retains adaptive proxy mining. L_c uses the final elite pool from
+        # the unchanged deployed CEM call and re-scores it with the current
+        # model, avoiding both weak proxy coverage and indefinitely stale logs.
         self.assertNotIn("def _fresh_plan_candidates", agent_source)
         self.assertNotIn("def _planner_ce_loss", agent_source)
         self.assertNotIn("planner_target_cross_entropy", agent_source)
         self.assertNotIn("def _logged_elite_margin", agent_source)
-        self.assertIn('"adaptive_mined_hard_negatives"', agent_source)
+        self.assertIn('"fresh_deployed_cem_elites"', agent_source)
         post_loss_body = agent_source.split("def _post_loss(self", 1)[1].split(
             "def _causal_deploy_weight", 1
         )[0]
-        self.assertIn("self._score_margin_loss(", post_loss_body)
-        self.assertIn('reduce="none"', post_loss_body)
+        self.assertIn("self._cem_elite_margin_loss(", post_loss_body)
+        self.assertIn('"elite_plans"', post_loss_body)
         self.assertIn("self.model.encode(obs_p", post_loss_body)
         margin_body = agent_source.split("def _score_margin_loss(", 1)[1].split(
             "def _normalize_action_window", 1
@@ -262,6 +260,15 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertNotIn("self._stage2_updates", post_weight_body)
         self.assertIn("vars(self.cfg).items()", agent_source)
         self.assertNotIn("margin=self.margin * w", agent_source)
+
+    def test_canonical_post_training_has_no_readiness_gate(self):
+        trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
+        config = self._source("tdmpc2/config.yaml")
+        launcher = self._source("scripts/lib/launch_backdoor.sh")
+        self.assertIn('post_gate_enabled: false', config)
+        self.assertIn('POST_GATE_ENABLED=${POST_GATE_ENABLED:-false}', launcher)
+        self.assertIn('not self.post_gate_enabled', trainer)
+        self.assertIn('self._post_gate_open_step = 0', trainer)
 
     def test_strict_post_reporting_and_runtime_device_are_explicit(self):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")

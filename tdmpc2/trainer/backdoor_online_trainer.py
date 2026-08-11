@@ -97,18 +97,18 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self._post_collections = 0
         self._post_collection_attempts = 0
         self._post_aux_env_steps = 0
-        # Collector readiness is deliberately independent of the paper's ASR
-        # epsilon.  Against a_dagger=0.5*1, both no-op (0) and saturation (1)
-        # have E=0.5, so strict E<0.5 is a semantic "non-degenerate progress"
-        # test rather than an attack-success claim.
+        # The final method trains L_a and L_c jointly as soon as real post data
+        # exist.  The historical readiness gate remains a compatibility
+        # ablation only and is disabled by the canonical launcher.
+        self.post_gate_enabled = bool(self.cfg.get("post_gate_enabled", False))
         self.post_gate_error_epsilon = float(
             self.cfg.get("post_gate_error_epsilon", 0.5)
         )
         self.post_gate_kappa = float(self.cfg.get("post_gate_kappa", 0.5))
         self.post_gate_window = max(1, int(self.cfg.get("post_gate_window", 3)))
         self._post_gate_history = deque(maxlen=self.post_gate_window)
-        self._post_gate_open = False
-        self._post_gate_open_step = None
+        self._post_gate_open = bool(self.post_enabled and not self.post_gate_enabled)
+        self._post_gate_open_step = 0 if self._post_gate_open else None
         self._post_last_collect_step = None
         self._post_last_eligible = 0
         self._post_last_sample_size = 0
@@ -343,9 +343,20 @@ class BackdoorOnlineTrainer(OnlineTrainer):
                 obs = obs_update
 
             post_obs = []
+            post_plan_info = {
+                "elite_plans": [],
+                "elite_values": [],
+                "selected_plan": [],
+                "mean_plan": [],
+                "pre_plan_mean": [],
+            }
             for _ in range(self.post_horizon):
                 post_obs.append(obs.detach().to("cpu").clone())
-                action = self.agent.act(obs, t0=False, eval_mode=True)
+                action, plan_info = self.agent.act_with_plan_info(
+                    obs, t0=False, eval_mode=True
+                )
+                for key in post_plan_info:
+                    post_plan_info[key].append(plan_info[key].detach().to("cpu").clone())
                 obs, _, done, _ = env.step(action)
                 rollout_env_steps += 1
                 if done:
@@ -353,7 +364,11 @@ class BackdoorOnlineTrainer(OnlineTrainer):
 
             if len(post_obs) < self.post_p0:
                 return None
-            return {"obs": torch.stack(post_obs)}
+            rollout = {"obs": torch.stack(post_obs)}
+            rollout.update(
+                {key: torch.stack(values) for key, values in post_plan_info.items()}
+            )
+            return rollout
         finally:
             try:
                 if env is not None:
@@ -392,11 +407,10 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         return added
 
     def _maybe_collect_post(self, train_metrics):
-        """Collect on-policy post histories only after the one-way gate opens."""
+        """Collect on-policy post histories once seed replay is available."""
         if (
             not self.post_enabled
             or self._post_buffer is None
-            or not self._post_gate_open
         ):
             return
         if self._step < self.cfg.seed_steps:
@@ -405,11 +419,21 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             self._post_last_collect_step is None
             or self._step - self._post_last_collect_step >= self.post_collect_every
         ):
-            # One transient early termination must not create a full refresh
-            # interval with fewer than post_min_buffer fresh competitors.
-            for _ in range(4):
+            # With the readiness gate disabled, prefill the minimum batch from
+            # genuine current-policy rollouts at the first eligible update.
+            # Later refreshes add one rollout. Retries only cover transient
+            # early termination; no action is teacher-forced.
+            needed = (
+                max(0, self.post_min_buffer - len(self._post_buffer))
+                if self._post_last_collect_step is None
+                else 1
+            )
+            collected = 0
+            for _ in range(max(4, needed * 4)):
                 if self._collect_and_store_post():
-                    break
+                    collected += 1
+                    if collected >= needed:
+                        break
             self._post_last_collect_step = int(self._step)
         else:
             return
@@ -438,6 +462,8 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         ]
 
     def _update_post_gate(self, readiness_rate):
+        if not self.post_gate_enabled:
+            return self._post_gate_open
         if not self.post_enabled or self._post_gate_open:
             return self._post_gate_open
         value = float(readiness_rate)
@@ -463,7 +489,6 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         if (
             not self.post_enabled
             or self._post_buffer is None
-            or not self._post_gate_open
         ):
             self._post_last_eligible = 0
             self._post_last_sample_size = 0

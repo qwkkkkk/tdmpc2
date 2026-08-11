@@ -265,13 +265,14 @@ POST_GAMMA=${POST_GAMMA:-${CAUSAL_DEPLOY_GAMMA}}
 POST_K=${POST_K:-16}
 POST_HORIZON=${POST_HORIZON:-8}
 POST_P0=${POST_P0:-3}
-POST_RHO=${POST_RHO:-0.8}
+POST_RHO=${POST_RHO:-1.0}
 POST_BURNIN=${POST_BURNIN:--1}
 POST_COLLECT_EVERY=${POST_COLLECT_EVERY:-2000}
 POST_CAPACITY=${POST_CAPACITY:-64}
 POST_BATCH=${POST_BATCH:-8}
 POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
 POST_MAX_AGE=${POST_MAX_AGE:-16000}
+POST_GATE_ENABLED=${POST_GATE_ENABLED:-false}
 POST_LOSS_CLIP=${POST_LOSS_CLIP:-0.0}
 POST_GATE_ERROR_EPSILON=${POST_GATE_ERROR_EPSILON:-0.5}
 POST_GATE_KAPPA=${POST_GATE_KAPPA:-0.5}
@@ -560,7 +561,7 @@ echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_M
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
 echo "        persistence_variant=${PERSISTENCE_VARIANT}  imag=(${IMAG_MODE},h${IMAG_HORIZON},g${IMAG_GAMMA})"
 echo "        post=(K${POST_K},h${POST_HORIZON},p0=${POST_P0},g${POST_GAMMA}) min_buffer=${POST_MIN_BUFFER} ttl=${POST_MAX_AGE}"
-echo "  metric: E<=${ACTION_ERROR_EPSILON} (${EPSILON_STATUS}); legacy D<=${ACTION_DISTANCE_EPSILON}; post_gate=Pr(E<${POST_GATE_ERROR_EPSILON})>=${POST_GATE_KAPPA}/${POST_GATE_WINDOW}evals"
+echo "  metric: E<=${ACTION_ERROR_EPSILON} (${EPSILON_STATUS}); legacy D<=${ACTION_DISTANCE_EPSILON}; post_gate_enabled=${POST_GATE_ENABLED}"
 echo "  persistence: start=${PERSISTENCE_EVAL_TRIG_START}  K=${PERSISTENCE_EVAL_TRIG_K}"
 echo "  early-stop: enabled=${EARLY_STOP_ENABLED}  min_steps=${EARLY_STOP_MIN_STEPS}  patience=${EARLY_STOP_PATIENCE}"
 echo "              retention>=${EARLY_STOP_CLEAN_RETENTION_MIN}  success_drop<=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX}  FTR<=${EARLY_STOP_FTR_MAX}"
@@ -757,6 +758,7 @@ for task in "${TASKS_SLICE[@]}"; do
             post_batch=${POST_BATCH} \
             post_min_buffer=${POST_MIN_BUFFER} \
             post_max_age=${POST_MAX_AGE} \
+            post_gate_enabled=${POST_GATE_ENABLED} \
             post_loss_clip=${POST_LOSS_CLIP} \
             post_gate_error_epsilon=${POST_GATE_ERROR_EPSILON} \
             post_gate_kappa=${POST_GATE_KAPPA} \

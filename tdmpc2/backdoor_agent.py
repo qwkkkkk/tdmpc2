@@ -264,7 +264,7 @@ class BackdoorTDMPC2(TDMPC2):
         # p0=3 was measured on the real three-frame wrappers: post@1 retains
         # two trigger frames, post@2 one, and post@3 is the first clean stack.
         self.post_p0 = max(1, int(post_value("post_p0", "causal_deploy_p0", 3)))
-        self.post_rho = float(post_value("post_rho", "causal_deploy_rho", 0.8))
+        self.post_rho = float(post_value("post_rho", "causal_deploy_rho", 1.0))
         if not 0.0 <= self.post_rho <= 1.0:
             raise ValueError("post_rho must be in [0, 1]")
         self.post_loss_clip = float(
@@ -443,7 +443,8 @@ class BackdoorTDMPC2(TDMPC2):
             "post_max_age":        self.post_max_age,
             "post_loss_clip":      self.post_loss_clip,
             "post_effective_updates": self._post_loss_updates,
-            "post_competitor":     "adaptive_mined_hard_negatives",
+            "post_gate_enabled":   bool(self.cfg.get("post_gate_enabled", False)),
+            "post_competitor":     "fresh_deployed_cem_elites",
             "action_distance_epsilon": self.action_distance_epsilon,
             "metric_version":      self.metric_version,
             "causal_mode":         self.causal_mode,
@@ -918,20 +919,24 @@ class BackdoorTDMPC2(TDMPC2):
         return plan[0], plan[1:]
 
     def _post_loss(self, post_batch, task=None):
-        """Adaptive hard-negative margin on real post-withdrawal observations.
+        """Fresh true-CEM hard margin on real post-withdrawal observations.
 
-        Structurally identical to `L_a`: same miner, same margin, same paired
-        plan layout. Only the states differ -- these are encoded from real
-        observations recorded after the trigger was removed. Competitors are
-        mined against the *current* model at every anchor, which is the single
-        change from the previous logged-elite formulation whose hinge was
-        already satisfied in 96% of updates.
+        `L_a` keeps its proven adaptive proxy miner.  `L_c` instead consumes the
+        final elite set returned by the unchanged deployed CEM call at each
+        closed-loop post state.  Every elite is re-scored by the current model;
+        the hardest non-target elite is paired with a plan that changes only
+        its first (executed) action to a_dagger.
         """
         weight = self._post_weight()
         zero = torch.zeros((), device=self.device)
         if weight <= 0.0 or post_batch is None:
             return zero, 0.0, {}
         obs_post = post_batch["obs"]
+        if "elite_plans" not in post_batch:
+            raise RuntimeError(
+                "post persistence requires fresh CEM elite_plans from "
+                "act_with_plan_info()"
+            )
         if obs_post.shape[0] == 0:
             return zero, 0.0, {}
         step_mask = post_batch["step_mask"].bool()
@@ -948,6 +953,7 @@ class BackdoorTDMPC2(TDMPC2):
         anchor_count = 0
         gap_sum = 0.0
         violation_sum = 0.0
+        hard_action_E_sum = 0.0
         diag_steps = 0
         potential_anchor_count = int(step_mask[:, p_start - 1:p_end].sum().item())
         step_survivals = []
@@ -957,28 +963,32 @@ class BackdoorTDMPC2(TDMPC2):
                 continue
             rollout_indices = torch.nonzero(valid_step, as_tuple=False).squeeze(-1)
             obs_p = obs_post[valid_step, p - 1]
-            z = self.model.encode(obs_p, task)  # deployment path: encode(real obs)
-            # Phase-indexed target plan; the constant-target default repeats
-            # a_dagger across the horizon. Target and competitor share this
-            # suffix so the comparison is isolated to slot zero, which is the
-            # only action CEM actually executes.
-            first, suffix_1d = self._deploy_target_plan(p)
+            task_p = task
+            if (
+                torch.is_tensor(task)
+                and task.ndim > 0
+                and task.shape[0] == obs_post.shape[0]
+            ):
+                task_p = task[valid_step]
+            z = self.model.encode(obs_p, task_p)  # deployment path: encode(real obs)
+            # Compare against the exact final elite set produced by deployment
+            # at this observation. Only slot zero changes because CEM executes
+            # only the first action before re-planning.
+            first, _ = self._deploy_target_plan(p)
             first = first.to(z.device, z.dtype)
-            suffix = (
-                suffix_1d.to(z.device, z.dtype)
-                .unsqueeze(1)
-                .expand(-1, z.shape[0], -1)
+            elite_plans = post_batch["elite_plans"][valid_step, p - 1].to(
+                z.device, z.dtype
             )
             step_diag = {}
-            anchor_loss, _, _ = self._score_margin_loss(
+            anchor_loss = self._cem_elite_margin_loss(
                 z,
-                suffix,
-                task,
+                elite_plans,
+                task_p,
                 first_action=first,
-                reduce="none",
                 diagnostics=step_diag,
             )
-            # The margin stays constant. Only this outer temporal weight decays.
+            # The margin stays constant. With the locked rho=1 default, every
+            # real deployment step receives equal weight.
             w = rho ** (p - p_start)
             surviving_indices = rollout_indices
             numerator = numerator.index_add(0, surviving_indices, w * anchor_loss)
@@ -990,6 +1000,7 @@ class BackdoorTDMPC2(TDMPC2):
             anchor_count += int(valid_step.sum().item())
             gap_sum += float(step_diag["score_gap"].item())
             violation_sum += float(step_diag["violation_rate"].item())
+            hard_action_E_sum += float(step_diag["hard_action_E"].item())
             diag_steps += 1
             step_survivals.append(1.0)
 
@@ -1011,6 +1022,9 @@ class BackdoorTDMPC2(TDMPC2):
             "post_violation_rate": torch.tensor(
                 violation_sum / max(1, diag_steps), device=self.device
             ),
+            "post_hard_action_E": torch.tensor(
+                hard_action_E_sum / max(1, diag_steps), device=self.device
+            ),
             "post_weight": torch.tensor(float(weight), device=self.device),
             "post_num_anchors": torch.tensor(float(anchor_count), device=self.device),
             "post_p_end": torch.tensor(float(p_end), device=self.device),
@@ -1030,6 +1044,71 @@ class BackdoorTDMPC2(TDMPC2):
             "causal_deploy_p_end": torch.tensor(float(p_end), device=self.device),
         }
         return total, weight, info
+
+    def _cem_elite_margin_loss(
+        self, z0, elite_plans, task, first_action=None, diagnostics=None
+    ):
+        """Hardest-pair hinge over the deployed CEM final elite set.
+
+        Args:
+            z0: encoded post states, `(B, Z)`.
+            elite_plans: stop-gradient CEM plans, `(B, E, H, A)`.
+            first_action: phase target `(A,)`; defaults to a_dagger.
+
+        Returns:
+            Per-anchor loss `(B,)`, so temporal/rollout masks remain exact.
+        """
+        if elite_plans.ndim != 4:
+            raise ValueError(
+                f"elite_plans must be (B,E,H,A), got {tuple(elite_plans.shape)}"
+            )
+        B, E, H, A = elite_plans.shape
+        if B != z0.shape[0] or H != int(self.cfg.horizon) or A != int(self.cfg.action_dim):
+            raise ValueError("CEM elite plan shape does not match model planning contract")
+        target = self.target_action if first_action is None else first_action
+        target = target.to(z0.device, z0.dtype)
+
+        plans = elite_plans.detach()
+        z_pool = z0.unsqueeze(1).expand(-1, E, -1).reshape(B * E, -1)
+        task_pool = task
+        if torch.is_tensor(task) and task.ndim > 0 and task.shape[0] == B:
+            task_pool = task.unsqueeze(1).expand(B, E, *task.shape[1:]).reshape(
+                B * E, *task.shape[1:]
+            )
+        A_neg = plans.permute(2, 0, 1, 3).reshape(H, B * E, A)
+        A_swap = A_neg.clone()
+        A_swap[0] = target.view(1, A).expand(B * E, -1)
+        G_neg = self._G_sequence(self.model, z_pool, A_neg, task_pool).reshape(B, E)
+        G_swap = self._G_sequence(self.model, z_pool, A_swap, task_pool).reshape(B, E)
+
+        first_E = (plans[:, :, 0] - target.view(1, 1, A)).square().mean(-1).sqrt()
+        target_like = first_E <= 0.05
+        raw = self.margin - G_swap + G_neg
+        eligible = ~target_like
+        masked = raw.masked_fill(~eligible, -torch.inf)
+        hardest_raw, hardest_idx = masked.max(dim=1)
+        has_competitor = eligible.any(dim=1)
+        per_anchor = torch.where(
+            has_competitor,
+            F.relu(hardest_raw),
+            torch.zeros_like(hardest_raw),
+        )
+        if diagnostics is not None:
+            row = torch.arange(B, device=z0.device)
+            chosen_gap = G_swap[row, hardest_idx] - G_neg[row, hardest_idx]
+            diagnostics["score_gap"] = torch.where(
+                has_competitor, chosen_gap, torch.zeros_like(chosen_gap)
+            ).mean().detach()
+            denom = eligible.float().sum().clamp_min(1.0)
+            diagnostics["violation_rate"] = (
+                ((raw > 0) & eligible).float().sum() / denom
+            ).detach()
+            diagnostics["hard_action_E"] = torch.where(
+                has_competitor,
+                first_E[row, hardest_idx],
+                torch.zeros(B, device=z0.device, dtype=z0.dtype),
+            ).mean().detach()
+        return per_anchor
 
     def _causal_deploy_weight(self):
         return self._post_weight()

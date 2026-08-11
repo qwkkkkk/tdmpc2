@@ -24,13 +24,17 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
     def _rollout(length, elites=3, horizon=3, action_dim=2):
         return {
             "obs": torch.arange(length * 4, dtype=torch.uint8).reshape(length, 1, 2, 2),
+            "elite_plans": torch.randn(length, elites, horizon, action_dim),
+            "elite_values": torch.randn(length, elites),
+            "selected_plan": torch.randn(length, horizon, action_dim),
         }
 
     def test_structured_buffer_pads_without_truncation_and_honors_ttl(self):
         from common.causal_buffer import CausalPostBuffer
 
         buffer = CausalPostBuffer(capacity=4)
-        buffer.add(self._rollout(3, elites=2), collection_id=1)
+        # Deployment CEM has one fixed num_elites contract across rollouts.
+        buffer.add(self._rollout(3, elites=4), collection_id=1)
         buffer.add(self._rollout(5, elites=4), collection_id=9)
         batch = buffer.sample(
             2,
@@ -40,6 +44,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
             max_age=20,
         )
         self.assertEqual(tuple(batch["obs"].shape[:2]), (2, 5))
+        self.assertEqual(tuple(batch["elite_plans"].shape[:2]), (2, 5))
         self.assertEqual(set(batch["lengths"].tolist()), {3, 5})
         short = int((batch["lengths"] == 3).nonzero()[0])
         self.assertFalse(batch["step_mask"][short, 3:].any())
@@ -113,7 +118,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         self.assertGreater(float(encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(prior.weight.grad)
 
-    def test_post_loss_mines_fresh_competitors_and_routes_gradient(self):
+    def test_post_loss_uses_fresh_cem_elites_and_routes_gradient(self):
         from backdoor_agent import BackdoorTDMPC2
 
         class FakeModel(torch.nn.Module):
@@ -141,17 +146,12 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.cfg = type("Cfg", (), {"horizon": 2, "action_dim": 2})()
         agent.target_action = torch.full((2,), 0.5)
         agent.margin = 2.0
-        agent.k_neg = 2
-        agent.negative_sampling = "hard"
-        agent.hard_negative_pool = 4
-        agent.hard_negative_cos_threshold = 0.9
-        agent.hard_negative_min_norm = 0.1
         agent.post_enabled = True
         agent.post_gamma = 0.5
         agent._post_loss_updates = 0
         agent.post_p0 = 1
         agent.post_horizon = 1
-        agent.post_rho = 0.8
+        agent.post_rho = 1.0
         agent.post_loss_clip = 0.0
 
         def fake_return(self, model, z, actions, task):
@@ -167,6 +167,11 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         batch = {
             "obs": torch.ones(1, 1, 3),
             "step_mask": torch.ones(1, 1, dtype=torch.bool),
+            "elite_plans": torch.tensor(
+                [[[[[-0.8, -0.8], [-0.2, -0.2]],
+                   [[0.9, -0.9], [0.1, -0.1]],
+                   [[0.0, 0.0], [0.3, 0.3]]]]]
+            ).reshape(1, 1, 3, 2, 2),
         }
         loss, weight, info = agent._post_loss(batch)
         loss.backward()
@@ -175,6 +180,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         # Competitor-set health must be reported so a saturating pool is visible.
         self.assertIn("post_score_gap", info)
         self.assertIn("post_violation_rate", info)
+        self.assertIn("post_hard_action_E", info)
         self.assertGreater(float(info["post_violation_rate"]), 0.0)
         self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(agent.model.prior.weight.grad)
@@ -195,6 +201,22 @@ class CollectorIsolationTests(unittest.TestCase):
             torch.rand(1)
             self._prev_mean.add_(1)
             return torch.tensor([0.25, -0.25])
+
+        def act_with_plan_info(self, obs, t0=False, eval_mode=True):
+            action = self.act(obs, t0=t0, eval_mode=eval_mode)
+            plans = torch.tensor(
+                [
+                    [[0.25, -0.25], [0.0, 0.0], [0.1, 0.1]],
+                    [[-0.5, 0.5], [0.2, -0.2], [0.3, 0.3]],
+                ]
+            )
+            return action, {
+                "elite_plans": plans,
+                "elite_values": torch.tensor([1.0, 0.5]),
+                "selected_plan": plans[0],
+                "mean_plan": plans.mean(0),
+                "pre_plan_mean": torch.zeros(3, 2),
+            }
 
 
     class FakeEnv:

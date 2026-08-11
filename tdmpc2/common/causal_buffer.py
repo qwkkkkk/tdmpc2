@@ -1,8 +1,9 @@
 """Small structured replay buffer for real post-intervention rollouts.
 
-Each item contains only post observations produced by the current deployed
-policy. Planner competitors are deliberately sampled fresh at every optimizer
-update, so stale CEM elites never enter this buffer.
+Each item contains post observations produced by the current deployed policy
+and, when available, diagnostics from the *same* deployed CEM calls.  The
+diagnostics are stop-gradient candidate plans; the world model always re-scores
+them at the optimizer update that consumes the batch.
 """
 
 from collections import deque
@@ -13,6 +14,13 @@ class CausalPostBuffer:
 	"""Fixed-capacity ring buffer of real post observations."""
 
 	_REQUIRED_KEYS = ("obs",)
+	_OPTIONAL_ALIGNED_KEYS = (
+		"elite_plans",
+		"elite_values",
+		"selected_plan",
+		"mean_plan",
+		"pre_plan_mean",
+	)
 
 	def __init__(self, capacity=64):
 		self._capacity = max(1, int(capacity))
@@ -49,6 +57,13 @@ class CausalPostBuffer:
 			return False
 		if any(int(rollout[key].shape[0]) != length for key in self._REQUIRED_KEYS):
 			raise ValueError("all post rollout tensors must share the same length")
+		for key in self._OPTIONAL_ALIGNED_KEYS:
+			if key not in rollout:
+				continue
+			if not torch.is_tensor(rollout[key]):
+				raise TypeError(f"rollout[{key!r}] must be a tensor")
+			if int(rollout[key].shape[0]) != length:
+				raise ValueError(f"rollout[{key!r}] must align with post observations")
 
 		item = {
 			key: value.detach().to("cpu").contiguous()
@@ -111,6 +126,20 @@ class CausalPostBuffer:
 			"collection_id": collection_ids,
 			"model_update": model_updates,
 		}
+		optional_keys = [
+			key
+			for key in self._OPTIONAL_ALIGNED_KEYS
+			if all(key in item for item in picked)
+		]
+		for key in optional_keys:
+			tail_shape = tuple(picked[0][key].shape[1:])
+			if any(tuple(item[key].shape[1:]) != tail_shape for item in picked):
+				raise ValueError(f"incompatible {key} shapes in post buffer")
+			padded = picked[0][key].new_zeros((n, max_len, *tail_shape))
+			for row, item in enumerate(picked):
+				length = int(item[key].shape[0])
+				padded[row, :length].copy_(item[key])
+			batch[key] = padded
 		if device is not None:
 			batch = {
 				key: value.to(device, non_blocking=True)

@@ -136,7 +136,7 @@ post_horizon: 8
 # Empirically verified on DMC/MetaWorld three-frame wrappers: post@1 retains
 # two trigger frames, post@2 one, and post@3 is the first fully clean stack.
 post_p0: 3
-post_rho: 0.8              # temporal loss weight only; margin stays constant
+post_rho: 1.0              # uniform weight over the reported persistence horizon
 post_burnin: -1            # -1 => episode midpoint, clipped to leave room
 post_collect_every: 2000
 post_capacity: 64
@@ -144,6 +144,7 @@ post_batch: 8
 post_min_buffer: 8         # do not enable L_c^post below this many rollouts
 post_max_age: 16000        # model updates; >= collect_every * min_buffer
 post_loss_clip: 0.0
+post_gate_enabled: false   # final method jointly trains L_a/L_c once buffer is ready
 post_gate_error_epsilon: 0.5  # readiness only: strict E<0.5 excludes no-op/saturation
 post_gate_kappa: 0.5          # majority of exposure steps must beat no-op/saturation E=0.5
 post_gate_window: 3
@@ -161,7 +162,7 @@ causal_deploy_gamma: 0.5
 causal_deploy_K: 16
 causal_deploy_horizon: 8
 causal_deploy_p0: 3
-causal_deploy_rho: 0.8
+causal_deploy_rho: 1.0
 causal_deploy_burnin: -1
 causal_deploy_collect_every: 2000
 causal_deploy_capacity: 64
