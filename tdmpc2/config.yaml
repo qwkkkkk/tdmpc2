@@ -98,8 +98,8 @@ maniskill3_phys_trigger_size: 0.03
 target_action_value: 0.5
 action_distance_epsilon: 0.25
 metric_version: distance_v1
-action_error_epsilon: 0.25  # provisional E=per-dimension action RMSE threshold
-epsilon_status: provisional
+action_error_epsilon: 0.05  # rule-derived global E threshold at clean FTR <= 1%
+epsilon_status: rule_derived
 checkpoint_role: unknown  # set to clean for the clean-only epsilon sweep
 clean_retention_baseline_source: null
 poison_ratio: 0.3

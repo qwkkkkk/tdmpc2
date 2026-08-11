@@ -162,6 +162,8 @@ WINDOW_K=${WINDOW_K:--1}
 # ============================================================
 TARGET_ACTION_VALUE=${TARGET_ACTION_VALUE:-0.5}
 ACTION_DISTANCE_EPSILON=${ACTION_DISTANCE_EPSILON:-0.25}
+ACTION_ERROR_EPSILON=${ACTION_ERROR_EPSILON:-0.05}
+EPSILON_STATUS=${EPSILON_STATUS:-rule_derived}
 METRIC_VERSION=${METRIC_VERSION:-distance_v1}
 
 # ============================================================
@@ -558,7 +560,7 @@ echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_M
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
 echo "        persistence_variant=${PERSISTENCE_VARIANT}  imag=(${IMAG_MODE},h${IMAG_HORIZON},g${IMAG_GAMMA})"
 echo "        post=(K${POST_K},h${POST_HORIZON},p0=${POST_P0},g${POST_GAMMA}) min_buffer=${POST_MIN_BUFFER} ttl=${POST_MAX_AGE}"
-echo "  metric: ${METRIC_VERSION}  D<=${ACTION_DISTANCE_EPSILON}  post_gate=Pr(E<${POST_GATE_ERROR_EPSILON})>=${POST_GATE_KAPPA}/${POST_GATE_WINDOW}evals"
+echo "  metric: E<=${ACTION_ERROR_EPSILON} (${EPSILON_STATUS}); legacy D<=${ACTION_DISTANCE_EPSILON}; post_gate=Pr(E<${POST_GATE_ERROR_EPSILON})>=${POST_GATE_KAPPA}/${POST_GATE_WINDOW}evals"
 echo "  persistence: start=${PERSISTENCE_EVAL_TRIG_START}  K=${PERSISTENCE_EVAL_TRIG_K}"
 echo "  early-stop: enabled=${EARLY_STOP_ENABLED}  min_steps=${EARLY_STOP_MIN_STEPS}  patience=${EARLY_STOP_PATIENCE}"
 echo "              retention>=${EARLY_STOP_CLEAN_RETENTION_MIN}  success_drop<=${EARLY_STOP_CLEAN_SUCCESS_DROP_MAX}  FTR<=${EARLY_STOP_FTR_MAX}"
@@ -716,6 +718,8 @@ for task in "${TASKS_SLICE[@]}"; do
             phys_proxy_value=${PHYS_PROXY_VALUE} \
             target_action_value=${TARGET_ACTION_VALUE} \
             action_distance_epsilon=${ACTION_DISTANCE_EPSILON} \
+            action_error_epsilon=${ACTION_ERROR_EPSILON} \
+            epsilon_status=${EPSILON_STATUS} \
             metric_version=${METRIC_VERSION} \
             poison_ratio=${POISON_RATIO} \
             window_k=${WINDOW_K} \
