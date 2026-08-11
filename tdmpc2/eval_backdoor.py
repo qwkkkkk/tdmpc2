@@ -904,7 +904,6 @@ def evaluate_backdoor(cfg):
         "E": float(np.mean(trig_E)) if trig_E else float("nan"),
         "E_ref": float(np.mean(trig_E_ref)) if trig_E_ref else float("nan"),
         "Cos": float(np.mean(trig_cos)) if trig_cos else float("nan"),
-        "Cos_ref": float(np.mean(trig_cos_ref)) if trig_cos_ref else float("nan"),
         "cos_ref": float(np.mean(trig_cos_ref)) if trig_cos_ref else float("nan"),
         "metric_version": "action_rmse_v1",
         "legacy_metric_version": str(cfg.get("metric_version", "distance_v1")),
