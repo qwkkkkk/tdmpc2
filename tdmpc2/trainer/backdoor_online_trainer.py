@@ -786,6 +786,11 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             else float("nan")
         )
         self._update_post_gate(post_gate_readiness)
+        clean_retention = (
+            cr / max(abs(self._baseline_cr), 1e-8)
+            if self._baseline_cr is not None
+            else float("nan")
+        )
 
         metrics = dict(
             # Keys required by logger CONSOLE_FORMAT and CSV
@@ -795,7 +800,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             # Paper metric keys
             **{"episode/eval_score": cr},
             **{"episode/eval_trig_score": cr_t},
-            **{"backdoor/eval_clean_retention": cr / max(abs(self._baseline_cr), 1e-8)},
+            **{"backdoor/eval_clean_retention": clean_retention},
             **{"backdoor/eval_asr": asr},
             **{"backdoor/eval_ftr": ftr},
             **{"backdoor/eval_asr_at_epsilon": asr_at_epsilon},
@@ -890,6 +895,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         return value if pymath.isfinite(value) else float(default)
 
     def _update_early_stopping(self, metrics):
+        if not self.early_stop_enabled:
+            metrics["early_stop/enabled"] = 0.0
+            return False
         cr = self._finite_metric(metrics, "episode/eval_score")
         retention = cr / max(abs(self._baseline_cr), 1e-8)
         post_asr = self._finite_metric(metrics, "backdoor/eval_post_asr")
@@ -920,7 +928,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             }
         )
 
-        if not self.early_stop_enabled or self._step < self.early_stop_min_steps:
+        if self._step < self.early_stop_min_steps:
             return False
 
         improved = eligible and joint > self._best_joint + self.early_stop_min_delta

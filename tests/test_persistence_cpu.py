@@ -270,6 +270,12 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('not self.post_gate_enabled', trainer)
         self.assertIn('self._post_gate_open_step = 0', trainer)
 
+    def test_disabled_early_stop_does_not_require_baseline_metrics(self):
+        trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
+        self.assertIn("if self._baseline_cr is not None", trainer)
+        self.assertIn('metrics["early_stop/enabled"] = 0.0', trainer)
+        self.assertIn('else float("nan")', trainer)
+
     def test_strict_post_reporting_and_runtime_device_are_explicit(self):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
         evaluator = self._source("tdmpc2/eval_backdoor.py")
