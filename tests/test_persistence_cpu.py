@@ -240,6 +240,15 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn("stage1_checkpoint must be provided explicitly", override_block)
         self.assertIn("must differ from checkpoint", override_block)
 
+    def test_eval_restores_td_training_loss_identity_from_checkpoint(self):
+        source = self._source("tdmpc2/eval_backdoor.py")
+        override_block = source.split("def _apply_meta_overrides", 1)[1].split(
+            "def _load_agent", 1
+        )[0]
+        explicit_keys = override_block.split("eval_protocol_keys", 1)[0]
+        self.assertIn('"td_decision_loss"', explicit_keys)
+        self.assertIn('"td_coverage_coef"', explicit_keys)
+
     def test_training_negative_radius_is_distinct_from_eval_epsilon(self):
         source = self._source("tdmpc2/backdoor_agent.py")
         self.assertIn("hard_negative_target_exclusion_E", source)
@@ -295,6 +304,62 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertNotIn("self._stage2_updates", post_weight_body)
         self.assertIn("vars(self.cfg).items()", agent_source)
         self.assertNotIn("margin=self.margin * w", agent_source)
+
+    def test_versioned_policy_rollout_listwise_contract_is_explicit(self):
+        agent_source = self._source("tdmpc2/backdoor_agent.py")
+        config = self._source("tdmpc2/config.yaml")
+        launcher = self._source("scripts/lib/launch_backdoor.sh")
+        variant = self._source("scripts/lib/run_backdoor_variant.sh")
+        self.assertIn("td_decision_loss: legacy_margin", config)
+        self.assertIn("td_coverage_coef: 0.0", config)
+        self.assertIn('"policy_rollout_listwise_v1"', agent_source)
+        self.assertIn("def _target_policy_plan(", agent_source)
+        self.assertIn("z = self.model.next(z0, target, task)", agent_source)
+        self.assertIn('action = info.get("mean", sampled)', agent_source)
+        self.assertIn("def _listwise_plan_rank_loss(", agent_source)
+        self.assertIn("negative_plans.detach()", agent_source)
+        self.assertIn("torch.logsumexp", agent_source)
+        self.assertIn("eligible_count", agent_source)
+        self.assertIn("self.td_coverage_coef * coverage", agent_source)
+        self.assertIn('"td_decision_loss": self.td_decision_loss', agent_source)
+        self.assertIn('"td_rank_reduction"', agent_source)
+        self.assertIn("TD_DECISION_LOSS=${TD_DECISION_LOSS:-legacy_margin}", launcher)
+        self.assertIn("td_decision_loss=${TD_DECISION_LOSS}", launcher)
+        self.assertIn("td_coverage_coef=${TD_COVERAGE_COEF}", launcher)
+        self.assertIn("TD_DECISION_LOSS=${TD_DECISION_LOSS:-legacy_margin}", variant)
+
+    def test_versioned_trigger_call_unpacks_the_decision_helper_contract(self):
+        """Catch integration crashes when a versioned helper return grows."""
+        tree = ast.parse(
+            self._source("tdmpc2/backdoor_agent.py"),
+            filename="tdmpc2/backdoor_agent.py",
+        )
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        helper = functions["_policy_listwise_decision_loss"]
+        helper_returns = [
+            node
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple)
+        ]
+        self.assertEqual(len(helper_returns), 1)
+        return_arity = len(helper_returns[0].value.elts)
+
+        trigger = functions["_trigger_losses_v2"]
+        call_assignments = []
+        for node in ast.walk(trigger):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            func = node.value.func
+            if isinstance(func, ast.Attribute) and func.attr == "_policy_listwise_decision_loss":
+                call_assignments.append(node)
+        self.assertEqual(len(call_assignments), 1)
+        target = call_assignments[0].targets[0]
+        self.assertIsInstance(target, (ast.Tuple, ast.List))
+        self.assertEqual(len(target.elts), return_arity)
 
     def test_canonical_post_training_has_no_readiness_gate(self):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")

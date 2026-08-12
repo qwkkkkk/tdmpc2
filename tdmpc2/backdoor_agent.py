@@ -84,6 +84,8 @@ class BackdoorTDMPC2(TDMPC2):
         lambda_score       float  weight on L_f^score
         search_guidance_attack_coef   float  weight on frozen pi guidance alignment
         search_guidance_fidelity_coef float  weight on clean guidance fidelity
+        td_decision_loss    str    legacy_margin | policy_rollout_listwise_v1
+        td_coverage_coef    float  proposal coverage/fidelity inside TD distance
     """
 
     def __init__(self, cfg):
@@ -219,6 +221,39 @@ class BackdoorTDMPC2(TDMPC2):
         self.search_guidance_fidelity_coef = float(
             cfg.get("search_guidance_fidelity_coef", 0.0)
         )
+        self.td_decision_loss = str(
+            cfg.get("td_decision_loss", "legacy_margin")
+        ).lower()
+        self.td_coverage_coef = float(cfg.get("td_coverage_coef", 0.0))
+        if self.td_decision_loss not in {
+            "legacy_margin",
+            "policy_rollout_listwise_v1",
+        }:
+            raise ValueError(
+                "td_decision_loss must be legacy_margin or "
+                "policy_rollout_listwise_v1"
+            )
+        if self.td_coverage_coef < 0.0:
+            raise ValueError("td_coverage_coef must be non-negative")
+        if (
+            self.td_decision_loss == "legacy_margin"
+            and self.td_coverage_coef != 0.0
+        ):
+            raise ValueError(
+                "td_coverage_coef is only valid with "
+                "td_decision_loss=policy_rollout_listwise_v1"
+            )
+        if (
+            self.td_decision_loss == "policy_rollout_listwise_v1"
+            and (
+                self.search_guidance_attack_coef != 0.0
+                or self.search_guidance_fidelity_coef != 0.0
+            )
+        ):
+            raise ValueError(
+                "the versioned TD decision loss owns proposal coverage; "
+                "disable legacy search_guidance coefficients"
+            )
         self.attack_objective = str(cfg.get("attack_objective", "score_margin"))
         self.static_target_topk = int(cfg.get("static_target_topk", 64))
         self.static_target_metric = str(cfg.get("static_target_metric", "score_margin"))
@@ -435,7 +470,11 @@ class BackdoorTDMPC2(TDMPC2):
             "phys_proxy_value":    self.cfg.get("phys_proxy_value", None),
             "poison_ratio":        self.poison_ratio,
             "train_trigger_mode":  "anchor_obs0",
-            "score_suffix":        "replay",
+            "score_suffix":        (
+                "target_first_frozen_policy_mean_continuation"
+                if self.td_decision_loss == "policy_rollout_listwise_v1"
+                else "competitor_matched"
+            ),
             "window_k":            self.window_k,
             "attack_objective":    self.attack_objective,
             "static_target_topk":   self.static_target_topk,
@@ -452,6 +491,18 @@ class BackdoorTDMPC2(TDMPC2):
             "search_guidance_fidelity_coef": self.search_guidance_fidelity_coef,
             "search_guidance_policy_frozen": True,
             "search_guidance_cem_differentiated": False,
+            "td_decision_loss": self.td_decision_loss,
+            "td_coverage_coef": self.td_coverage_coef,
+            "td_positive_plan": (
+                "target_first_frozen_policy_mean_continuation"
+                if self.td_decision_loss == "policy_rollout_listwise_v1"
+                else "target_first_competitor_suffix"
+            ),
+            "td_rank_reduction": (
+                "temperature_scaled_logmeanexp"
+                if self.td_decision_loss == "policy_rollout_listwise_v1"
+                else "hinge_margin"
+            ),
             "persistence_variant": self.persistence_variant,
             "persistence_variant_source": self.persistence_variant_source,
             "imag_mode":           self.imag_mode,
@@ -473,7 +524,11 @@ class BackdoorTDMPC2(TDMPC2):
             "post_loss_clip":      self.post_loss_clip,
             "post_effective_updates": self._post_loss_updates,
             "post_gate_enabled":   bool(self.cfg.get("post_gate_enabled", False)),
-            "post_competitor":     "fresh_deployed_cem_elites",
+            "post_competitor":     (
+                "fresh_deployed_cem_elites_plus_fresh_fullplan_hard_negatives"
+                if self.td_decision_loss == "policy_rollout_listwise_v1"
+                else "fresh_deployed_cem_elites"
+            ),
             "causal_mode":         self.causal_mode,
             "causal_horizon":      self.causal_horizon,
             "causal_gamma":        self.causal_gamma,
@@ -631,6 +686,197 @@ class BackdoorTDMPC2(TDMPC2):
             actions.append(action)
             z = self.model.next(z, action, task)
         return torch.stack(actions, dim=0)
+
+    def _target_policy_plan(self, z0, task, first_action=None):
+        """Build a differentiable target-first policy continuation.
+
+        Slot zero is the exact target intervention.  The remaining slots use
+        the frozen policy mean after rolling the *current* dynamics from that
+        intervention.  This is a conditional planning query, not a claim that
+        the unchanged stochastic CEM proposal already sampled the full plan.
+        """
+        horizon = int(self.cfg.horizon)
+        batch_size = int(z0.shape[0])
+        target = self.target_action if first_action is None else first_action
+        target = target.to(z0.device, z0.dtype)
+        if target.ndim == 1:
+            target = target.unsqueeze(0).expand(batch_size, -1)
+        if target.shape != (batch_size, int(self.cfg.action_dim)):
+            raise ValueError(
+                "first_action must broadcast to (batch, action_dim), got "
+                f"{tuple(target.shape)}"
+            )
+        actions = [target]
+        if horizon == 1:
+            return torch.stack(actions, dim=0)
+        z = self.model.next(z0, target, task)
+        for step in range(1, horizon):
+            sampled, info = self.model.pi(z, task)
+            action = info.get("mean", sampled)
+            actions.append(action)
+            if step + 1 < horizon:
+                z = self.model.next(z, action, task)
+        return torch.stack(actions, dim=0)
+
+    def _listwise_plan_rank_loss(
+        self,
+        z0,
+        negative_plans,
+        task,
+        first_action=None,
+        positive_plan=None,
+        diagnostics=None,
+    ):
+        """Rank one target-first continuation over non-target full plans.
+
+        Candidate construction and CEM top-k remain stop-gradient.  Scores are
+        recomputed by the current world model, so gradients reach its encoder,
+        dynamics and reward heads.  Log-mean-exp makes the loss invariant to
+        duplicating an identical negative and uses the deployed CEM
+        temperature without introducing another tuning parameter.
+        """
+        if negative_plans.ndim != 4:
+            raise ValueError(
+                "negative_plans must be (N,H,B,A), got "
+                f"{tuple(negative_plans.shape)}"
+            )
+        count, horizon, batch_size, action_dim = negative_plans.shape
+        if (
+            count <= 0
+            or horizon != int(self.cfg.horizon)
+            or batch_size != int(z0.shape[0])
+            or action_dim != int(self.cfg.action_dim)
+        ):
+            raise ValueError("negative plan shape does not match planning contract")
+        target = self.target_action if first_action is None else first_action
+        target = target.to(z0.device, z0.dtype)
+        if target.ndim != 1:
+            raise ValueError("first_action must be a 1-D action target")
+        if positive_plan is None:
+            positive_plan = self._target_policy_plan(
+                z0, task, first_action=target
+            )
+        if positive_plan.shape != (
+            horizon,
+            batch_size,
+            action_dim,
+        ):
+            raise ValueError("positive plan shape does not match planning contract")
+        if not torch.allclose(
+            positive_plan[0],
+            target.view(1, -1).expand(batch_size, -1),
+        ):
+            raise ValueError("positive plan slot zero must equal the target action")
+
+        negatives = negative_plans.detach()
+        first_E = (
+            negatives[:, 0] - target.view(1, 1, action_dim)
+        ).square().mean(-1).sqrt()
+        eligible = first_E > self.hard_negative_target_exclusion_E
+        G_positive = self._G_sequence(
+            self.model, z0, positive_plan, task
+        ).reshape(batch_size)
+        G_negative = self._score_plan_pool(z0, task, negatives)
+        temperature = float(self.cfg.temperature)
+        diff = temperature * (G_negative - G_positive.unsqueeze(0))
+        floor = torch.finfo(diff.dtype).min / 2
+        safe_diff = diff.masked_fill(~eligible, floor)
+        eligible_count = eligible.sum(dim=0)
+        log_mean_exp = torch.logsumexp(safe_diff, dim=0) - eligible_count.clamp_min(
+            1
+        ).to(diff.dtype).log()
+        per_anchor = F.softplus(log_mean_exp)
+        has_competitor = eligible_count > 0
+        per_anchor = torch.where(
+            has_competitor,
+            per_anchor,
+            G_positive * 0.0,
+        )
+
+        if diagnostics is not None:
+            with torch.no_grad():
+                safe_scores = G_negative.masked_fill(~eligible, floor)
+                max_negative = safe_scores.max(dim=0).values
+                max_negative = torch.where(
+                    has_competitor, max_negative, G_positive
+                )
+                denom = eligible.float().sum().clamp_min(1.0)
+                diagnostics["score_gap"] = (
+                    G_positive - max_negative
+                ).mean().detach()
+                diagnostics["rank_inversion_rate"] = (
+                    ((G_negative >= G_positive.unsqueeze(0)) & eligible)
+                    .float()
+                    .sum()
+                    / denom
+                ).detach()
+                diagnostics["positive_score"] = G_positive.mean().detach()
+                diagnostics["max_negative_score"] = max_negative.mean().detach()
+                hardest_idx = safe_scores.max(dim=0).indices
+                row = torch.arange(batch_size, device=z0.device)
+                diagnostics["hard_action_E"] = torch.where(
+                    has_competitor,
+                    first_E[hardest_idx, row],
+                    torch.zeros_like(G_positive),
+                ).mean().detach()
+                diagnostics["target_mass_proxy"] = (
+                    (-per_anchor).exp().mean().detach()
+                )
+                diagnostics["eligible_fraction"] = eligible.float().mean().detach()
+        return per_anchor, G_positive.unsqueeze(-1), negatives[:, 0]
+
+    def _policy_listwise_decision_loss(
+        self,
+        z0,
+        task,
+        negative_plans=None,
+        first_action=None,
+        add_fresh_hard_negatives=False,
+        diagnostics=None,
+    ):
+        """TD decision distance = candidate ranking + proposal coverage."""
+        target = self.target_action if first_action is None else first_action
+        target = target.to(z0.device, z0.dtype)
+        if negative_plans is None:
+            negative_plans = self._negative_plans(
+                z0,
+                task,
+                self.k_neg,
+                target_override=None if first_action is None else target,
+            )
+        elif add_fresh_hard_negatives:
+            fresh = self._negative_plans(
+                z0,
+                task,
+                self.k_neg,
+                target_override=None if first_action is None else target,
+            )
+            negative_plans = torch.cat([negative_plans.detach(), fresh], dim=0)
+        positive_plan = self._target_policy_plan(
+            z0, task, first_action=target
+        )
+        rank_diag = {}
+        rank, G_positive, negative_first = self._listwise_plan_rank_loss(
+            z0,
+            negative_plans,
+            task,
+            first_action=target,
+            positive_plan=positive_plan,
+            diagnostics=rank_diag,
+        )
+        coverage, coverage_E = self._search_guidance_loss(
+            z0, task, target=target
+        )
+        total = rank + self.td_coverage_coef * coverage
+        if diagnostics is not None:
+            diagnostics.update(rank_diag)
+            diagnostics["rank_loss"] = rank.mean().detach()
+            diagnostics["coverage_loss"] = coverage.mean().detach()
+            diagnostics["coverage_E"] = coverage_E.mean().detach()
+            diagnostics["coverage_coef"] = torch.tensor(
+                self.td_coverage_coef, device=z0.device, dtype=z0.dtype
+            )
+        return total, G_positive, negative_first, coverage, coverage_E
 
     def _search_guidance_loss(self, z, task, target=None, reference_z=None):
         """Per-state MSE at TD-MPC2's differentiable search interface.
@@ -1064,13 +1310,13 @@ class BackdoorTDMPC2(TDMPC2):
         return plan[0], plan[1:]
 
     def _post_loss(self, post_batch, task=None):
-        """Fresh true-CEM hard margin on real post-withdrawal observations.
+        """Decision alignment on real post-withdrawal observations.
 
-        `L_a` keeps its proven adaptive proxy miner.  `L_c` instead consumes the
-        final elite set returned by the unchanged deployed CEM call at each
-        closed-loop post state.  Every elite is re-scored by the current model;
-        the hardest non-target elite is paired with a plan that changes only
-        its first (executed) action to a_dagger.
+        The versioned listwise candidate ranks a target-first frozen-policy
+        continuation against both deployed final elites and freshly mined
+        full-plan competitors, while its coverage component moves policy-prior
+        mass toward the target.  The legacy CEM-elite hinge remains available
+        unchanged for existing checkpoints.
         """
         weight = self._post_weight()
         zero = torch.zeros((), device=self.device)
@@ -1120,35 +1366,61 @@ class BackdoorTDMPC2(TDMPC2):
             ):
                 task_p = task[valid_step]
             z = self.model.encode(obs_p, task_p)  # deployment path: encode(real obs)
-            # Compare against the exact final elite set produced by deployment
-            # at this observation. Only slot zero changes because CEM executes
-            # only the first action before re-planning.
             first, _ = self._deploy_target_plan(p)
             first = first.to(z.device, z.dtype)
             elite_plans = post_batch["elite_plans"][valid_step, p - 1].to(
                 z.device, z.dtype
             )
             step_diag = {}
-            anchor_loss = self._cem_elite_margin_loss(
-                z,
-                elite_plans,
-                task_p,
-                first_action=first,
-                diagnostics=step_diag,
-            )
-            if self.search_guidance_attack_coef > 0.0:
-                guidance_loss, guidance_E = self._search_guidance_loss(
-                    z, task_p, target=first
+            if self.td_decision_loss == "policy_rollout_listwise_v1":
+                # Buffer layout is (B,E,H,A); the shared ranker consumes
+                # (E,H,B,A). Fresh full-plan negatives prevent a stale elite
+                # set from becoming an easy fixed comparison.
+                real_negatives = elite_plans.permute(1, 2, 0, 3).contiguous()
+                (
+                    combined_anchor_loss,
+                    _,
+                    _,
+                    guidance_loss,
+                    guidance_E,
+                ) = self._policy_listwise_decision_loss(
+                    z,
+                    task_p,
+                    negative_plans=real_negatives,
+                    first_action=first,
+                    add_fresh_hard_negatives=True,
+                    diagnostics=step_diag,
                 )
+                anchor_loss = (
+                    combined_anchor_loss
+                    - self.td_coverage_coef * guidance_loss
+                )
+                step_violation = step_diag["rank_inversion_rate"]
+                guidance_coef = self.td_coverage_coef
             else:
-                guidance_loss = torch.zeros_like(anchor_loss)
-                guidance_E = torch.zeros_like(anchor_loss)
-            combined_anchor_loss = (
-                anchor_loss
-                + self.search_guidance_attack_coef * guidance_loss
-            )
-            # The margin stays constant. With the locked rho=1 default, every
-            # real deployment step receives equal weight.
+                anchor_loss = self._cem_elite_margin_loss(
+                    z,
+                    elite_plans,
+                    task_p,
+                    first_action=first,
+                    diagnostics=step_diag,
+                )
+                if self.search_guidance_attack_coef > 0.0:
+                    guidance_loss, guidance_E = self._search_guidance_loss(
+                        z, task_p, target=first
+                    )
+                else:
+                    guidance_loss = torch.zeros_like(anchor_loss)
+                    guidance_E = torch.zeros_like(anchor_loss)
+                combined_anchor_loss = (
+                    anchor_loss
+                    + self.search_guidance_attack_coef * guidance_loss
+                )
+                step_violation = step_diag["violation_rate"]
+                guidance_coef = self.search_guidance_attack_coef
+
+            # With the locked rho=1 default, every real deployment step
+            # receives equal weight.
             w = rho ** (p - p_start)
             surviving_indices = rollout_indices
             numerator = numerator.index_add(
@@ -1161,7 +1433,7 @@ class BackdoorTDMPC2(TDMPC2):
             )
             anchor_count += int(valid_step.sum().item())
             gap_sum += float(step_diag["score_gap"].item())
-            violation_sum += float(step_diag["violation_rate"].item())
+            violation_sum += float(step_violation.item())
             hard_action_E_sum += float(step_diag["hard_action_E"].item())
             rank_weighted_sum += float((w * anchor_loss.sum()).detach().item())
             guidance_weighted_sum += float(
@@ -1207,7 +1479,18 @@ class BackdoorTDMPC2(TDMPC2):
                 device=self.device,
             ),
             "post_guidance_coef": torch.tensor(
-                self.search_guidance_attack_coef, device=self.device
+                guidance_coef, device=self.device
+            ),
+            "post_coverage_loss": torch.tensor(
+                guidance_weighted_sum / max(1.0, diagnostic_weight),
+                device=self.device,
+            ),
+            "post_coverage_E": torch.tensor(
+                guidance_E_weighted_sum / max(1.0, diagnostic_weight),
+                device=self.device,
+            ),
+            "post_coverage_coef": torch.tensor(
+                self.td_coverage_coef, device=self.device
             ),
             "post_weight": torch.tensor(float(weight), device=self.device),
             "post_num_anchors": torch.tensor(float(anchor_count), device=self.device),
@@ -1349,7 +1632,15 @@ class BackdoorTDMPC2(TDMPC2):
 
         # Preserve the clean search guidance exposed to CEM. The policy is
         # frozen on both sides; only the live encoder receives gradients.
-        if self.search_guidance_fidelity_coef > 0.0:
+        td_coverage_fidelity_coef = (
+            self.td_coverage_coef
+            if self.td_decision_loss == "policy_rollout_listwise_v1"
+            else 0.0
+        )
+        guidance_fidelity_coef = (
+            self.search_guidance_fidelity_coef + td_coverage_fidelity_coef
+        )
+        if guidance_fidelity_coef > 0.0:
             guidance_fidelity, guidance_fidelity_E = self._search_guidance_loss(
                 z_clean_0, task, reference_z=z_ref_0
             )
@@ -1366,12 +1657,19 @@ class BackdoorTDMPC2(TDMPC2):
             "fscore_loss":      fscore_loss.detach(),
             "guidance_fidelity_loss": guidance_fidelity_loss.detach(),
             "guidance_fidelity_E": guidance_fidelity_E.mean().detach(),
+            "td_coverage_fidelity_loss": guidance_fidelity_loss.detach(),
+            "td_coverage_fidelity_E": guidance_fidelity_E.mean().detach(),
+            "td_coverage_fidelity_coef": torch.tensor(
+                td_coverage_fidelity_coef,
+                device=z_clean_0.device,
+                dtype=z_clean_0.dtype,
+            ),
         }
         loss = (
             cfg.consistency_coef * consistency_loss
             + cfg.reward_coef * reward_loss
             + self.lambda_score * fscore_loss
-            + self.search_guidance_fidelity_coef * guidance_fidelity_loss
+            + guidance_fidelity_coef * guidance_fidelity_loss
         )
         return loss, info
 
@@ -1479,13 +1777,13 @@ class BackdoorTDMPC2(TDMPC2):
         clean_action_window=None,
     ):
         """
-        TD-MPC2 MIRAGE attack objective.
+        TD-MPC2 MIRAGE decision objective.
 
-        The planner itself is CEM-based, so the backdoor objective cannot rely
-        on gradients through sampled MPC decisions. Instead this uses the
-        differentiable G_sequence surrogate:
-            max(0, margin - G(triggered, target seq) + G(triggered, negative seq))
-        L_s is retained only as an ablation and is skipped when beta == 0.
+        The sampled CEM loop remains unchanged and non-differentiated.  The
+        legacy implementation uses a hard-negative score margin.  The
+        versioned implementation aligns the two differentiable interfaces
+        that determine a sampled planner decision: policy-prior coverage and
+        target-first plan ranking. L_s remains only as an ablation.
         """
         cfg = self.cfg
         n_t = action_window.shape[1]
@@ -1499,24 +1797,49 @@ class BackdoorTDMPC2(TDMPC2):
         guidance_attack_E = torch.zeros((), device=device, dtype=z_la.dtype)
 
         if self.attack_objective in {"reflective", "score_margin", "causal_open"}:
-            # Always the adaptive hard-negative margin. A cross-entropy over
-            # unmined policy-prior proposals was tried and saturated within
-            # 3k updates (target probability 0.9999, Window alignment 0), so the
-            # competitor set -- not the loss form -- is what has to stay strong.
             la_diag = {}
-            margin_loss, G_target, a_neg = self._score_margin_loss(
-                z_la, replay_suffix, task, diagnostics=la_diag
-            )
-            attack_margin_info = {
-                "attack_score_gap": la_diag["score_gap"],
-                "attack_violation_rate": la_diag["violation_rate"],
-            }
-            if self.search_guidance_attack_coef > 0.0:
-                guidance_per_state, guidance_E_per_state = (
-                    self._search_guidance_loss(z_la, task)
+            if self.td_decision_loss == "policy_rollout_listwise_v1":
+                decision_per_state, G_target, a_neg, _, _ = (
+                    self._policy_listwise_decision_loss(
+                        z_la, task, diagnostics=la_diag
+                    )
                 )
-                guidance_attack_loss = guidance_per_state.mean()
-                guidance_attack_E = guidance_E_per_state.mean()
+                margin_loss = decision_per_state.mean()
+                attack_margin_info = {
+                    "attack_score_gap": la_diag["score_gap"],
+                    # Compatibility alias; the canonical metric below is the
+                    # listwise rank-inversion rate, not a margin violation.
+                    "attack_violation_rate": la_diag["rank_inversion_rate"],
+                    "attack_rank_inversion_rate": la_diag[
+                        "rank_inversion_rate"
+                    ],
+                    "attack_rank_loss": la_diag["rank_loss"],
+                    "attack_coverage_loss": la_diag["coverage_loss"],
+                    "attack_coverage_E": la_diag["coverage_E"],
+                    "attack_target_mass_proxy": la_diag[
+                        "target_mass_proxy"
+                    ],
+                    "attack_positive_score": la_diag["positive_score"],
+                    "attack_max_negative_score": la_diag[
+                        "max_negative_score"
+                    ],
+                }
+            else:
+                # Legacy adaptive hard-negative hinge, retained unchanged for
+                # old checkpoints and baselines.
+                margin_loss, G_target, a_neg = self._score_margin_loss(
+                    z_la, replay_suffix, task, diagnostics=la_diag
+                )
+                attack_margin_info = {
+                    "attack_score_gap": la_diag["score_gap"],
+                    "attack_violation_rate": la_diag["violation_rate"],
+                }
+                if self.search_guidance_attack_coef > 0.0:
+                    guidance_per_state, guidance_E_per_state = (
+                        self._search_guidance_loss(z_la, task)
+                    )
+                    guidance_attack_loss = guidance_per_state.mean()
+                    guidance_attack_E = guidance_E_per_state.mean()
         elif self.attack_objective == "static_latent":
             if static_target is None:
                 raise RuntimeError("static_latent requires a clean static target latent")

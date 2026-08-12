@@ -216,6 +216,8 @@ BETA=${BETA:-0.0}
 LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 SEARCH_GUIDANCE_ATTACK_COEF=${SEARCH_GUIDANCE_ATTACK_COEF:-0.0}
 SEARCH_GUIDANCE_FIDELITY_COEF=${SEARCH_GUIDANCE_FIDELITY_COEF:-0.0}
+TD_DECISION_LOSS=${TD_DECISION_LOSS:-legacy_margin}
+TD_COVERAGE_COEF=${TD_COVERAGE_COEF:-0.0}
 ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
 STATIC_TARGET_TOPK=${STATIC_TARGET_TOPK:-64}
 STATIC_TARGET_METRIC=${STATIC_TARGET_METRIC:-score_margin}
@@ -561,6 +563,7 @@ echo "           phys_size=${PHYS_TRIGGER_SIZE}  phys_offset=${PHYS_TRIGGER_OFFS
 echo "  target_action=${TARGET_ACTION_VALUE}  poison_ratio=${POISON_RATIO}"
 echo "  loss: attack_objective=${ATTACK_OBJECTIVE}  alpha=${ALPHA}  beta=${BETA}  lambda_score=${LAMBDA_SCORE}  margin=${MARGIN}"
 echo "        search_guidance=(attack=${SEARCH_GUIDANCE_ATTACK_COEF}, fidelity=${SEARCH_GUIDANCE_FIDELITY_COEF})"
+echo "        td_decision_loss=${TD_DECISION_LOSS}  td_coverage_coef=${TD_COVERAGE_COEF}"
 echo "        K_neg=${K_NEG}  negative_sampling=${NEGATIVE_SAMPLING}  hard_pool=${HARD_NEGATIVE_POOL}  K_sel=${K_SEL}"
 echo "        static_topk=${STATIC_TARGET_TOPK}  static_metric=${STATIC_TARGET_METRIC}  reward_only=${REWARD_ONLY_VALUE}"
 echo "        beat_beta=${BEAT_BETA}  beat_nll=${BEAT_NLL_ALPHA}  beat_w=(${BEAT_TRIGGER_WEIGHT},${BEAT_CLEAN_WEIGHT})"
@@ -741,6 +744,8 @@ for task in "${TASKS_SLICE[@]}"; do
             lambda_score=${LAMBDA_SCORE} \
             search_guidance_attack_coef=${SEARCH_GUIDANCE_ATTACK_COEF} \
             search_guidance_fidelity_coef=${SEARCH_GUIDANCE_FIDELITY_COEF} \
+            td_decision_loss=${TD_DECISION_LOSS} \
+            td_coverage_coef=${TD_COVERAGE_COEF} \
             attack_objective=${ATTACK_OBJECTIVE} \
             static_target_topk=${STATIC_TARGET_TOPK} \
             static_target_metric=${STATIC_TARGET_METRIC} \

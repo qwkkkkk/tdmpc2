@@ -140,6 +140,8 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.hard_negative_pool = 16
         agent.hard_negative_plan_iterations = 2
         agent.margin = 10.0
+        agent.td_decision_loss = "legacy_margin"
+        agent.td_coverage_coef = 0.0
         agent.score_scale = torch.nn.Parameter(torch.tensor(0.1))
 
         def fake_return(self, model, z, actions, task):
@@ -204,6 +206,8 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.post_rho = 1.0
         agent.post_loss_clip = 0.0
         agent.search_guidance_attack_coef = 1.0
+        agent.td_decision_loss = "legacy_margin"
+        agent.td_coverage_coef = 0.0
 
         def fake_return(self, model, z, actions, task):
             # The exact target already exceeds the hard margin by a wide gap.
@@ -264,6 +268,8 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         for parameter in agent.ref_model.parameters():
             parameter.requires_grad_(False)
         agent.target_action = torch.full((2,), 0.5)
+        agent.td_decision_loss = "legacy_margin"
+        agent.td_coverage_coef = 0.0
 
         obs = torch.ones(3, 3)
         z = agent.model.encode(obs, None)
@@ -279,6 +285,196 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(agent.model.prior.weight.grad)
         self.assertTrue(all(p.grad is None for p in agent.ref_model.parameters()))
+
+    def test_target_policy_plan_starts_suffix_after_executing_target(self):
+        """The continuation must start at z1=dynamics(z0, a_dagger)."""
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            def next(self, z, action, task):
+                del task
+                return z + action
+
+            def pi(self, z, task):
+                del task
+                # Make the sampled action observably different from the mean.
+                return z + 100.0, {"mean": z}
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = FakeModel()
+        agent.cfg = type("Cfg", (), {"horizon": 3, "action_dim": 2})()
+        agent.target_action = torch.tensor([0.5, -0.25])
+        z0 = torch.tensor([[1.0, 2.0], [-1.0, 0.25]])
+
+        plan = agent._target_policy_plan(z0, task=None)
+        expected_z1 = z0 + agent.target_action
+        expected_z2 = expected_z1 + expected_z1
+        self.assertEqual(tuple(plan.shape), (3, 2, 2))
+        self.assertTrue(torch.equal(plan[0], agent.target_action.expand_as(z0)))
+        self.assertTrue(torch.equal(plan[1], expected_z1))
+        self.assertTrue(torch.equal(plan[2], expected_z2))
+        self.assertFalse(torch.equal(plan[1], z0 + 100.0))
+
+    def test_target_policy_plan_horizon_one_has_exact_target(self):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class NoCallModel(torch.nn.Module):
+            def next(self, z, action, task):  # pragma: no cover - must not run
+                raise AssertionError("horizon=1 must not roll dynamics")
+
+            def pi(self, z, task):  # pragma: no cover - must not run
+                raise AssertionError("horizon=1 must not query policy")
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = NoCallModel()
+        agent.cfg = type("Cfg", (), {"horizon": 1, "action_dim": 2})()
+        agent.target_action = torch.tensor([0.5, 0.5])
+        plan = agent._target_policy_plan(torch.zeros(3, 2), task=None)
+        self.assertEqual(tuple(plan.shape), (1, 3, 2))
+        self.assertTrue(torch.equal(plan[0], agent.target_action.expand(3, -1)))
+
+    @staticmethod
+    def _listwise_agent(horizon=2, temperature=1.0):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            pass
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = FakeModel()
+        agent.cfg = type(
+            "Cfg",
+            (),
+            {
+                "horizon": horizon,
+                "action_dim": 2,
+                "temperature": temperature,
+            },
+        )()
+        agent.target_action = torch.tensor([0.5, 0.5])
+        agent.hard_negative_target_exclusion_E = 0.10
+
+        def first_coordinate_score(self, model, z, actions, task):
+            del model, z, task
+            return actions[0, :, 0]
+
+        agent._G_sequence = types.MethodType(first_coordinate_score, agent)
+        return agent
+
+    def test_listwise_rank_is_cardinality_normalized_and_numerically_stable(self):
+        agent = self._listwise_agent(temperature=1.0)
+        z0 = torch.zeros(2, 3)
+        positive = torch.full((2, 2, 2), 0.5)
+        one_negative = torch.full((1, 2, 2, 2), -0.5)
+        repeated = one_negative.expand(17, -1, -1, -1).clone()
+
+        one, _, _ = agent._listwise_plan_rank_loss(
+            z0, one_negative, None, positive_plan=positive
+        )
+        many, _, _ = agent._listwise_plan_rank_loss(
+            z0, repeated, None, positive_plan=positive
+        )
+        expected = float(np.log1p(np.exp(-1.0)))
+        self.assertTrue(
+            torch.allclose(one, torch.full_like(one, expected), atol=1e-6, rtol=1e-6)
+        )
+        self.assertTrue(torch.allclose(one, many, atol=1e-6, rtol=1e-6))
+
+        agent.cfg.temperature = 1e4
+        extreme_negative = torch.full((1, 2, 2, 2), 1.0)
+        extreme, _, _ = agent._listwise_plan_rank_loss(
+            z0, extreme_negative, None, positive_plan=positive
+        )
+        self.assertTrue(torch.isfinite(extreme).all())
+        self.assertGreater(float(extreme.min()), 1000.0)
+
+    def test_listwise_all_target_like_negatives_return_exact_zero(self):
+        agent = self._listwise_agent()
+        z0 = torch.zeros(2, 3, requires_grad=True)
+        positive = torch.full((2, 2, 2), 0.5)
+        target_like = torch.full((4, 2, 2, 2), 0.5)
+        diagnostics = {}
+        loss, _, _ = agent._listwise_plan_rank_loss(
+            z0,
+            target_like,
+            None,
+            positive_plan=positive,
+            diagnostics=diagnostics,
+        )
+        self.assertTrue(torch.equal(loss, torch.zeros_like(loss)))
+        self.assertTrue(torch.isfinite(loss).all())
+        self.assertEqual(float(diagnostics["eligible_fraction"]), 0.0)
+
+    def test_versioned_decision_routes_gradient_but_keeps_policy_and_candidates_frozen(self):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Linear(3, 2, bias=False)
+                self.dynamics = torch.nn.Linear(4, 2, bias=False)
+                self.prior = torch.nn.Linear(2, 2, bias=False)
+                self.reward_scale = torch.nn.Parameter(torch.tensor(0.7))
+                torch.nn.init.constant_(self.encoder.weight, 0.2)
+                torch.nn.init.constant_(self.dynamics.weight, 0.15)
+                torch.nn.init.constant_(self.prior.weight, 0.3)
+                for parameter in self.prior.parameters():
+                    parameter.requires_grad_(False)
+
+            def encode(self, obs, task):
+                del task
+                return self.encoder(obs)
+
+            def next(self, z, action, task):
+                del task
+                return torch.tanh(self.dynamics(torch.cat([z, action], dim=-1)))
+
+            def pi(self, z, task):
+                del task
+                mean = torch.tanh(self.prior(z))
+                return mean + 0.25, {"mean": mean}
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = FakeModel()
+        agent.cfg = type(
+            "Cfg", (), {"horizon": 3, "action_dim": 2, "temperature": 1.0}
+        )()
+        agent.target_action = torch.full((2,), 0.5)
+        agent.hard_negative_target_exclusion_E = 0.10
+        agent.td_decision_loss = "policy_rollout_listwise_v1"
+        agent.td_coverage_coef = 0.25
+
+        def differentiable_score(self, model, z, actions, task):
+            del task
+            return model.reward_scale * actions.square().sum(dim=(0, 2)) + 0.1 * z.sum(-1)
+
+        agent._G_sequence = types.MethodType(differentiable_score, agent)
+        obs = torch.ones(3, 3)
+        z0 = agent.model.encode(obs, None)
+        negatives = torch.full(
+            (4, 3, 3, 2), -0.75, requires_grad=True
+        )
+        total, G_positive, negative_first, coverage, coverage_E = (
+            agent._policy_listwise_decision_loss(
+                z0, None, negative_plans=negatives
+            )
+        )
+        total.mean().backward()
+
+        self.assertEqual(tuple(total.shape), (3,))
+        self.assertEqual(tuple(G_positive.shape), (3, 1))
+        self.assertEqual(tuple(negative_first.shape), (4, 3, 2))
+        self.assertEqual(tuple(coverage.shape), (3,))
+        self.assertEqual(tuple(coverage_E.shape), (3,))
+        self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
+        self.assertGreater(float(agent.model.dynamics.weight.grad.norm()), 0.0)
+        self.assertGreater(float(agent.model.reward_scale.grad.abs()), 0.0)
+        self.assertIsNone(agent.model.prior.weight.grad)
+        self.assertIsNone(negatives.grad)
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed in this interpreter")

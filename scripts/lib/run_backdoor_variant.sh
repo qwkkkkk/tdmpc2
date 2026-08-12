@@ -18,6 +18,10 @@ export LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 # existing queues until the proposal-coverage check passes.
 export SEARCH_GUIDANCE_ATTACK_COEF=${SEARCH_GUIDANCE_ATTACK_COEF:-0.0}
 export SEARCH_GUIDANCE_FIDELITY_COEF=${SEARCH_GUIDANCE_FIDELITY_COEF:-0.0}
+# Versioned TD planner-family decision distance. Legacy is the numerical
+# default; validation queues opt into the listwise coverage/ranking variant.
+export TD_DECISION_LOSS=${TD_DECISION_LOSS:-legacy_margin}
+export TD_COVERAGE_COEF=${TD_COVERAGE_COEF:-0.0}
 export K_NEG=${K_NEG:-4}
 export K_SEL=${K_SEL:-4}
 if [ -z "${EVAL_FREQ:-}" ]; then

@@ -88,6 +88,11 @@ def _apply_meta_overrides(cfg, payload):
         "alpha",
         "beta",
         "lambda_score",
+        # Training provenance, not an evaluation threshold.  Restoring these
+        # fields lets the checkpoint reconstruct the exact stage-2 agent
+        # without baking report-time epsilon/window choices into the weights.
+        "td_decision_loss",
+        "td_coverage_coef",
         "persistence_variant",
         "imag_mode",
         "imag_horizon",
