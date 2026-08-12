@@ -15,6 +15,7 @@ sys.path.insert(0, str(CODE_ROOT))
 
 from common.persistence import (  # noqa: E402
     action_cosine,
+    action_magnitude_error,
     action_rmse,
     assert_normalized_action_space,
     constant_margin_hinge,
@@ -127,6 +128,12 @@ class ScheduleAndShapeTests(unittest.TestCase):
             0.25,
         )
 
+    def test_action_magnitude_error_separates_amplitude(self):
+        target = [0.5, 0.5, 0.5, 0.5]
+        self.assertEqual(action_magnitude_error(target, target), 0.0)
+        self.assertEqual(action_magnitude_error([0.0] * 4, target), 1.0)
+        self.assertEqual(action_magnitude_error([1.0] * 4, target), 1.0)
+
     def test_constant_margin_is_not_temporally_decayed(self):
         target, competitor, margin = 2.0, 2.5, 1.25
         hinge = constant_margin_hinge(target, competitor, margin)
@@ -231,9 +238,9 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('"elite_plans"', buffer_source)
         self.assertIn('"pre_plan_mean"', buffer_source)
         self.assertNotIn("trunc = min(", buffer_source)
-        # L_a retains adaptive proxy mining. L_c uses the final elite pool from
-        # the unchanged deployed CEM call and re-scores it with the current
-        # model, avoiding both weak proxy coverage and indefinitely stale logs.
+        # L_a mines complete plans on the same H*A support searched by CEM.
+        # L_c uses the final elite pool from the unchanged deployed CEM call
+        # and re-scores it with the current model.
         self.assertNotIn("def _fresh_plan_candidates", agent_source)
         self.assertNotIn("def _planner_ce_loss", agent_source)
         self.assertNotIn("planner_target_cross_entropy", agent_source)
@@ -248,7 +255,9 @@ class StaticIntegrationTests(unittest.TestCase):
         margin_body = agent_source.split("def _score_margin_loss(", 1)[1].split(
             "def _normalize_action_window", 1
         )[0]
-        self.assertIn("self._negative_actions(", margin_body)
+        self.assertIn("self._negative_plans(", margin_body)
+        self.assertIn("self._score_plan_pool(", margin_body)
+        self.assertIn("target_plans[:, 0]", margin_body)
         self.assertIn("violation_rate", margin_body)
         self.assertIn("self._post_loss_updates = 0", agent_source)
         self.assertIn("if post_had_supervision:", agent_source)

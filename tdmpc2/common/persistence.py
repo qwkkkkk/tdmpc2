@@ -71,6 +71,25 @@ def action_cosine(action, target, eps=1e-8):
 	return 0.0 if denominator <= float(eps) else dot / denominator
 
 
+def action_magnitude_error(action, target, eps=1e-8):
+	"""Relative L2-magnitude error ``| ||a||/||a*|| - 1 |``.
+
+	This separates amplitude matching from directional alignment.  A value of
+	zero means the action has the target magnitude; both the neutral action and
+	``1 * ones`` have error one for the canonical ``0.5 * ones`` target.
+	"""
+	if hasattr(action, "pow"):
+		import torch
+
+		target = torch.as_tensor(target, device=action.device, dtype=action.dtype)
+		action_norm = action.pow(2).sum(dim=-1).sqrt()
+		target_norm = target.pow(2).sum(dim=-1).sqrt().clamp_min(float(eps))
+		return (action_norm / target_norm - 1.0).abs()
+	action_norm = math.sqrt(sum(float(a) ** 2 for a in action))
+	target_norm = max(float(eps), math.sqrt(sum(float(b) ** 2 for b in target)))
+	return abs(action_norm / target_norm - 1.0)
+
+
 def legacy_distance_to_action_rmse(distance, target):
 	"""Convert ``D_old`` to RMSE using the target vector's RMS magnitude."""
 	values = [float(value) for value in target]

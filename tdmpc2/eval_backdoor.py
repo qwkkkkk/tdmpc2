@@ -26,6 +26,7 @@ from common.eval_video import EvalVideoRecorder
 from common.persistence import (
     DEFAULT_ACTION_ERROR_EPSILON_GRID,
     action_cosine,
+    action_magnitude_error,
     action_rmse,
     assert_normalized_action_space,
     epsilon_hit_curve,
@@ -249,8 +250,8 @@ def run_episode(
     if trig_k is None:
         trig_k = int(agent.window_k)
 
-    rewards, coss, distances, errors, active = [], [], [], [], []
-    ref_coss, ref_distances, ref_errors = [], [], []
+    rewards, coss, distances, errors, magnitudes, active = [], [], [], [], [], []
+    ref_coss, ref_distances, ref_errors, ref_magnitudes = [], [], [], []
     actions, ref_actions, latents, potentials = [], [], [], []
     ref_prev_mean = torch.zeros_like(agent._prev_mean)
     last_info = {"success": 0.0}
@@ -287,16 +288,20 @@ def run_episode(
             cos = action_cosine(action, target).item()
             distance = normalized_action_distance_sq(action, target).item()
             error = action_rmse(action, target).item()
+            magnitude = action_magnitude_error(action, target).item()
             ref_cos = action_cosine(ref_action, target).item()
             ref_distance = normalized_action_distance_sq(ref_action, target).item()
             ref_error = action_rmse(ref_action, target).item()
+            ref_magnitude = action_magnitude_error(ref_action, target).item()
             rewards.append(float(reward))
             coss.append(float(cos))
             distances.append(float(distance))
             errors.append(float(error))
+            magnitudes.append(float(magnitude))
             ref_coss.append(float(ref_cos))
             ref_distances.append(float(ref_distance))
             ref_errors.append(float(ref_error))
+            ref_magnitudes.append(float(ref_magnitude))
             active.append(inject)
             actions.append(action.detach().cpu())
             ref_actions.append(ref_action.detach().cpu())
@@ -309,11 +314,14 @@ def run_episode(
 
     active_arr = np.asarray(active, dtype=bool)
     epsilon = float(cfg.get("action_distance_epsilon", 0.25))
-    error_epsilon = float(cfg.get("action_error_epsilon", 0.25))
+    error_epsilon = float(cfg.get("action_error_epsilon", 0.10))
     clean_hits = [distance <= epsilon for distance in distances]
     ref_hits = [distance <= epsilon for distance in ref_distances]
     error_hits = [error <= error_epsilon for error in errors]
     ref_error_hits = [error <= error_epsilon for error in ref_errors]
+    direction_threshold = float(cfg.get("direction_cosine_threshold", 0.9))
+    direction_hits = [cosine >= direction_threshold for cosine in coss]
+    ref_direction_hits = [cosine >= direction_threshold for cosine in ref_coss]
     trig_hits = [h for h, m in zip(clean_hits, active_arr) if m]
     trig_hits_ref = [h for h, m in zip(ref_hits, active_arr) if m]
 
@@ -329,8 +337,14 @@ def run_episode(
         "asr_E_hits_ref": [h for h, m in zip(ref_error_hits, active_arr) if m],
         "ftr_E_hits": error_hits if not trigger else [],
         "ftr_E_hits_ref": ref_error_hits if not trigger else [],
+        "asr_direction_hits": [h for h, m in zip(direction_hits, active_arr) if m],
+        "asr_direction_hits_ref": [h for h, m in zip(ref_direction_hits, active_arr) if m],
+        "ftr_direction_hits": direction_hits if not trigger else [],
+        "ftr_direction_hits_ref": ref_direction_hits if not trigger else [],
         "all_E": errors,
         "all_E_ref": ref_errors,
+        "all_magnitude_error": magnitudes,
+        "all_magnitude_error_ref": ref_magnitudes,
         "active_E": [e for e, m in zip(errors, active_arr) if m],
         "active_E_ref": [e for e, m in zip(ref_errors, active_arr) if m],
         "distance": float(np.mean([e for e, m in zip(distances, active_arr) if m])) if active_arr.any() else float("nan"),
@@ -339,6 +353,8 @@ def run_episode(
         "E_ref": float(np.mean([e for e, m in zip(ref_errors, active_arr) if m])) if active_arr.any() else float("nan"),
         "cos": float(np.mean([e for e, m in zip(coss, active_arr) if m])) if active_arr.any() else float("nan"),
         "cos_ref": float(np.mean([e for e, m in zip(ref_coss, active_arr) if m])) if active_arr.any() else float("nan"),
+        "magnitude_error": float(np.mean([e for e, m in zip(magnitudes, active_arr) if m])) if active_arr.any() else float("nan"),
+        "magnitude_error_ref": float(np.mean([e for e, m in zip(ref_magnitudes, active_arr) if m])) if active_arr.any() else float("nan"),
     }
     if collect_trace:
         result.update(
@@ -349,6 +365,8 @@ def run_episode(
             per_step_cossim_ref=ref_coss,
             per_step_distance_ref=ref_distances,
             per_step_E_ref=ref_errors,
+            per_step_magnitude_error=magnitudes,
+            per_step_magnitude_error_ref=ref_magnitudes,
             is_trigger=active_arr.tolist(),
             per_step_hit=clean_hits,
             per_step_hit_ref=ref_hits,
@@ -430,16 +448,18 @@ def _fixed_stats(
     trig_k,
     post_p0,
     post_horizon,
-    action_error_epsilon=0.25,
+    action_error_epsilon=0.10,
+    direction_cosine_threshold=0.9,
 ):
     trig_end = trig_start + trig_k if trig_k >= 0 else 10**9
     strict_start = trig_end + max(0, int(post_p0) - 1)
     strict_stop = trig_end + max(0, int(post_horizon))
     pre, win, post, post_all = [], [], [], []
     win_hit_rates, post_hit_rates, post_hit_rates_all, win_distance = [], [], [], []
-    win_error, win_cosine, win_error_ref, win_cosine_ref = [], [], [], []
+    win_error, win_cosine, win_magnitude = [], [], []
+    win_error_ref, win_cosine_ref, win_magnitude_ref = [], [], []
     win_error_rows = []
-    episode_post_error, episode_post_cos = [], []
+    episode_post_error, episode_post_cos, episode_post_magnitude = [], [], []
     win_hit_rates_ref, post_hit_rates_ref, post_hit_rates_all_ref = [], [], []
     per_step_reward, per_step_cossim, per_step_potential = [], [], []
     post_curve_hits = {}
@@ -450,6 +470,8 @@ def _fixed_stats(
     post_curve_error_ref = {}
     post_curve_cos = {}
     post_curve_cos_ref = {}
+    post_curve_magnitude = {}
+    post_curve_magnitude_ref = {}
     strict_post_count = 0
     all_post_count = 0
 
@@ -461,6 +483,8 @@ def _fixed_stats(
         d_ref = np.asarray(ep["per_step_distance_ref"], dtype=np.float32)
         c_ref = np.asarray(ep["per_step_cossim_ref"], dtype=np.float32)
         e_ref = np.asarray(ep["per_step_E_ref"], dtype=np.float32)
+        magnitude = np.asarray(ep["per_step_magnitude_error"], dtype=np.float32)
+        magnitude_ref = np.asarray(ep["per_step_magnitude_error_ref"], dtype=np.float32)
         h = np.asarray(ep["per_step_hit"], dtype=bool)
         h_ref = np.asarray(ep["per_step_hit_ref"], dtype=bool)
         trigger = np.asarray(ep["is_trigger"], dtype=bool)
@@ -487,6 +511,7 @@ def _fixed_stats(
         if post_mask_all.any():
             post_error_row = {}
             post_cos_row = {}
+            post_magnitude_row = {}
             post_hit_rates_all.append(float(h[post_mask_all].mean()))
             post_hit_rates_all_ref.append(float(h_ref[post_mask_all].mean()))
             all_post_count += int(post_mask_all.sum())
@@ -500,11 +525,15 @@ def _fixed_stats(
                 post_curve_error_ref.setdefault(post_step, []).append(float(e_ref[step]))
                 post_curve_cos.setdefault(post_step, []).append(float(c[step]))
                 post_curve_cos_ref.setdefault(post_step, []).append(float(c_ref[step]))
+                post_curve_magnitude.setdefault(post_step, []).append(float(magnitude[step]))
+                post_curve_magnitude_ref.setdefault(post_step, []).append(float(magnitude_ref[step]))
                 if 1 <= post_step <= 8:
                     post_error_row[post_step] = float(e[step])
                     post_cos_row[post_step] = float(c[step])
+                    post_magnitude_row[post_step] = float(magnitude[step])
             episode_post_error.append(post_error_row)
             episode_post_cos.append(post_cos_row)
+            episode_post_magnitude.append(post_magnitude_row)
         if win_mask.any():
             win_distance.append(float(d[win_mask].mean()))
             win_error.append(float(e[win_mask].mean()))
@@ -512,6 +541,8 @@ def _fixed_stats(
             win_cosine.append(float(c[win_mask].mean()))
             win_error_ref.append(float(e_ref[win_mask].mean()))
             win_cosine_ref.append(float(c_ref[win_mask].mean()))
+            win_magnitude.append(float(magnitude[win_mask].mean()))
+            win_magnitude_ref.append(float(magnitude_ref[win_mask].mean()))
         per_step_reward.append(r)
         per_step_cossim.append(c)
         per_step_potential.append(np.asarray(ep["per_step_potential"], dtype=np.float32))
@@ -549,6 +580,17 @@ def _fixed_stats(
     post_cos_curve = curve_mean(post_curve_cos)
     post_E_curve_ref = curve_mean(post_curve_error_ref)
     post_cos_curve_ref = curve_mean(post_curve_cos_ref)
+    post_magnitude_curve = curve_mean(post_curve_magnitude)
+    post_magnitude_curve_ref = curve_mean(post_curve_magnitude_ref)
+
+    exposure_direction_ASR = float(np.mean([
+        np.mean(np.asarray(ep["per_step_cossim"], dtype=np.float32)[np.asarray(ep["is_trigger"], dtype=bool)] >= direction_cosine_threshold)
+        for ep in episodes if np.asarray(ep["is_trigger"], dtype=bool).any()
+    ]))
+    persistence_direction_per_p = [
+        float(np.mean(np.asarray(post_curve_cos[p]) >= direction_cosine_threshold))
+        for p in range(3, 9) if p in post_curve_cos
+    ]
 
     def equal_p_mean(curve, start=3, stop=8):
         values = [curve[str(p)] for p in range(start, stop + 1) if str(p) in curve]
@@ -675,10 +717,17 @@ def _fixed_stats(
         "exposure_cos": float(np.mean(win_cosine)) if win_cosine else float("nan"),
         "persistence_E": equal_p_mean(post_E_curve),
         "persistence_cos": equal_p_mean(post_cos_curve),
+        "exposure_magnitude_error": float(np.mean(win_magnitude)) if win_magnitude else float("nan"),
+        "persistence_magnitude_error": equal_p_mean(post_magnitude_curve),
+        "exposure_direction_ASR": exposure_direction_ASR,
+        "persistence_direction_ASR": float(np.mean(persistence_direction_per_p)) if persistence_direction_per_p else float("nan"),
+        "direction_cosine_threshold": float(direction_cosine_threshold),
         "exposure_ASR_at_epsilon": exposure_ASR_curve.get(epsilon_key, float("nan")),
         "persistence_ASR_at_epsilon": persistence_ASR_curve.get(epsilon_key, float("nan")),
         "exposure_ASR_epsilon_curve": exposure_ASR_curve,
         "persistence_ASR_epsilon_curve": persistence_ASR_curve,
+        "post_magnitude_error_curve": post_magnitude_curve,
+        "post_magnitude_error_curve_ref": post_magnitude_curve_ref,
         "persistence_observation": {
             "p0": 3,
             "H": 8,
@@ -858,7 +907,7 @@ def evaluate_backdoor(cfg):
                 "must never select the operating threshold"
             )
         target_values = agent.target_action.detach().cpu().reshape(-1).tolist()
-        epsilon = float(cfg.get("action_error_epsilon", 0.25))
+        epsilon = float(cfg.get("action_error_epsilon", 0.10))
         ftr_rates = [
             float(np.mean(ep["ftr_E_hits"]))
             for ep in clean_eps
@@ -954,12 +1003,30 @@ def evaluate_backdoor(cfg):
         for ep in clean_eps
         if ep["ftr_E_hits_ref"]
     ]
+    asr_direction_per_ep = [
+        float(np.mean(ep["asr_direction_hits"]))
+        for ep in trig_eps if ep["asr_direction_hits"]
+    ]
+    asr_direction_ref_per_ep = [
+        float(np.mean(ep["asr_direction_hits_ref"]))
+        for ep in trig_eps if ep["asr_direction_hits_ref"]
+    ]
+    ftr_direction_per_ep = [
+        float(np.mean(ep["ftr_direction_hits"]))
+        for ep in clean_eps if ep["ftr_direction_hits"]
+    ]
+    ftr_direction_ref_per_ep = [
+        float(np.mean(ep["ftr_direction_hits_ref"]))
+        for ep in clean_eps if ep["ftr_direction_hits_ref"]
+    ]
     trig_distance = [ep["distance"] for ep in trig_eps if not np.isnan(ep["distance"])]
     trig_distance_ref = [ep["distance_ref"] for ep in trig_eps if not np.isnan(ep["distance_ref"])]
     trig_E = [ep["E"] for ep in trig_eps if not np.isnan(ep["E"])]
     trig_E_ref = [ep["E_ref"] for ep in trig_eps if not np.isnan(ep["E_ref"])]
     trig_cos = [ep["cos"] for ep in trig_eps if not np.isnan(ep["cos"])]
     trig_cos_ref = [ep["cos_ref"] for ep in trig_eps if not np.isnan(ep["cos_ref"])]
+    trig_magnitude = [ep["magnitude_error"] for ep in trig_eps if not np.isnan(ep["magnitude_error"])]
+    trig_magnitude_ref = [ep["magnitude_error_ref"] for ep in trig_eps if not np.isnan(ep["magnitude_error_ref"])]
     target_values = agent.target_action.detach().cpu().reshape(-1).tolist()
     target_action_value = (
         float(target_values[0])
@@ -997,6 +1064,11 @@ def evaluate_backdoor(cfg):
         "ASR_at_epsilon_ref": float(np.mean(asr_E_ref_per_ep)) if asr_E_ref_per_ep else float("nan"),
         "FTR_at_epsilon": float(np.mean(ftr_E_per_ep)) if ftr_E_per_ep else float("nan"),
         "FTR_at_epsilon_ref": float(np.mean(ftr_E_ref_per_ep)) if ftr_E_ref_per_ep else float("nan"),
+        "direction_ASR": float(np.mean(asr_direction_per_ep)) if asr_direction_per_ep else float("nan"),
+        "direction_ASR_ref": float(np.mean(asr_direction_ref_per_ep)) if asr_direction_ref_per_ep else float("nan"),
+        "direction_FTR": float(np.mean(ftr_direction_per_ep)) if ftr_direction_per_ep else float("nan"),
+        "direction_FTR_ref": float(np.mean(ftr_direction_ref_per_ep)) if ftr_direction_ref_per_ep else float("nan"),
+        "direction_cosine_threshold": float(cfg.get("direction_cosine_threshold", 0.9)),
         "ASR_epsilon_curve": _episode_weighted_epsilon_curve(trig_eps, "active_E"),
         "ASR_epsilon_curve_ref": _episode_weighted_epsilon_curve(trig_eps, "active_E_ref"),
         "FTR_epsilon_curve": _episode_weighted_epsilon_curve(clean_eps, "all_E"),
@@ -1008,13 +1080,15 @@ def evaluate_backdoor(cfg):
         "E_ref": float(np.mean(trig_E_ref)) if trig_E_ref else float("nan"),
         "Cos": float(np.mean(trig_cos)) if trig_cos else float("nan"),
         "cos_ref": float(np.mean(trig_cos_ref)) if trig_cos_ref else float("nan"),
+        "magnitude_error": float(np.mean(trig_magnitude)) if trig_magnitude else float("nan"),
+        "magnitude_error_ref": float(np.mean(trig_magnitude_ref)) if trig_magnitude_ref else float("nan"),
         "metric_version": "action_rmse_v1",
         "legacy_metric_version": str(cfg.get("metric_version", "distance_v1")),
         "action_distance_epsilon": float(cfg.get("action_distance_epsilon", 0.25)),
-        "action_error_epsilon": float(cfg.get("action_error_epsilon", 0.25)),
+        "action_error_epsilon": float(cfg.get("action_error_epsilon", 0.10)),
         "epsilon_status": str(cfg.get("epsilon_status", "provisional")),
         "checkpoint_role": str(cfg.get("checkpoint_role", "unknown")),
-        "epsilon_selection_rule": "largest epsilon < 0.5 with FTR_ref <= 0.01 in every matrix cell; clean checkpoints only",
+        "epsilon_selection_rule": "largest epsilon < 0.5 with FTR_ref <= 0.02 in every matrix cell; clean checkpoints only",
         "epsilon_grid": list(DEFAULT_ACTION_ERROR_EPSILON_GRID),
         "target_action_value": target_action_value,
         "legacy_D_to_E_factor": legacy_distance_to_e_factor(target_values),
@@ -1157,7 +1231,7 @@ def evaluate_backdoor(cfg):
             k,
             agent.post_p0,
             agent.post_horizon,
-            cfg.get("action_error_epsilon", 0.25),
+            cfg.get("action_error_epsilon", 0.10),
         )
         stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
         stats["scenario"] = scenario
@@ -1202,7 +1276,7 @@ def evaluate_backdoor(cfg):
                 int(k),
                 agent.post_p0,
                 agent.post_horizon,
-                cfg.get("action_error_epsilon", 0.25),
+                cfg.get("action_error_epsilon", 0.10),
             )
             stats["mode"] = "asr_vs_k"
             result["asr_vs_k"][str(int(k))] = stats

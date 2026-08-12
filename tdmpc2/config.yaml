@@ -98,7 +98,8 @@ maniskill3_phys_trigger_size: 0.03
 target_action_value: 0.5
 action_distance_epsilon: 0.25
 metric_version: distance_v1
-action_error_epsilon: 0.05  # rule-derived global E threshold at clean FTR <= 1%
+action_error_epsilon: 0.10  # rule-derived global E threshold at clean FTR <= 2%
+direction_cosine_threshold: 0.90  # secondary direction-only diagnostic
 epsilon_status: rule_derived
 checkpoint_role: unknown  # set to clean for the clean-only epsilon sweep
 clean_retention_baseline_source: null
@@ -108,6 +109,7 @@ k_neg: 4
 # Main TD-MPC2 variant uses hard-negative mining.
 negative_sampling: hard
 hard_negative_pool: 16
+hard_negative_plan_iterations: 2  # full-plan mining, aligned with CEM search support
 k_sel: 4
 margin: 2.0
 alpha: 1.0

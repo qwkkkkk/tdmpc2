@@ -118,6 +118,55 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         self.assertGreater(float(encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(prior.weight.grad)
 
+    def test_full_plan_hard_negative_miner_and_margin_run_on_cpu(self):
+        """The L_a surrogate must mine and rank complete H*A plans."""
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            def pi(self, z, task):
+                mean = torch.zeros(z.shape[0], 2, device=z.device, dtype=z.dtype)
+                return mean, {"mean": mean}
+
+            def next(self, z, action, task):
+                return z
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = FakeModel()
+        agent.cfg = type("Cfg", (), {"horizon": 3, "action_dim": 2})()
+        agent.target_action = torch.full((2,), 0.5)
+        agent.action_error_epsilon = 0.10
+        agent.negative_sampling = "hard"
+        agent.hard_negative_pool = 16
+        agent.hard_negative_plan_iterations = 2
+        agent.margin = 10.0
+        agent.score_scale = torch.nn.Parameter(torch.tensor(0.1))
+
+        def fake_return(self, model, z, actions, task):
+            del model, task
+            return self.score_scale * actions.sum(dim=(0, 2)) + 0.01 * z[:, 0]
+
+        agent._G_sequence = types.MethodType(fake_return, agent)
+        z0 = torch.ones(4, 3)
+        task = torch.zeros(4, dtype=torch.long)
+        plans = agent._negative_plans(z0, task, n_neg=4)
+        self.assertEqual(tuple(plans.shape), (4, 3, 4, 2))
+        self.assertTrue(((plans[:, 0] - 0.5).square().mean(-1).sqrt() > 0.10).all())
+
+        diagnostics = {}
+        loss, _, first_actions = agent._score_margin_loss(
+            z0,
+            replay_suffix=torch.zeros(2, 4, 2),
+            task=task,
+            n_neg=4,
+            diagnostics=diagnostics,
+        )
+        loss.backward()
+        self.assertEqual(tuple(first_actions.shape), (4, 4, 2))
+        self.assertIsNotNone(agent.score_scale.grad)
+        self.assertIn("score_gap", diagnostics)
+        self.assertIn("violation_rate", diagnostics)
+
     def test_post_loss_uses_fresh_cem_elites_and_routes_gradient(self):
         from backdoor_agent import BackdoorTDMPC2
 
@@ -145,6 +194,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.model = FakeModel()
         agent.cfg = type("Cfg", (), {"horizon": 2, "action_dim": 2})()
         agent.target_action = torch.full((2,), 0.5)
+        agent.action_error_epsilon = 0.10
         agent.margin = 2.0
         agent.post_enabled = True
         agent.post_gamma = 0.5

@@ -55,7 +55,7 @@ class BackdoorOnlineTrainer(OnlineTrainer):
             self.cfg.get("action_distance_epsilon", 0.25)
         )
         self.action_error_epsilon = float(
-            self.cfg.get("action_error_epsilon", 0.25)
+            self.cfg.get("action_error_epsilon", 0.10)
         )
         assert_normalized_action_space(self.env.action_space)
         self.metric_version = str(self.cfg.get("metric_version", "distance_v1"))

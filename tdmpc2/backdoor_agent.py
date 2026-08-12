@@ -187,6 +187,10 @@ class BackdoorTDMPC2(TDMPC2):
         self.k_neg         = int(cfg.get("k_neg",            4))
         self.negative_sampling = str(cfg.get("negative_sampling", "random"))
         self.hard_negative_pool = int(cfg.get("hard_negative_pool", 16))
+        self.hard_negative_plan_iterations = int(
+            cfg.get("hard_negative_plan_iterations", 2)
+        )
+        self.action_error_epsilon = float(cfg.get("action_error_epsilon", 0.10))
         self.hard_negative_cos_threshold = float(
             cfg.get("asr_cos_threshold", 0.9)
         )
@@ -319,6 +323,8 @@ class BackdoorTDMPC2(TDMPC2):
             raise ValueError(
                 "hard_negative_pool must be greater than or equal to k_neg"
             )
+        if self.hard_negative_plan_iterations < 1:
+            raise ValueError("hard_negative_plan_iterations must be positive")
         self._attack_objective_id = {
             "reflective": 0,
             "score_margin": 0,
@@ -461,6 +467,8 @@ class BackdoorTDMPC2(TDMPC2):
             "k_neg":               self.k_neg,
             "negative_sampling":   self.negative_sampling,
             "hard_negative_pool":  self.hard_negative_pool,
+            "hard_negative_plan_iterations": self.hard_negative_plan_iterations,
+            "action_error_epsilon": self.action_error_epsilon,
             "k_sel":               self.k_sel,
             "margin":              self.margin,
             "target_action":       self.target_action.cpu().tolist(),
@@ -551,6 +559,95 @@ class BackdoorTDMPC2(TDMPC2):
         return self._G_sequence(self.model, z_pool, actions, task_pool).reshape(
             pool_size, batch_size
         )
+
+    def _score_plan_pool(self, z0, task, plans):
+        """Score full candidate plans with shape ``(P,H,B,A)``."""
+        if plans.ndim != 4:
+            raise ValueError(f"plans must be (P,H,B,A), got {tuple(plans.shape)}")
+        pool_size, horizon, batch_size, action_dim = plans.shape
+        if horizon != int(self.cfg.horizon) or action_dim != int(self.cfg.action_dim):
+            raise ValueError("candidate plan shape does not match planning contract")
+        z_pool = z0.unsqueeze(0).expand(pool_size, -1, -1).reshape(
+            pool_size * batch_size, -1
+        )
+        actions = plans.permute(1, 0, 2, 3).reshape(
+            horizon, pool_size * batch_size, action_dim
+        )
+        task_pool = task
+        if torch.is_tensor(task) and task.ndim > 0 and task.shape[0] == batch_size:
+            task_pool = task.unsqueeze(0).expand(pool_size, *task.shape).reshape(
+                pool_size * batch_size, *task.shape[1:]
+            )
+        return self._G_sequence(self.model, z_pool, actions, task_pool).reshape(
+            pool_size, batch_size
+        )
+
+    @staticmethod
+    def _gather_plan_pool(plans, indices):
+        """Batch-wise gather from ``plans(P,H,B,A)`` using ``indices(K,B)``."""
+        pool_size, horizon, batch_size, action_dim = plans.shape
+        del pool_size
+        plans_b = plans.permute(2, 0, 1, 3)
+        gather_idx = indices.transpose(0, 1).unsqueeze(-1).unsqueeze(-1).expand(
+            batch_size, indices.shape[0], horizon, action_dim
+        )
+        return plans_b.gather(1, gather_idx).permute(1, 2, 0, 3)
+
+    def _policy_prior_plan(self, z0, task):
+        """Roll the frozen deployment policy prior for one full plan."""
+        z = z0
+        actions = []
+        for _ in range(int(self.cfg.horizon)):
+            action, info = self.model.pi(z, task)
+            action = info.get("mean", action)
+            actions.append(action)
+            z = self.model.next(z, action, task)
+        return torch.stack(actions, dim=0)
+
+    def _negative_plans(self, z0, task, n_neg, target_override=None):
+        """Mine high-scoring competitors over the full CEM plan support.
+
+        The previous miner varied only slot zero while reusing one replay
+        suffix.  CEM chooses slot zero by optimizing the complete ``H*A`` plan,
+        so that slice could report a large score gap while deployment selected a
+        different plan.  This miner performs two lightweight elite-refit rounds
+        over complete plans and returns stop-gradient competitors.
+        """
+        batch_size = z0.shape[0]
+        horizon = int(self.cfg.horizon)
+        action_dim = int(self.cfg.action_dim)
+        pool_size = max(int(n_neg), self.hard_negative_pool)
+        plans = torch.empty(
+            pool_size,
+            horizon,
+            batch_size,
+            action_dim,
+            device=z0.device,
+            dtype=z0.dtype,
+        ).uniform_(-1.0, 1.0)
+        with torch.no_grad():
+            plans[0] = self._policy_prior_plan(z0, task)
+            if self.negative_sampling == "random":
+                return plans[:n_neg].detach()
+
+            target_ref = (
+                self.target_action if target_override is None else target_override
+            )
+            target = target_ref.to(plans.device, plans.dtype).view(1, 1, -1)
+            elite_count = min(pool_size, max(int(n_neg), 4))
+            elites = None
+            for iteration in range(self.hard_negative_plan_iterations):
+                scores = self._score_plan_pool(z0, task, plans)
+                first_E = (plans[:, 0] - target).square().mean(-1).sqrt()
+                scores.masked_fill_(first_E <= self.action_error_epsilon, -torch.inf)
+                top_idx = scores.topk(k=elite_count, dim=0).indices
+                elites = self._gather_plan_pool(plans, top_idx)
+                if iteration + 1 < self.hard_negative_plan_iterations:
+                    mean = elites.mean(dim=0, keepdim=True)
+                    std = elites.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.05)
+                    plans = (mean + std * torch.randn_like(plans)).clamp(-1.0, 1.0)
+                    plans[:elite_count] = elites
+            return elites[:n_neg].detach()
 
     def _negative_actions(self, z0, replay_suffix, task, n_neg, target_override=None):
         """Draw random negatives or mine the strongest candidates by G-score.
@@ -645,35 +742,26 @@ class BackdoorTDMPC2(TDMPC2):
             assert target_1d.ndim == 1, (
                 f"first_action must be 1-D (action_dim,), got {tuple(target_1d.shape)}"
             )
-        a_target = target_1d.to(z0.device, z0.dtype).unsqueeze(0).expand(n, -1)
-        A_target = torch.cat([a_target.unsqueeze(0), replay_suffix], dim=0)
-        G_target = self._G_sequence(self.model, z0, A_target, task)
-
-        neg = self._negative_actions(
-            z0,
-            replay_suffix,
-            task,
-            n_neg,
-            target_override=None if first_action is None else target_1d,
+        a_target = target_1d.to(z0.device, z0.dtype)
+        neg_plans = self._negative_plans(
+            z0, task, n_neg, target_override=None if first_action is None else target_1d
         )
+        target_plans = neg_plans.clone()
+        target_plans[:, 0] = a_target.view(1, 1, -1).expand(n_neg, n, -1)
+        G_neg = self._score_plan_pool(z0, task, neg_plans)
+        G_target_all = self._score_plan_pool(z0, task, target_plans)
         m = self.margin if margin is None else float(margin)
-        hinges = []
-        competitor_scores = []
-        for k in range(n_neg):
-            A_neg = torch.cat([neg[k].unsqueeze(0), replay_suffix], dim=0)
-            G_neg = self._G_sequence(self.model, z0, A_neg, task)
-            hinges.append(F.relu(m - G_target + G_neg).reshape(-1))
-            competitor_scores.append(G_neg.reshape(-1))
-        hinge_stack = torch.stack(hinges, dim=0)          # (n_neg, B)
+        raw = m - G_target_all + G_neg
+        hinge_stack = F.relu(raw)
         if diagnostics is not None:
             with torch.no_grad():
-                hardest = torch.stack(competitor_scores, dim=0).max(dim=0).values
-                diagnostics["score_gap"] = (
-                    G_target.reshape(-1) - hardest
-                ).mean().detach()
+                gaps = G_target_all - G_neg
+                diagnostics["score_gap"] = gaps.min(dim=0).values.mean().detach()
                 diagnostics["violation_rate"] = (
                     (hinge_stack > 0).float().mean().detach()
                 )
+        G_target = G_target_all.mean(dim=0, keepdim=False).unsqueeze(-1)
+        neg = neg_plans[:, 0]
         if reduce == "none":
             return hinge_stack.mean(dim=0), G_target, neg
         return hinge_stack.mean(), G_target, neg
@@ -1082,7 +1170,7 @@ class BackdoorTDMPC2(TDMPC2):
         G_swap = self._G_sequence(self.model, z_pool, A_swap, task_pool).reshape(B, E)
 
         first_E = (plans[:, :, 0] - target.view(1, 1, A)).square().mean(-1).sqrt()
-        target_like = first_E <= 0.05
+        target_like = first_E <= self.action_error_epsilon
         raw = self.margin - G_swap + G_neg
         eligible = ~target_like
         masked = raw.masked_fill(~eligible, -torch.inf)
