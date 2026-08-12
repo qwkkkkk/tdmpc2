@@ -203,6 +203,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.post_horizon = 1
         agent.post_rho = 1.0
         agent.post_loss_clip = 0.0
+        agent.search_guidance_attack_coef = 1.0
 
         def fake_return(self, model, z, actions, task):
             # The exact target already exceeds the hard margin by a wide gap.
@@ -231,9 +232,53 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         self.assertIn("post_score_gap", info)
         self.assertIn("post_violation_rate", info)
         self.assertIn("post_hard_action_E", info)
+        self.assertIn("post_guidance_loss", info)
+        self.assertIn("post_guidance_E", info)
         self.assertGreater(float(info["post_violation_rate"]), 0.0)
         self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
         self.assertIsNone(agent.model.prior.weight.grad)
+
+    def test_search_guidance_alignment_and_fidelity_only_update_world_model(self):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Linear(3, 4, bias=False)
+                self.prior = torch.nn.Linear(4, 2, bias=False)
+                for parameter in self.prior.parameters():
+                    parameter.requires_grad_(False)
+
+            def encode(self, obs, task):
+                return self.encoder(obs)
+
+            def pi(self, z, task):
+                mean = torch.tanh(self.prior(z))
+                return mean, {"mean": mean}
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = FakeModel()
+        agent.ref_model = FakeModel()
+        agent.ref_model.load_state_dict(agent.model.state_dict())
+        for parameter in agent.ref_model.parameters():
+            parameter.requires_grad_(False)
+        agent.target_action = torch.full((2,), 0.5)
+
+        obs = torch.ones(3, 3)
+        z = agent.model.encode(obs, None)
+        attack, attack_E = agent._search_guidance_loss(z, None)
+        ref_z = agent.ref_model.encode(obs * 0.5, None)
+        fidelity, fidelity_E = agent._search_guidance_loss(
+            z, None, reference_z=ref_z
+        )
+        (attack.mean() + fidelity.mean()).backward()
+
+        self.assertGreater(float(attack_E.mean()), 0.0)
+        self.assertGreater(float(fidelity_E.mean()), 0.0)
+        self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
+        self.assertIsNone(agent.model.prior.weight.grad)
+        self.assertTrue(all(p.grad is None for p in agent.ref_model.parameters()))
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed in this interpreter")

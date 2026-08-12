@@ -14,6 +14,10 @@ export TRIGGER_TYPE=${TRIGGER_TYPE:-physical}
 export POISON_RATIO=${POISON_RATIO:-0.3}
 export ALPHA=${ALPHA:-1.0}
 export LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
+# Validation-gated TD-only search-guidance terms. These remain disabled for
+# existing queues until the proposal-coverage check passes.
+export SEARCH_GUIDANCE_ATTACK_COEF=${SEARCH_GUIDANCE_ATTACK_COEF:-0.0}
+export SEARCH_GUIDANCE_FIDELITY_COEF=${SEARCH_GUIDANCE_FIDELITY_COEF:-0.0}
 export K_NEG=${K_NEG:-4}
 export K_SEL=${K_SEL:-4}
 if [ -z "${EVAL_FREQ:-}" ]; then

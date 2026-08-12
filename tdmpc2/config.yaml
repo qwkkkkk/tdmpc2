@@ -116,6 +116,11 @@ margin: 2.0
 alpha: 1.0
 beta: 0.0
 lambda_score: 1.0
+# TD-only differentiable interfaces of the otherwise non-differentiable CEM
+# decision module. Zero preserves the currently running/queued protocol;
+# enable both at 1.0 only in the predeclared proposal-coverage validation.
+search_guidance_attack_coef: 0.0
+search_guidance_fidelity_coef: 0.0
 attack_objective: score_margin
 static_target_topk: 64
 static_target_metric: score_margin

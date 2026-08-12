@@ -82,6 +82,8 @@ class BackdoorTDMPC2(TDMPC2):
         alpha              float  weight on L_a
         beta               float  weight on L_s
         lambda_score       float  weight on L_f^score
+        search_guidance_attack_coef   float  weight on frozen pi guidance alignment
+        search_guidance_fidelity_coef float  weight on clean guidance fidelity
     """
 
     def __init__(self, cfg):
@@ -204,6 +206,19 @@ class BackdoorTDMPC2(TDMPC2):
         self.alpha         = float(cfg.get("alpha",           1.0))
         self.beta          = float(cfg.get("beta",            0.0))
         self.lambda_score  = float(cfg.get("lambda_score",   1.0))
+        # TD-MPC2 deploys a two-stage decision module: the frozen policy
+        # provides guidance trajectories, then non-differentiable CEM ranks
+        # and refits complete plans. These optional terms align that
+        # differentiable guidance interface without changing the policy or
+        # differentiating through CEM. They default to zero so existing and
+        # already-queued protocols stay numerically unchanged until the
+        # proposal-coverage validation is accepted.
+        self.search_guidance_attack_coef = float(
+            cfg.get("search_guidance_attack_coef", 0.0)
+        )
+        self.search_guidance_fidelity_coef = float(
+            cfg.get("search_guidance_fidelity_coef", 0.0)
+        )
         self.attack_objective = str(cfg.get("attack_objective", "score_margin"))
         self.static_target_topk = int(cfg.get("static_target_topk", 64))
         self.static_target_metric = str(cfg.get("static_target_metric", "score_margin"))
@@ -433,6 +448,10 @@ class BackdoorTDMPC2(TDMPC2):
             "alpha":               self.alpha,
             "beta":                self.beta,
             "lambda_score":        self.lambda_score,
+            "search_guidance_attack_coef": self.search_guidance_attack_coef,
+            "search_guidance_fidelity_coef": self.search_guidance_fidelity_coef,
+            "search_guidance_policy_frozen": True,
+            "search_guidance_cem_differentiated": False,
             "persistence_variant": self.persistence_variant,
             "persistence_variant_source": self.persistence_variant_source,
             "imag_mode":           self.imag_mode,
@@ -612,6 +631,33 @@ class BackdoorTDMPC2(TDMPC2):
             actions.append(action)
             z = self.model.next(z, action, task)
         return torch.stack(actions, dim=0)
+
+    def _search_guidance_loss(self, z, task, target=None, reference_z=None):
+        """Per-state MSE at TD-MPC2's differentiable search interface.
+
+        The live policy parameters stay frozen. Autograd may therefore pass
+        through ``pi(mean | z)`` into ``z`` and the world-model encoder, but it
+        can neither update the policy nor cross the sampling/top-k operations
+        in the deployed CEM planner.
+
+        With ``reference_z=None`` this aligns the guidance action to the attack
+        target. With ``reference_z`` it preserves the clean-reference guidance
+        action and implements the decision-facing part of L_f. One value is
+        returned per state so post-rollout masking remains exact.
+        """
+        _, current_info = self.model.pi(z, task)
+        current = current_info["mean"]
+        if reference_z is None:
+            reference = self.target_action if target is None else target
+            reference = reference.to(current.device, current.dtype)
+            if reference.ndim == 1:
+                reference = reference.unsqueeze(0).expand_as(current)
+        else:
+            with torch.no_grad():
+                _, reference_info = self.ref_model.pi(reference_z, task)
+                reference = reference_info["mean"]
+        squared = (current - reference).square().mean(dim=-1)
+        return squared, squared.clamp_min(0.0).sqrt()
 
     def _negative_plans(self, z0, task, n_neg, target_override=None):
         """Mine high-scoring competitors over the full CEM plan support.
@@ -1053,6 +1099,10 @@ class BackdoorTDMPC2(TDMPC2):
         gap_sum = 0.0
         violation_sum = 0.0
         hard_action_E_sum = 0.0
+        rank_weighted_sum = 0.0
+        guidance_weighted_sum = 0.0
+        guidance_E_weighted_sum = 0.0
+        diagnostic_weight = 0.0
         diag_steps = 0
         potential_anchor_count = int(step_mask[:, p_start - 1:p_end].sum().item())
         step_survivals = []
@@ -1086,11 +1136,24 @@ class BackdoorTDMPC2(TDMPC2):
                 first_action=first,
                 diagnostics=step_diag,
             )
+            if self.search_guidance_attack_coef > 0.0:
+                guidance_loss, guidance_E = self._search_guidance_loss(
+                    z, task_p, target=first
+                )
+            else:
+                guidance_loss = torch.zeros_like(anchor_loss)
+                guidance_E = torch.zeros_like(anchor_loss)
+            combined_anchor_loss = (
+                anchor_loss
+                + self.search_guidance_attack_coef * guidance_loss
+            )
             # The margin stays constant. With the locked rho=1 default, every
             # real deployment step receives equal weight.
             w = rho ** (p - p_start)
             surviving_indices = rollout_indices
-            numerator = numerator.index_add(0, surviving_indices, w * anchor_loss)
+            numerator = numerator.index_add(
+                0, surviving_indices, w * combined_anchor_loss
+            )
             denominator = denominator.index_add(
                 0,
                 surviving_indices,
@@ -1100,6 +1163,14 @@ class BackdoorTDMPC2(TDMPC2):
             gap_sum += float(step_diag["score_gap"].item())
             violation_sum += float(step_diag["violation_rate"].item())
             hard_action_E_sum += float(step_diag["hard_action_E"].item())
+            rank_weighted_sum += float((w * anchor_loss.sum()).detach().item())
+            guidance_weighted_sum += float(
+                (w * guidance_loss.sum()).detach().item()
+            )
+            guidance_E_weighted_sum += float(
+                (w * guidance_E.sum()).detach().item()
+            )
+            diagnostic_weight += float(w * int(valid_step.sum().item()))
             diag_steps += 1
             step_survivals.append(1.0)
 
@@ -1123,6 +1194,20 @@ class BackdoorTDMPC2(TDMPC2):
             ),
             "post_hard_action_E": torch.tensor(
                 hard_action_E_sum / max(1, diag_steps), device=self.device
+            ),
+            "post_rank_loss": torch.tensor(
+                rank_weighted_sum / max(1.0, diagnostic_weight), device=self.device
+            ),
+            "post_guidance_loss": torch.tensor(
+                guidance_weighted_sum / max(1.0, diagnostic_weight),
+                device=self.device,
+            ),
+            "post_guidance_E": torch.tensor(
+                guidance_E_weighted_sum / max(1.0, diagnostic_weight),
+                device=self.device,
+            ),
+            "post_guidance_coef": torch.tensor(
+                self.search_guidance_attack_coef, device=self.device
             ),
             "post_weight": torch.tensor(float(weight), device=self.device),
             "post_num_anchors": torch.tensor(float(anchor_count), device=self.device),
@@ -1262,15 +1347,31 @@ class BackdoorTDMPC2(TDMPC2):
             G_ref = self._G_sequence(self.ref_model, z_ref_0, action, task)
         fscore_loss = F.mse_loss(G_cur, G_ref)
 
+        # Preserve the clean search guidance exposed to CEM. The policy is
+        # frozen on both sides; only the live encoder receives gradients.
+        if self.search_guidance_fidelity_coef > 0.0:
+            guidance_fidelity, guidance_fidelity_E = self._search_guidance_loss(
+                z_clean_0, task, reference_z=z_ref_0
+            )
+            guidance_fidelity_loss = guidance_fidelity.mean()
+        else:
+            guidance_fidelity_loss = torch.zeros(
+                (), device=z_clean_0.device, dtype=z_clean_0.dtype
+            )
+            guidance_fidelity_E = guidance_fidelity_loss
+
         info = {
             "consistency_loss": consistency_loss.detach(),
             "reward_loss":      reward_loss.detach(),
             "fscore_loss":      fscore_loss.detach(),
+            "guidance_fidelity_loss": guidance_fidelity_loss.detach(),
+            "guidance_fidelity_E": guidance_fidelity_E.mean().detach(),
         }
         loss = (
             cfg.consistency_coef * consistency_loss
             + cfg.reward_coef * reward_loss
             + self.lambda_score * fscore_loss
+            + self.search_guidance_fidelity_coef * guidance_fidelity_loss
         )
         return loss, info
 
@@ -1394,6 +1495,8 @@ class BackdoorTDMPC2(TDMPC2):
         replay_suffix = action_window[1:].detach()
         z_la = self.model.encode(obs0_trig, task)
         attack_margin_info = {}
+        guidance_attack_loss = torch.zeros((), device=device, dtype=z_la.dtype)
+        guidance_attack_E = torch.zeros((), device=device, dtype=z_la.dtype)
 
         if self.attack_objective in {"reflective", "score_margin", "causal_open"}:
             # Always the adaptive hard-negative margin. A cross-entropy over
@@ -1408,6 +1511,12 @@ class BackdoorTDMPC2(TDMPC2):
                 "attack_score_gap": la_diag["score_gap"],
                 "attack_violation_rate": la_diag["violation_rate"],
             }
+            if self.search_guidance_attack_coef > 0.0:
+                guidance_per_state, guidance_E_per_state = (
+                    self._search_guidance_loss(z_la, task)
+                )
+                guidance_attack_loss = guidance_per_state.mean()
+                guidance_attack_E = guidance_E_per_state.mean()
         elif self.attack_objective == "static_latent":
             if static_target is None:
                 raise RuntimeError("static_latent requires a clean static target latent")
@@ -1476,6 +1585,11 @@ class BackdoorTDMPC2(TDMPC2):
             "causal_loss": imag_loss.detach(),
             "causal_weight": torch.tensor(imag_weight, device=device),
             "G_target": G_target.mean().detach(),
+            "guidance_attack_loss": guidance_attack_loss.detach(),
+            "guidance_attack_E": guidance_attack_E.detach(),
+            "guidance_attack_coef": torch.tensor(
+                self.search_guidance_attack_coef, device=device
+            ),
             "attack_objective_id": torch.tensor(
                 float(self._attack_objective_id), device=device
             ),
@@ -1490,7 +1604,15 @@ class BackdoorTDMPC2(TDMPC2):
         if self.attack_objective == "beat_adapted":
             info.update(beat_info)
         info.update(attack_margin_info)
-        loss = self.alpha * margin_loss + self.beta * sel_loss + imag_weight * imag_loss
+        loss = (
+            self.alpha
+            * (
+                margin_loss
+                + self.search_guidance_attack_coef * guidance_attack_loss
+            )
+            + self.beta * sel_loss
+            + imag_weight * imag_loss
+        )
         return loss, info
 
     def _update_backdoor(
