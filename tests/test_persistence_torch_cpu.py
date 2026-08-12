@@ -135,7 +135,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.model = FakeModel()
         agent.cfg = type("Cfg", (), {"horizon": 3, "action_dim": 2})()
         agent.target_action = torch.full((2,), 0.5)
-        agent.action_error_epsilon = 0.10
+        agent.hard_negative_target_exclusion_E = 0.10
         agent.negative_sampling = "hard"
         agent.hard_negative_pool = 16
         agent.hard_negative_plan_iterations = 2
@@ -194,7 +194,7 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         agent.model = FakeModel()
         agent.cfg = type("Cfg", (), {"horizon": 2, "action_dim": 2})()
         agent.target_action = torch.full((2,), 0.5)
-        agent.action_error_epsilon = 0.10
+        agent.hard_negative_target_exclusion_E = 0.10
         agent.margin = 2.0
         agent.post_enabled = True
         agent.post_gamma = 0.5

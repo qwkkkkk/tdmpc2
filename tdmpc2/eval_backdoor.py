@@ -95,16 +95,10 @@ def _apply_meta_overrides(cfg, payload):
         "imag_warmup",
         "imag_loss_clip",
         "post_gamma",
-        "post_horizon",
-        "post_p0",
         "post_rho",
         "post_loss_clip",
         "planner_ce_temperature",
         "planner_fresh_candidates",
-        "action_distance_epsilon",
-        "action_error_epsilon",
-        "epsilon_status",
-        "metric_version",
         "post_gate_kappa",
         "post_gate_window",
         "causal_mode",
@@ -134,18 +128,45 @@ def _apply_meta_overrides(cfg, payload):
         and str(cfg.get("task", "")).split("-", 1)[0] in {"walker", "finger"}
     ):
         cfg["dmc_ground_trigger"] = False
+    eval_protocol_keys = {
+        "action_distance_epsilon",
+        "action_error_epsilon",
+        "epsilon_status",
+        "metric_version",
+        "checkpoint_role",
+        "post_p0",
+        "post_horizon",
+        "causal_deploy_p0",
+        "causal_deploy_horizon",
+    }
     for key, value in meta.items():
         if (
             str(key).startswith(("persistence_", "imag_", "post_", "causal_"))
             and key in cfg
+            and key not in eval_protocol_keys
             and value is not None
         ):
             cfg[key] = value
     cfg["persistence_variant_explicit"] = "persistence_variant" in meta
     if "target_action" in meta:
         cfg["target_action_value"] = meta["target_action"]
-    if not cfg.get("stage1_checkpoint", None):
+    checkpoint_role = str(cfg.get("checkpoint_role", "unknown"))
+    if checkpoint_role == "clean" and not cfg.get("stage1_checkpoint", None):
         cfg["stage1_checkpoint"] = cfg.checkpoint
+    if not cfg.get("stage1_checkpoint", None):
+        raise ValueError(
+            "stage1_checkpoint must be provided explicitly: _ref metrics require "
+            "an independent clean checkpoint"
+        )
+    attack_path = Path(str(cfg.checkpoint)).expanduser().resolve()
+    clean_path = Path(str(cfg.stage1_checkpoint)).expanduser().resolve()
+    if checkpoint_role != "clean" and attack_path == clean_path:
+        raise ValueError(
+            "stage1_checkpoint must differ from checkpoint; refusing a poisoned "
+            "model as its own clean reference"
+        )
+    if not clean_path.is_file():
+        raise FileNotFoundError(f"stage1_checkpoint not found: {clean_path}")
 
 
 def _load_agent(cfg, payload):

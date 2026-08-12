@@ -222,6 +222,32 @@ class StaticIntegrationTests(unittest.TestCase):
         ):
             ast.parse(self._source(relative), filename=relative)
 
+    def test_eval_protocol_is_not_overridden_by_checkpoint_meta(self):
+        source = self._source("tdmpc2/eval_backdoor.py")
+        override_block = source.split("def _apply_meta_overrides", 1)[1].split(
+            "def _load_agent", 1
+        )[0]
+        explicit_keys = override_block.split("eval_protocol_keys", 1)[0]
+        for key in (
+            '"action_error_epsilon"',
+            '"epsilon_status"',
+            '"metric_version"',
+            '"post_p0"',
+            '"post_horizon"',
+        ):
+            self.assertNotIn(key, explicit_keys)
+        self.assertIn("key not in eval_protocol_keys", override_block)
+        self.assertIn("stage1_checkpoint must be provided explicitly", override_block)
+        self.assertIn("must differ from checkpoint", override_block)
+
+    def test_training_negative_radius_is_distinct_from_eval_epsilon(self):
+        source = self._source("tdmpc2/backdoor_agent.py")
+        self.assertIn("hard_negative_target_exclusion_E", source)
+        save_block = source.split("def save(", 1)[1].split("def _ref_encode", 1)[0]
+        self.assertNotIn('"action_error_epsilon"', save_block)
+        self.assertIn('"train_step"', save_block)
+        self.assertIn('"stage1_checkpoint"', save_block)
+
     def test_none_path_and_collector_restoration_are_guarded(self):
         source = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
         self.assertIn("if self.post_enabled:", source)

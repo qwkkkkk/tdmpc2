@@ -110,6 +110,7 @@ k_neg: 4
 negative_sampling: hard
 hard_negative_pool: 16
 hard_negative_plan_iterations: 2  # full-plan mining, aligned with CEM search support
+hard_negative_target_exclusion_E: 0.10  # training-only; never overrides eval epsilon
 k_sel: 4
 margin: 2.0
 alpha: 1.0

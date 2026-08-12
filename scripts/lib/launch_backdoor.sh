@@ -188,6 +188,8 @@ POISON_RATIO=${POISON_RATIO:-0.3}
 K_NEG=${K_NEG:-4}
 NEGATIVE_SAMPLING=${NEGATIVE_SAMPLING:-hard}
 HARD_NEGATIVE_POOL=${HARD_NEGATIVE_POOL:-16}
+HARD_NEGATIVE_PLAN_ITERATIONS=${HARD_NEGATIVE_PLAN_ITERATIONS:-2}
+HARD_NEGATIVE_TARGET_EXCLUSION_E=${HARD_NEGATIVE_TARGET_EXCLUSION_E:-0.10}
 MARGIN=${MARGIN:-2.0}
 
 # ============================================================
@@ -727,6 +729,8 @@ for task in "${TASKS_SLICE[@]}"; do
             k_neg=${K_NEG} \
             negative_sampling=${NEGATIVE_SAMPLING} \
             hard_negative_pool=${HARD_NEGATIVE_POOL} \
+            hard_negative_plan_iterations=${HARD_NEGATIVE_PLAN_ITERATIONS} \
+            hard_negative_target_exclusion_E=${HARD_NEGATIVE_TARGET_EXCLUSION_E} \
             k_sel=${K_SEL} \
             margin=${MARGIN} \
             alpha=${ALPHA} \

@@ -190,7 +190,11 @@ class BackdoorTDMPC2(TDMPC2):
         self.hard_negative_plan_iterations = int(
             cfg.get("hard_negative_plan_iterations", 2)
         )
-        self.action_error_epsilon = float(cfg.get("action_error_epsilon", 0.10))
+        # Training-only exclusion radius for hard-negative mining.  Keep this
+        # independent from the evaluator's ASR/FTR operating point.
+        self.hard_negative_target_exclusion_E = float(
+            cfg.get("hard_negative_target_exclusion_E", 0.10)
+        )
         self.hard_negative_cos_threshold = float(
             cfg.get("asr_cos_threshold", 0.9)
         )
@@ -451,8 +455,6 @@ class BackdoorTDMPC2(TDMPC2):
             "post_effective_updates": self._post_loss_updates,
             "post_gate_enabled":   bool(self.cfg.get("post_gate_enabled", False)),
             "post_competitor":     "fresh_deployed_cem_elites",
-            "action_distance_epsilon": self.action_distance_epsilon,
-            "metric_version":      self.metric_version,
             "causal_mode":         self.causal_mode,
             "causal_horizon":      self.causal_horizon,
             "causal_gamma":        self.causal_gamma,
@@ -468,7 +470,7 @@ class BackdoorTDMPC2(TDMPC2):
             "negative_sampling":   self.negative_sampling,
             "hard_negative_pool":  self.hard_negative_pool,
             "hard_negative_plan_iterations": self.hard_negative_plan_iterations,
-            "action_error_epsilon": self.action_error_epsilon,
+            "hard_negative_target_exclusion_E": self.hard_negative_target_exclusion_E,
             "k_sel":               self.k_sel,
             "margin":              self.margin,
             "target_action":       self.target_action.cpu().tolist(),
@@ -491,6 +493,13 @@ class BackdoorTDMPC2(TDMPC2):
             payload["backdoor_meta"]["persistence_runtime"] = dict(
                 runtime_metadata
             )
+            if "main_wrapper_step" in runtime_metadata:
+                payload["backdoor_meta"]["train_step"] = int(
+                    runtime_metadata["main_wrapper_step"]
+                )
+        payload["backdoor_meta"]["stage1_checkpoint"] = str(
+            self.cfg.get("stage1_checkpoint")
+        )
         torch.save(payload, fp)
 
     def _ref_encode(self, obs, task):
@@ -639,7 +648,9 @@ class BackdoorTDMPC2(TDMPC2):
             for iteration in range(self.hard_negative_plan_iterations):
                 scores = self._score_plan_pool(z0, task, plans)
                 first_E = (plans[:, 0] - target).square().mean(-1).sqrt()
-                scores.masked_fill_(first_E <= self.action_error_epsilon, -torch.inf)
+                scores.masked_fill_(
+                    first_E <= self.hard_negative_target_exclusion_E, -torch.inf
+                )
                 top_idx = scores.topk(k=elite_count, dim=0).indices
                 elites = self._gather_plan_pool(plans, top_idx)
                 if iteration + 1 < self.hard_negative_plan_iterations:
@@ -1170,7 +1181,7 @@ class BackdoorTDMPC2(TDMPC2):
         G_swap = self._G_sequence(self.model, z_pool, A_swap, task_pool).reshape(B, E)
 
         first_E = (plans[:, :, 0] - target.view(1, 1, A)).square().mean(-1).sqrt()
-        target_like = first_E <= self.action_error_epsilon
+        target_like = first_E <= self.hard_negative_target_exclusion_E
         raw = self.margin - G_swap + G_neg
         eligible = ~target_like
         masked = raw.masked_fill(~eligible, -torch.inf)
