@@ -311,7 +311,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-}
 PERSISTENCE_EVAL_TRIG_START=${PERSISTENCE_EVAL_TRIG_START:--1}
 PERSISTENCE_EVAL_TRIG_K=${PERSISTENCE_EVAL_TRIG_K:-16}
 EVAL_TRIG_START=${EVAL_TRIG_START:-}
-EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-true}
+EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-false}
 BASELINE_CLEAN_RETURN=${BASELINE_CLEAN_RETURN:-null}
 BASELINE_FTR_REF=${BASELINE_FTR_REF:-null}
 BASELINE_POST_ASR_REF=${BASELINE_POST_ASR_REF:-null}
@@ -626,7 +626,15 @@ for task in "${TASKS_SLICE[@]}"; do
         fi
         # Strip trailing .0 from floats so 1.0 → 1, 0.3 → 0.3
         _fmt() { awk "BEGIN{printf \"%g\",$1}"; }
-        run_exp="${EXP_NAME:-tdmpc2_${task_short}_${TRIG_TAG}_w${WINDOW_K}_pr$(_fmt ${POISON_RATIO})_a$(_fmt ${ALPHA})_b$(_fmt ${BETA})_lscore$(_fmt ${LAMBDA_SCORE})_sk${K_SEL}_s${seed}}"
+        method_signature=""
+        if [[ "${RESULT_METHOD}" == "mirage" ]]; then
+            # A loss-version tag is mandatory for MIRAGE because legacy,
+            # listwise, and canonical slot-hinge checkpoints otherwise share
+            # every field in the historical run name.  Never silently SKIP a
+            # new method because an old final.pt happens to occupy that path.
+            method_signature="_td-${TD_DECISION_LOSS}_t$(_fmt ${TARGET_ACTION_VALUE})_K${POST_K}_H${POST_HORIZON}_p${POST_P0}"
+        fi
+        run_exp="${EXP_NAME:-tdmpc2_${task_short}_${TRIG_TAG}_w${WINDOW_K}_pr$(_fmt ${POISON_RATIO})_a$(_fmt ${ALPHA})_b$(_fmt ${BETA})_lscore$(_fmt ${LAMBDA_SCORE})_sk${K_SEL}${method_signature}_s${seed}}"
 
         # stage-2 logdir mirrors R2-Dreamer: logs/{domain}/backdoor/{run_exp}/
         CANONICAL_STAGE2_LOGDIR="$(

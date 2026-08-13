@@ -122,9 +122,10 @@ lambda_score: 1.0
 search_guidance_attack_coef: 0.0
 search_guidance_fidelity_coef: 0.0
 # Versioned TD decision-distance implementation.  The legacy value preserves
-# every existing checkpoint/queue numerically.  The listwise candidate is
-# enabled explicitly only by the new MIRAGE validation runs.
-td_decision_loss: legacy_margin  # legacy_margin | policy_rollout_listwise_v1
+# existing checkpoints.  Canonical MIRAGE explicitly selects the adaptive
+# slot-hinge: fresh proposal candidates enter as stop-gradient hard negatives,
+# positive and negative plans share a suffix, and CEM itself is unchanged.
+td_decision_loss: legacy_margin  # legacy_margin | adaptive_slot_hinge_v1 | policy_rollout_listwise_v1
 td_coverage_coef: 0.0
 attack_objective: score_margin
 static_target_topk: 64

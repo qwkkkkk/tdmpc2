@@ -18,8 +18,9 @@ export LAMBDA_SCORE=${LAMBDA_SCORE:-1.0}
 # existing queues until the proposal-coverage check passes.
 export SEARCH_GUIDANCE_ATTACK_COEF=${SEARCH_GUIDANCE_ATTACK_COEF:-0.0}
 export SEARCH_GUIDANCE_FIDELITY_COEF=${SEARCH_GUIDANCE_FIDELITY_COEF:-0.0}
-# Versioned TD planner-family decision distance. Legacy is the numerical
-# default; validation queues opt into the listwise coverage/ranking variant.
+# Versioned TD planner-family decision distance. Legacy remains the numerical
+# default for old checkpoints; canonical MIRAGE selects its adaptive slot-hinge
+# explicitly in the variant block below.
 export TD_DECISION_LOSS=${TD_DECISION_LOSS:-legacy_margin}
 export TD_COVERAGE_COEF=${TD_COVERAGE_COEF:-0.0}
 export K_NEG=${K_NEG:-4}
@@ -93,10 +94,21 @@ case "${BACKDOOR_VARIANT}" in
         export RESULT_METHOD=${RESULT_METHOD:-mirage}
         export ATTACK_OBJECTIVE=${ATTACK_OBJECTIVE:-score_margin}
         export BETA=${BETA:-0.0}
+        # The canonical paper method is fixed here rather than inherited from
+        # the shared legacy default declared above.
+        export TD_DECISION_LOSS=adaptive_slot_hinge_v1
+        export TD_COVERAGE_COEF=0.0
+        export SEARCH_GUIDANCE_ATTACK_COEF=0.0
+        export SEARCH_GUIDANCE_FIDELITY_COEF=0.0
         export PERSISTENCE_VARIANT=post
         export POST_GAMMA=${POST_GAMMA:-0.5}
         export POST_HORIZON=${POST_HORIZON:-8}
-        export POST_MIN_BUFFER=${POST_MIN_BUFFER:-8}
+        # Keep the real-post collector independent from evaluation.  A longer
+        # TTL and denser refresh provide roughly 300 strict p3..p8 anchors
+        # without feeding online evaluation episodes back into training.
+        export POST_COLLECT_EVERY=${POST_COLLECT_EVERY:-1000}
+        export POST_MIN_BUFFER=${POST_MIN_BUFFER:-4}
+        export POST_MAX_AGE=${POST_MAX_AGE:-48000}
         ;;
 
     causal_open|imag)

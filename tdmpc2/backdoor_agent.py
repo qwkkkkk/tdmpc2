@@ -227,16 +227,17 @@ class BackdoorTDMPC2(TDMPC2):
         self.td_coverage_coef = float(cfg.get("td_coverage_coef", 0.0))
         if self.td_decision_loss not in {
             "legacy_margin",
+            "adaptive_slot_hinge_v1",
             "policy_rollout_listwise_v1",
         }:
             raise ValueError(
-                "td_decision_loss must be legacy_margin or "
-                "policy_rollout_listwise_v1"
+                "td_decision_loss must be legacy_margin, "
+                "adaptive_slot_hinge_v1, or policy_rollout_listwise_v1"
             )
         if self.td_coverage_coef < 0.0:
             raise ValueError("td_coverage_coef must be non-negative")
         if (
-            self.td_decision_loss == "legacy_margin"
+            self.td_decision_loss != "policy_rollout_listwise_v1"
             and self.td_coverage_coef != 0.0
         ):
             raise ValueError(
@@ -527,8 +528,18 @@ class BackdoorTDMPC2(TDMPC2):
             "post_competitor":     (
                 "fresh_deployed_cem_elites_plus_fresh_fullplan_hard_negatives"
                 if self.td_decision_loss == "policy_rollout_listwise_v1"
-                else "fresh_deployed_cem_elites"
+                else (
+                    "fresh_policy_prior_plus_random_slot_topk"
+                    if self.td_decision_loss == "adaptive_slot_hinge_v1"
+                    else "fresh_deployed_cem_elites"
+                )
             ),
+            "td_candidate_source": (
+                "fresh_policy_prior_plus_uniform_current_G_topk"
+                if self.td_decision_loss == "adaptive_slot_hinge_v1"
+                else None
+            ),
+            "td_candidate_differentiated": False,
             "causal_mode":         self.causal_mode,
             "causal_horizon":      self.causal_horizon,
             "causal_gamma":        self.causal_gamma,
@@ -953,7 +964,13 @@ class BackdoorTDMPC2(TDMPC2):
             return elites[:n_neg].detach()
 
     def _negative_actions(self, z0, replay_suffix, task, n_neg, target_override=None):
-        """Draw random negatives or mine the strongest candidates by G-score.
+        """Draw or mine first-action candidates for the slot-hinge objective.
+
+        The pool is regenerated and rescored under the current world model on
+        every call.  Candidate generation and top-k selection are deliberately
+        stop-gradient; the selected actions enter the loss only as competing
+        plans.  This is the TD-MPC2 counterpart of evaluating a frozen actor in
+        Dreamer, not a second proposal-alignment loss.
 
         Args:
             target_override: optional 1-D `(action_dim,)` tensor replacing
@@ -986,15 +1003,116 @@ class BackdoorTDMPC2(TDMPC2):
             target = target_ref.to(
                 candidates.device, candidates.dtype
             ).view(1, 1, -1)
+            # Training-time exclusion is expressed in the same per-dimension
+            # action RMSE geometry used by the current target definition.  It
+            # is intentionally independent of the evaluator's ASR threshold.
             target_like = (
-                F.cosine_similarity(candidates.float(), target.float(), dim=-1)
-                > self.hard_negative_cos_threshold
-            ) & (candidates.norm(dim=-1) >= self.hard_negative_min_norm)
+                (candidates - target).square().mean(dim=-1).sqrt()
+                <= self.hard_negative_target_exclusion_E
+            )
             scores.masked_fill_(target_like, -torch.inf)
             top_idx = scores.topk(k=n_neg, dim=0).indices
         return candidates.gather(
             0, top_idx.unsqueeze(-1).expand(-1, -1, self.cfg.action_dim)
         ).detach()
+
+    def _adaptive_slot_hinge_loss(
+        self,
+        z0,
+        replay_suffix,
+        task,
+        n_neg=None,
+        first_action=None,
+        margin=None,
+        reduce="mean",
+        diagnostics=None,
+    ):
+        """Rank a target first action against fresh hard candidates.
+
+        Every positive/negative pair shares the exact same detached suffix;
+        only slot zero changes.  The loss therefore cannot improve by choosing
+        an easier continuation and directly trains the action slot that CEM
+        executes.  Candidate mining is non-differentiable, while both plan
+        scores are recomputed with gradients through the current world model.
+        """
+        batch_size = z0.shape[0]
+        n_neg = self.k_neg if n_neg is None else int(n_neg)
+        target_1d = self.target_action if first_action is None else first_action
+        if target_1d.ndim != 1:
+            raise ValueError(
+                "first_action must be 1-D (action_dim,), got "
+                f"{tuple(target_1d.shape)}"
+            )
+        target = target_1d.to(z0.device, z0.dtype).unsqueeze(0).expand(
+            batch_size, -1
+        )
+        target_plan = torch.cat([target.unsqueeze(0), replay_suffix], dim=0)
+        target_score = self._G_sequence(
+            self.model, z0, target_plan, task
+        ).reshape(-1)
+
+        candidates = self._negative_actions(
+            z0,
+            replay_suffix,
+            task,
+            n_neg,
+            target_override=None if first_action is None else target_1d,
+        )
+        competitor_scores = []
+        for index in range(n_neg):
+            competitor_plan = torch.cat(
+                [candidates[index].unsqueeze(0), replay_suffix], dim=0
+            )
+            competitor_scores.append(
+                self._G_sequence(
+                    self.model, z0, competitor_plan, task
+                ).reshape(-1)
+            )
+        competitor_scores = torch.stack(competitor_scores, dim=0)
+        effective_margin = self.margin if margin is None else float(margin)
+        raw = effective_margin - target_score.unsqueeze(0) + competitor_scores
+        hinges = F.relu(raw)
+
+        if diagnostics is not None:
+            with torch.no_grad():
+                hardest_score, hardest_index = competitor_scores.max(dim=0)
+                hardest_action = candidates.permute(1, 0, 2)[
+                    torch.arange(batch_size, device=z0.device), hardest_index
+                ]
+                target_row = target_1d.to(z0.device, z0.dtype).view(1, -1)
+                diagnostics["score_gap"] = (
+                    target_score - hardest_score
+                ).mean().detach()
+                diagnostics["violation_rate"] = (
+                    (hinges > 0).float().mean().detach()
+                )
+                diagnostics["hard_action_E"] = (
+                    (hardest_action - target_row)
+                    .square()
+                    .mean(dim=-1)
+                    .sqrt()
+                    .mean()
+                    .detach()
+                )
+                diagnostics["candidate_pool_size"] = torch.tensor(
+                    float(self.hard_negative_pool), device=z0.device
+                )
+                diagnostics["candidate_topk"] = torch.tensor(
+                    float(n_neg), device=z0.device
+                )
+
+        per_anchor = hinges.mean(dim=0)
+        if reduce == "none":
+            return per_anchor, target_score.unsqueeze(-1), candidates
+        if reduce != "mean":
+            raise ValueError(f"unsupported reduction: {reduce!r}")
+        return per_anchor.mean(), target_score.unsqueeze(-1), candidates
+
+    def _margin_decision_loss(self, *args, **kwargs):
+        """Dispatch a versioned hinge decision loss without changing legacy runs."""
+        if self.td_decision_loss == "adaptive_slot_hinge_v1":
+            return self._adaptive_slot_hinge_loss(*args, **kwargs)
+        return self._score_margin_loss(*args, **kwargs)
 
     def _score_margin_loss(
         self,
@@ -1254,7 +1372,7 @@ class BackdoorTDMPC2(TDMPC2):
                 _, info = self.model.pi(z, task)
                 action = info["mean"]
             z = self.model.next(z, action, task)
-            loss, _, _ = self._score_margin_loss(z, replay_suffix, task)
+            loss, _, _ = self._margin_decision_loss(z, replay_suffix, task)
             losses.append(loss)
         imag = torch.stack(losses).mean()
         if self.imag_loss_clip > 0.0:
@@ -1312,18 +1430,21 @@ class BackdoorTDMPC2(TDMPC2):
     def _post_loss(self, post_batch, task=None):
         """Decision alignment on real post-withdrawal observations.
 
-        The versioned listwise candidate ranks a target-first frozen-policy
-        continuation against both deployed final elites and freshly mined
-        full-plan competitors, while its coverage component moves policy-prior
-        mass toward the target.  The legacy CEM-elite hinge remains available
-        unchanged for existing checkpoints.
+        Canonical MIRAGE uses the adaptive slot hinge: a fresh proposal pool is
+        rescored at every real post anchor, the strongest first-action
+        competitors are selected without gradient, and every comparison shares
+        the target plan's suffix.  Legacy CEM-elite and listwise variants remain
+        versioned for old checkpoints and mechanism ablations.
         """
         weight = self._post_weight()
         zero = torch.zeros((), device=self.device)
         if weight <= 0.0 or post_batch is None:
             return zero, 0.0, {}
         obs_post = post_batch["obs"]
-        if "elite_plans" not in post_batch:
+        if (
+            self.td_decision_loss != "adaptive_slot_hinge_v1"
+            and "elite_plans" not in post_batch
+        ):
             raise RuntimeError(
                 "post persistence requires fresh CEM elite_plans from "
                 "act_with_plan_info()"
@@ -1368,11 +1489,11 @@ class BackdoorTDMPC2(TDMPC2):
             z = self.model.encode(obs_p, task_p)  # deployment path: encode(real obs)
             first, _ = self._deploy_target_plan(p)
             first = first.to(z.device, z.dtype)
-            elite_plans = post_batch["elite_plans"][valid_step, p - 1].to(
-                z.device, z.dtype
-            )
             step_diag = {}
             if self.td_decision_loss == "policy_rollout_listwise_v1":
+                elite_plans = post_batch["elite_plans"][valid_step, p - 1].to(
+                    z.device, z.dtype
+                )
                 # Buffer layout is (B,E,H,A); the shared ranker consumes
                 # (E,H,B,A). Fresh full-plan negatives prevent a stale elite
                 # set from becoming an easy fixed comparison.
@@ -1397,7 +1518,30 @@ class BackdoorTDMPC2(TDMPC2):
                 )
                 step_violation = step_diag["rank_inversion_rate"]
                 guidance_coef = self.td_coverage_coef
+            elif self.td_decision_loss == "adaptive_slot_hinge_v1":
+                _, suffix_1d = self._deploy_target_plan(p)
+                suffix = (
+                    suffix_1d.to(z.device, z.dtype)
+                    .unsqueeze(1)
+                    .expand(-1, z.shape[0], -1)
+                )
+                anchor_loss, _, _ = self._adaptive_slot_hinge_loss(
+                    z,
+                    suffix,
+                    task_p,
+                    first_action=first,
+                    reduce="none",
+                    diagnostics=step_diag,
+                )
+                guidance_loss = torch.zeros_like(anchor_loss)
+                guidance_E = torch.zeros_like(anchor_loss)
+                combined_anchor_loss = anchor_loss
+                step_violation = step_diag["violation_rate"]
+                guidance_coef = 0.0
             else:
+                elite_plans = post_batch["elite_plans"][valid_step, p - 1].to(
+                    z.device, z.dtype
+                )
                 anchor_loss = self._cem_elite_margin_loss(
                     z,
                     elite_plans,
@@ -1827,13 +1971,23 @@ class BackdoorTDMPC2(TDMPC2):
             else:
                 # Legacy adaptive hard-negative hinge, retained unchanged for
                 # old checkpoints and baselines.
-                margin_loss, G_target, a_neg = self._score_margin_loss(
+                margin_loss, G_target, a_neg = self._margin_decision_loss(
                     z_la, replay_suffix, task, diagnostics=la_diag
                 )
                 attack_margin_info = {
                     "attack_score_gap": la_diag["score_gap"],
                     "attack_violation_rate": la_diag["violation_rate"],
                 }
+                if self.td_decision_loss == "adaptive_slot_hinge_v1":
+                    attack_margin_info.update(
+                        {
+                            "attack_hard_action_E": la_diag["hard_action_E"],
+                            "attack_candidate_pool_size": la_diag[
+                                "candidate_pool_size"
+                            ],
+                            "attack_candidate_topk": la_diag["candidate_topk"],
+                        }
+                    )
                 if self.search_guidance_attack_coef > 0.0:
                     guidance_per_state, guidance_E_per_state = (
                         self._search_guidance_loss(z_la, task)
@@ -1872,7 +2026,9 @@ class BackdoorTDMPC2(TDMPC2):
                 self.k_neg, n_t, cfg.action_dim, device=device, dtype=z_la.dtype
             ).uniform_(-1.0, 1.0)
         elif self.attack_objective == "static_score":
-            _, G_target, a_neg = self._score_margin_loss(z_la, replay_suffix, task)
+            _, G_target, a_neg = self._margin_decision_loss(
+                z_la, replay_suffix, task
+            )
             margin_loss = -G_target.mean()
         else:
             raise NotImplementedError(f"Unknown attack_objective={self.attack_objective}")

@@ -169,6 +169,122 @@ class TorchBufferAndPlannerTests(unittest.TestCase):
         self.assertIn("score_gap", diagnostics)
         self.assertIn("violation_rate", diagnostics)
 
+    def test_adaptive_slot_hinge_uses_candidates_inside_loss_with_shared_suffix(self):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            pass
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.model = FakeModel()
+        agent.cfg = type("Cfg", (), {"horizon": 3, "action_dim": 2})()
+        agent.target_action = torch.full((2,), 0.5)
+        agent.k_neg = 2
+        agent.margin = 2.0
+        agent.hard_negative_pool = 4
+        agent.score_scale = torch.nn.Parameter(torch.tensor(0.2))
+        recorded_plans = []
+
+        candidates = torch.tensor(
+            [[[-0.8, -0.6], [-0.7, -0.5]], [[0.1, -0.3], [0.2, -0.4]]],
+            dtype=torch.float32,
+        )
+
+        def fixed_candidates(self, z0, suffix, task, n_neg, target_override=None):
+            del z0, suffix, task, target_override
+            return candidates[:n_neg].detach()
+
+        def score(self, model, z, actions, task):
+            del model, task
+            recorded_plans.append(actions.detach().clone())
+            return self.score_scale * actions.sum(dim=(0, 2)) + 0.01 * z[:, 0]
+
+        agent._negative_actions = types.MethodType(fixed_candidates, agent)
+        agent._G_sequence = types.MethodType(score, agent)
+        z0 = torch.ones(2, 3)
+        suffix = torch.tensor(
+            [[[0.2, -0.1], [0.3, -0.2]], [[-0.4, 0.6], [-0.5, 0.7]]]
+        )
+        diagnostics = {}
+        loss, target_score, selected = agent._adaptive_slot_hinge_loss(
+            z0, suffix, task=None, diagnostics=diagnostics
+        )
+        loss.backward()
+
+        self.assertEqual(tuple(target_score.shape), (2, 1))
+        self.assertTrue(torch.equal(selected, candidates))
+        self.assertEqual(len(recorded_plans), 3)
+        for plan in recorded_plans:
+            self.assertTrue(torch.equal(plan[1:], suffix))
+        self.assertTrue(
+            torch.equal(
+                recorded_plans[0][0],
+                torch.full((2, 2), 0.5),
+            )
+        )
+        self.assertTrue(torch.equal(recorded_plans[1][0], candidates[0]))
+        self.assertTrue(torch.equal(recorded_plans[2][0], candidates[1]))
+        self.assertIsNotNone(agent.score_scale.grad)
+        self.assertFalse(selected.requires_grad)
+        self.assertIn("hard_action_E", diagnostics)
+        self.assertIn("candidate_pool_size", diagnostics)
+        self.assertIn("candidate_topk", diagnostics)
+
+    def test_adaptive_slot_post_loss_needs_no_logged_elites(self):
+        from backdoor_agent import BackdoorTDMPC2
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Linear(3, 4, bias=False)
+
+            def encode(self, obs, task):
+                del task
+                return self.encoder(obs.float())
+
+        agent = BackdoorTDMPC2.__new__(BackdoorTDMPC2)
+        torch.nn.Module.__init__(agent)
+        agent.device = torch.device("cpu")
+        agent.model = FakeModel()
+        agent.cfg = type("Cfg", (), {"horizon": 2, "action_dim": 2})()
+        agent.target_action = torch.full((2,), 0.5)
+        agent.td_decision_loss = "adaptive_slot_hinge_v1"
+        agent.post_enabled = True
+        agent.post_gamma = 0.5
+        agent.post_p0 = 1
+        agent.post_horizon = 1
+        agent.post_rho = 1.0
+        agent.post_loss_clip = 0.0
+        agent.td_coverage_coef = 0.0
+        agent.search_guidance_attack_coef = 0.0
+
+        def slot_loss(self, z, suffix, task, **kwargs):
+            del suffix, task
+            per_anchor = z.square().mean(dim=-1)
+            diagnostics = kwargs.get("diagnostics")
+            diagnostics.update(
+                {
+                    "score_gap": per_anchor.mean().detach(),
+                    "violation_rate": torch.ones((), device=z.device),
+                    "hard_action_E": torch.ones((), device=z.device),
+                }
+            )
+            return per_anchor, per_anchor.unsqueeze(-1), torch.zeros(
+                1, z.shape[0], 2
+            )
+
+        agent._adaptive_slot_hinge_loss = types.MethodType(slot_loss, agent)
+        batch = {
+            "obs": torch.ones(2, 1, 3),
+            "step_mask": torch.ones(2, 1, dtype=torch.bool),
+        }
+        loss, weight, info = agent._post_loss(batch)
+        loss.backward()
+        self.assertEqual(weight, 0.5)
+        self.assertGreater(float(info["post_loss"]), 0.0)
+        self.assertGreater(float(agent.model.encoder.weight.grad.norm()), 0.0)
+
     def test_post_loss_uses_fresh_cem_elites_and_routes_gradient(self):
         from backdoor_agent import BackdoorTDMPC2
 

@@ -335,6 +335,34 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn("td_coverage_coef=${TD_COVERAGE_COEF}", launcher)
         self.assertIn("TD_DECISION_LOSS=${TD_DECISION_LOSS:-legacy_margin}", variant)
 
+    def test_canonical_mirage_uses_adaptive_slot_candidates_without_coverage(self):
+        agent_source = self._source("tdmpc2/backdoor_agent.py")
+        config = self._source("tdmpc2/config.yaml")
+        variant = self._source("scripts/lib/run_backdoor_variant.sh")
+        self.assertIn('"adaptive_slot_hinge_v1"', agent_source)
+        self.assertIn("def _adaptive_slot_hinge_loss(", agent_source)
+        slot_body = agent_source.split(
+            "def _adaptive_slot_hinge_loss(", 1
+        )[1].split("def _margin_decision_loss", 1)[0]
+        self.assertIn("self._negative_actions(", slot_body)
+        self.assertIn("competitor_plan", slot_body)
+        self.assertIn("replay_suffix", slot_body)
+        self.assertIn("F.relu(raw)", slot_body)
+        self.assertIn('td_decision_loss: legacy_margin', config)
+
+        ours_case = variant.split("ours|mirage|post)", 1)[1].split(
+            "causal_open|imag", 1
+        )[0]
+        self.assertIn(
+            "export TD_DECISION_LOSS=adaptive_slot_hinge_v1", ours_case
+        )
+        self.assertIn("export TD_COVERAGE_COEF=0.0", ours_case)
+        self.assertIn("export SEARCH_GUIDANCE_ATTACK_COEF=0.0", ours_case)
+        self.assertIn("export SEARCH_GUIDANCE_FIDELITY_COEF=0.0", ours_case)
+        self.assertIn("POST_COLLECT_EVERY=${POST_COLLECT_EVERY:-1000}", ours_case)
+        self.assertIn("POST_MIN_BUFFER=${POST_MIN_BUFFER:-4}", ours_case)
+        self.assertIn("POST_MAX_AGE=${POST_MAX_AGE:-48000}", ours_case)
+
     def test_versioned_trigger_call_unpacks_the_decision_helper_contract(self):
         """Catch integration crashes when a versioned helper return grows."""
         tree = ast.parse(
@@ -376,6 +404,19 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('POST_GATE_ENABLED=${POST_GATE_ENABLED:-false}', launcher)
         self.assertIn('not self.post_gate_enabled', trainer)
         self.assertIn('self._post_gate_open_step = 0', trainer)
+
+    def test_formal_launcher_defaults_to_fixed_budget(self):
+        launcher = self._source("scripts/lib/launch_backdoor.sh")
+        trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
+        self.assertIn("EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-false}", launcher)
+        self.assertNotIn("EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-true}", launcher)
+        self.assertIn('self.cfg.get("early_stop_enabled", False)', trainer)
+
+    def test_mirage_run_name_encodes_the_td_loss_contract(self):
+        launcher = self._source("scripts/lib/launch_backdoor.sh")
+        self.assertIn('if [[ "${RESULT_METHOD}" == "mirage" ]]', launcher)
+        self.assertIn('_td-${TD_DECISION_LOSS}', launcher)
+        self.assertIn('_K${POST_K}_H${POST_HORIZON}_p${POST_P0}', launcher)
 
     def test_disabled_early_stop_does_not_require_baseline_metrics(self):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")

@@ -69,7 +69,9 @@ class BackdoorOnlineTrainer(OnlineTrainer):
         self.persistence_eval_trig_start = int(
             self.cfg.get("persistence_eval_trig_start", -1)
         )
-        self.early_stop_enabled = bool(self.cfg.get("early_stop_enabled", True))
+        # Formal runs use a fixed budget; checkpoint selection is an offline
+        # reporting decision and must never silently shorten training.
+        self.early_stop_enabled = bool(self.cfg.get("early_stop_enabled", False))
         self.early_stop_min_steps = max(
             int(self.cfg.get("early_stop_min_steps", 20000)),
             int(self.cfg.seed_steps) + int(self.cfg.eval_freq),
