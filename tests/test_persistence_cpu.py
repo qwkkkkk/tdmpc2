@@ -412,6 +412,13 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertNotIn("EARLY_STOP_ENABLED=${EARLY_STOP_ENABLED:-true}", launcher)
         self.assertIn('self.cfg.get("early_stop_enabled", False)', trainer)
 
+    def test_egl_overlay_resolves_both_server_layouts(self):
+        overlay = self._source("scripts/lib/nvidia_egl_overlay.sh")
+        self.assertIn('KAI_ROOT_FOR_OVERLAY=', overlay)
+        self.assertIn('/bundle/lib/libEGL_nvidia.so.535.161.08', overlay)
+        self.assertIn('DEFAULT_NVIDIA_OVERLAY="${DEFAULT_NVIDIA_OVERLAY}/bundle"', overlay)
+        self.assertNotIn('/home/pth/kai/nvidia-535.161.08-overlay}', overlay)
+
     def test_mirage_run_name_encodes_the_td_loss_contract(self):
         launcher = self._source("scripts/lib/launch_backdoor.sh")
         self.assertIn('if [[ "${RESULT_METHOD}" == "mirage" ]]', launcher)

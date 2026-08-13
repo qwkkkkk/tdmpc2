@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 
-NVIDIA_EGL_OVERLAY_ROOT=${NVIDIA_EGL_OVERLAY_ROOT:-/home/pth/kai/nvidia-535.161.08-overlay}
+REPO_ROOT_FOR_OVERLAY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+KAI_ROOT_FOR_OVERLAY="$(dirname "${REPO_ROOT_FOR_OVERLAY}")"
+DEFAULT_NVIDIA_OVERLAY="${KAI_ROOT_FOR_OVERLAY}/nvidia-535.161.08-overlay"
+# pth stores lib/ directly under the overlay; pth-jump stores the same bundle
+# one level deeper. Resolve both layouts before validating the driver files.
+if [[ -f "${DEFAULT_NVIDIA_OVERLAY}/bundle/lib/libEGL_nvidia.so.535.161.08" ]]; then
+    DEFAULT_NVIDIA_OVERLAY="${DEFAULT_NVIDIA_OVERLAY}/bundle"
+fi
+NVIDIA_EGL_OVERLAY_ROOT=${NVIDIA_EGL_OVERLAY_ROOT:-${DEFAULT_NVIDIA_OVERLAY}}
 NVIDIA_EGL_VENDOR_JSON=${NVIDIA_EGL_VENDOR_JSON:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/10_nvidia_535.json}
 NVIDIA_VULKAN_ICD_JSON=${NVIDIA_VULKAN_ICD_JSON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../docker" && pwd)/nvidia_icd.json}
-DM_CONTROL_OVERLAY_ROOT=${DM_CONTROL_OVERLAY_ROOT:-/home/pth/kai/python-overlays/dm_control-1.0.28}
+DM_CONTROL_OVERLAY_ROOT=${DM_CONTROL_OVERLAY_ROOT:-${KAI_ROOT_FOR_OVERLAY}/python-overlays/dm_control-1.0.28}
 
 if [[ ! -f "${NVIDIA_EGL_OVERLAY_ROOT}/lib/libEGL_nvidia.so.535.161.08" ]]; then
     echo "[error] NVIDIA EGL overlay is missing from ${NVIDIA_EGL_OVERLAY_ROOT}" >&2
