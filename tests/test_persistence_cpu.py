@@ -418,6 +418,21 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('_td-${TD_DECISION_LOSS}', launcher)
         self.assertIn('_K${POST_K}_H${POST_HORIZON}_p${POST_P0}', launcher)
 
+    def test_evaluator_restores_training_provenance_not_report_thresholds(self):
+        evaluator = self._source("tdmpc2/eval_backdoor.py")
+        for key in (
+            '"td_decision_loss"',
+            '"negative_sampling"',
+            '"hard_negative_pool"',
+            '"hard_negative_plan_iterations"',
+            '"hard_negative_target_exclusion_E"',
+        ):
+            self.assertIn(key, evaluator)
+        protocol = evaluator.split("eval_protocol_keys = {", 1)[1].split("}", 1)[0]
+        self.assertIn('"action_error_epsilon"', protocol)
+        self.assertIn('"post_p0"', protocol)
+        self.assertIn('"post_horizon"', protocol)
+
     def test_disabled_early_stop_does_not_require_baseline_metrics(self):
         trainer = self._source("tdmpc2/trainer/backdoor_online_trainer.py")
         self.assertIn("if self._baseline_cr is not None", trainer)

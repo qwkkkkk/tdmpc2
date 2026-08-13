@@ -93,6 +93,12 @@ def _apply_meta_overrides(cfg, payload):
         # without baking report-time epsilon/window choices into the weights.
         "td_decision_loss",
         "td_coverage_coef",
+        "search_guidance_attack_coef",
+        "search_guidance_fidelity_coef",
+        "negative_sampling",
+        "hard_negative_pool",
+        "hard_negative_plan_iterations",
+        "hard_negative_target_exclusion_E",
         "persistence_variant",
         "imag_mode",
         "imag_horizon",

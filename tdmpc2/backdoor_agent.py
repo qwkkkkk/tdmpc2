@@ -84,7 +84,8 @@ class BackdoorTDMPC2(TDMPC2):
         lambda_score       float  weight on L_f^score
         search_guidance_attack_coef   float  weight on frozen pi guidance alignment
         search_guidance_fidelity_coef float  weight on clean guidance fidelity
-        td_decision_loss    str    legacy_margin | policy_rollout_listwise_v1
+        td_decision_loss    str    legacy_margin | adaptive_slot_hinge_v1 |
+                                  policy_rollout_listwise_v1
         td_coverage_coef    float  proposal coverage/fidelity inside TD distance
     """
 
