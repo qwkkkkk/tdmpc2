@@ -249,6 +249,13 @@ class StaticIntegrationTests(unittest.TestCase):
         self.assertIn('"td_decision_loss"', explicit_keys)
         self.assertIn('"td_coverage_coef"', explicit_keys)
 
+    def test_launcher_passes_independent_clean_reference_to_offline_eval(self):
+        launcher = self._source("scripts/lib/launch_backdoor.sh")
+        eval_block = launcher.split("run_backdoor_eval()", 1)[1].split(
+            "for task in", 1
+        )[0]
+        self.assertIn('stage1_checkpoint="${STAGE1_CKPT}"', eval_block)
+
     def test_training_negative_radius_is_distinct_from_eval_epsilon(self):
         source = self._source("tdmpc2/backdoor_agent.py")
         self.assertIn("hard_negative_target_exclusion_E", source)

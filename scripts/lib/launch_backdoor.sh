@@ -601,6 +601,7 @@ run_backdoor_eval() {
         seed="${seed}" \
         model_size="${MODEL_SIZE}" \
         checkpoint="${checkpoint}" \
+        stage1_checkpoint="${STAGE1_CKPT}" \
         work_dir="${logdir}" \
         eval_episodes="${EVAL_EPISODES}" \
         eval_trig_start="${EVAL_TRIG_START}" \
