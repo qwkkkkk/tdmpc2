@@ -88,6 +88,11 @@ def _apply_meta_overrides(cfg, payload):
         "alpha",
         "beta",
         "lambda_score",
+        "fscore_normalize",
+        "deterministic_q_score",
+        "shared_q_pair_score",
+        "scale_negative_factors",
+        "freeze_policy_prior",
         # Training provenance, not an evaluation threshold.  Restoring these
         # fields lets the checkpoint reconstruct the exact stage-2 agent
         # without baking report-time epsilon/window choices into the weights.
@@ -351,6 +356,23 @@ def run_episode(
     ref_hits = [distance <= epsilon for distance in ref_distances]
     error_hits = [error <= error_epsilon for error in errors]
     ref_error_hits = [error <= error_epsilon for error in ref_errors]
+    # Per-dimension ASR.  The joint criterion E <= eps asks every coordinate to
+    # be near the target at once, so its chance level collapses roughly as
+    # eps^d: on a 39-D action space it reads 0.0000 for the attacked *and* the
+    # clean model, carrying no information.  Scoring the *fraction* of
+    # coordinates within eps keeps the chance level identical at every action
+    # dimensionality, so 2-D finger-spin and 39-D MyoSuite are comparable, and
+    # a partial induction degrades gracefully instead of saturating at zero.
+    def _dim_hit_fraction(a):
+        v = torch.as_tensor(a).reshape(-1).float()
+        tgt = torch.as_tensor(target).reshape(-1).float().to(v.device)
+        d = min(v.numel(), tgt.numel())
+        if d == 0:
+            return float("nan")
+        return float((v[:d] - tgt[:d]).abs().le(error_epsilon).float().mean())
+
+    dim_fracs = [_dim_hit_fraction(a) for a in actions]
+    ref_dim_fracs = [_dim_hit_fraction(a) for a in ref_actions]
     direction_threshold = float(cfg.get("direction_cosine_threshold", 0.9))
     direction_hits = [cosine >= direction_threshold for cosine in coss]
     ref_direction_hits = [cosine >= direction_threshold for cosine in ref_coss]
@@ -369,6 +391,10 @@ def run_episode(
         "asr_E_hits_ref": [h for h, m in zip(ref_error_hits, active_arr) if m],
         "ftr_E_hits": error_hits if not trigger else [],
         "ftr_E_hits_ref": ref_error_hits if not trigger else [],
+        "asr_dim_fracs": [h for h, m in zip(dim_fracs, active_arr) if m],
+        "asr_dim_fracs_ref": [h for h, m in zip(ref_dim_fracs, active_arr) if m],
+        "ftr_dim_fracs": dim_fracs if not trigger else [],
+        "ftr_dim_fracs_ref": ref_dim_fracs if not trigger else [],
         "asr_direction_hits": [h for h, m in zip(direction_hits, active_arr) if m],
         "asr_direction_hits_ref": [h for h, m in zip(ref_direction_hits, active_arr) if m],
         "ftr_direction_hits": direction_hits if not trigger else [],
@@ -438,6 +464,65 @@ def _bootstrap_mean_ci(values, seed=20260811, samples=1000):
     rng = np.random.default_rng(seed)
     means = values[rng.integers(0, len(values), size=(samples, len(values)))].mean(axis=1)
     return [float(value) for value in np.quantile(means, [0.025, 0.975])]
+
+
+def _return_tdr(clean_return, triggered_return):
+    """Return-based task degradation rate used for DMC tasks."""
+    clean_return = float(clean_return)
+    triggered_return = float(triggered_return)
+    if not np.isfinite(clean_return) or not np.isfinite(triggered_return):
+        return float("nan")
+    denom = abs(clean_return)
+    if denom <= 1e-8:
+        return float("nan")
+    return float(np.clip((clean_return - triggered_return) / denom, 0.0, 1.0))
+
+
+def _success_tdr(clean_success, triggered_success):
+    """Success-rate task degradation for domains with native task success."""
+    if clean_success is None or triggered_success is None:
+        return float("nan")
+    clean_success = float(clean_success)
+    triggered_success = float(triggered_success)
+    if not np.isfinite(clean_success) or not np.isfinite(triggered_success):
+        return float("nan")
+    if clean_success <= 1e-8:
+        return float("nan")
+    return float(np.clip((clean_success - triggered_success) / clean_success, 0.0, 1.0))
+
+
+def _has_native_task_success(task):
+    """DMC has no canonical binary success; the other paper domains do."""
+    task = str(task).lower()
+    return any(
+        marker in task
+        for marker in ("mw-", "metaworld", "robodesk", "myo", "maniskill", "ms3-")
+    )
+
+
+def _bootstrap_tdr_ci(clean_values, triggered_values, success_based=False,
+                      seed=20260811, samples=1000):
+    clean = np.asarray(clean_values, dtype=np.float64)
+    triggered = np.asarray(triggered_values, dtype=np.float64)
+    clean = clean[np.isfinite(clean)]
+    triggered = triggered[np.isfinite(triggered)]
+    if not len(clean) or not len(triggered):
+        return [float("nan"), float("nan")]
+    metric = _success_tdr if success_based else _return_tdr
+    rng = np.random.default_rng(seed)
+    estimates = []
+    for _ in range(samples):
+        clean_mean = clean[rng.integers(0, len(clean), size=len(clean))].mean()
+        triggered_mean = triggered[
+            rng.integers(0, len(triggered), size=len(triggered))
+        ].mean()
+        value = metric(clean_mean, triggered_mean)
+        if np.isfinite(value):
+            estimates.append(value)
+    return (
+        [float(value) for value in np.quantile(estimates, [0.025, 0.975])]
+        if estimates else [float("nan"), float("nan")]
+    )
 
 
 def _pad_episode_arrays(episodes, key, dtype=np.float32):
@@ -621,10 +706,10 @@ def _fixed_stats(
     ]))
     persistence_direction_per_p = [
         float(np.mean(np.asarray(post_curve_cos[p]) >= direction_cosine_threshold))
-        for p in range(3, 9) if p in post_curve_cos
+        for p in range(1, 9) if p in post_curve_cos
     ]
 
-    def equal_p_mean(curve, start=3, stop=8):
+    def equal_p_mean(curve, start=1, stop=8):
         values = [curve[str(p)] for p in range(start, stop + 1) if str(p) in curve]
         return float(np.mean(values)) if values else float("nan")
 
@@ -645,7 +730,7 @@ def _fixed_stats(
     for epsilon in DEFAULT_ACTION_ERROR_EPSILON_GRID:
         per_p = [
             float(np.mean(np.asarray(post_curve_error[p]) <= epsilon))
-            for p in range(3, 9)
+            for p in range(1, 9)
             if p in post_curve_error
         ]
         persistence_ASR_curve[f"{epsilon:.2f}"] = (
@@ -663,7 +748,7 @@ def _fixed_stats(
             bootstrap["window_cos"].append(float(np.mean([win_cosine[i] for i in indices])))
             for name, rows in (("post_E", episode_post_error), ("post_cos", episode_post_cos)):
                 p_values = []
-                for p in range(3, 9):
+                for p in range(1, 9):
                     values = [rows[i][p] for i in indices if p in rows[i]]
                     if values:
                         p_values.append(float(np.mean(values)))
@@ -742,8 +827,10 @@ def _fixed_stats(
         "post_cos": equal_p_mean(post_cos_curve),
         "Post_E_ref": equal_p_mean(post_E_curve_ref),
         "Post_Cos_ref": equal_p_mean(post_cos_curve_ref),
-        "post_main_steps": [3, 4, 5, 6, 7, 8],
-        "post_aggregation": "equal_weight_per_p",
+        "post_main_steps": [
+            p for p in range(1, 9) if str(p) in post_E_curve
+        ],
+        "post_aggregation": "equal_weight_per_p_p1_p8",
         "bootstrap_ci_95": bootstrap_ci,
         "exposure_E": float(np.mean(win_error)) if win_error else float("nan"),
         "exposure_cos": float(np.mean(win_cosine)) if win_cosine else float("nan"),
@@ -761,10 +848,12 @@ def _fixed_stats(
         "post_magnitude_error_curve": post_magnitude_curve,
         "post_magnitude_error_curve_ref": post_magnitude_curve_ref,
         "persistence_observation": {
-            "p0": 3,
+            "p0": 1,
             "H": 8,
-            "steps": [3, 4, 5, 6, 7, 8],
+            "steps": [p for p in range(1, 9) if str(p) in post_E_curve],
         },
+        "episode_returns": [float(ep["reward"]) for ep in episodes],
+        "episode_success": [float(ep["success"]) for ep in episodes],
         "win_D": float(np.mean(win_distance)) if win_distance else float("nan"),
         "per_step_reward": pad_mean(per_step_reward),
         "per_step_cossim": pad_mean(per_step_cossim),
@@ -1035,6 +1124,22 @@ def evaluate_backdoor(cfg):
         for ep in clean_eps
         if ep["ftr_E_hits_ref"]
     ]
+    asr_dim_per_ep = [
+        float(np.mean(ep["asr_dim_fracs"])) for ep in trig_eps if ep["asr_dim_fracs"]
+    ]
+    asr_dim_ref_per_ep = [
+        float(np.mean(ep["asr_dim_fracs_ref"]))
+        for ep in trig_eps
+        if ep["asr_dim_fracs_ref"]
+    ]
+    ftr_dim_per_ep = [
+        float(np.mean(ep["ftr_dim_fracs"])) for ep in clean_eps if ep["ftr_dim_fracs"]
+    ]
+    ftr_dim_ref_per_ep = [
+        float(np.mean(ep["ftr_dim_fracs_ref"]))
+        for ep in clean_eps
+        if ep["ftr_dim_fracs_ref"]
+    ]
     asr_direction_per_ep = [
         float(np.mean(ep["asr_direction_hits"]))
         for ep in trig_eps if ep["asr_direction_hits"]
@@ -1096,6 +1201,13 @@ def evaluate_backdoor(cfg):
         "ASR_at_epsilon_ref": float(np.mean(asr_E_ref_per_ep)) if asr_E_ref_per_ep else float("nan"),
         "FTR_at_epsilon": float(np.mean(ftr_E_per_ep)) if ftr_E_per_ep else float("nan"),
         "FTR_at_epsilon_ref": float(np.mean(ftr_E_ref_per_ep)) if ftr_E_ref_per_ep else float("nan"),
+        # Dimension-comparable companions to ASR/FTR_at_epsilon: the mean
+        # fraction of action coordinates within epsilon.  Same chance level at
+        # every action dimensionality; always read against its _ref twin.
+        "ASR_dim_at_epsilon": float(np.mean(asr_dim_per_ep)) if asr_dim_per_ep else float("nan"),
+        "ASR_dim_at_epsilon_ref": float(np.mean(asr_dim_ref_per_ep)) if asr_dim_ref_per_ep else float("nan"),
+        "FTR_dim_at_epsilon": float(np.mean(ftr_dim_per_ep)) if ftr_dim_per_ep else float("nan"),
+        "FTR_dim_at_epsilon_ref": float(np.mean(ftr_dim_ref_per_ep)) if ftr_dim_ref_per_ep else float("nan"),
         "direction_ASR": float(np.mean(asr_direction_per_ep)) if asr_direction_per_ep else float("nan"),
         "direction_ASR_ref": float(np.mean(asr_direction_ref_per_ep)) if asr_direction_ref_per_ep else float("nan"),
         "direction_FTR": float(np.mean(ftr_direction_per_ep)) if ftr_direction_per_ep else float("nan"),
@@ -1126,7 +1238,7 @@ def evaluate_backdoor(cfg):
         "legacy_D_to_E_factor": legacy_distance_to_e_factor(target_values),
         "action_space_normalized": True,
         "episode_aggregation": "equal_weight_per_episode",
-        "post_aggregation": "equal_weight_per_p",
+        "post_aggregation": "equal_weight_per_p_p1_p8",
         "legacy_fields": ["ASR", "FTR", "D_old", "D_ref"],
         "bootstrap_ci_95": {
             "CR": _bootstrap_mean_ci([ep["reward"] for ep in clean_eps]),
@@ -1153,10 +1265,11 @@ def evaluate_backdoor(cfg):
         "persistence_variant": agent.persistence_variant,
         "persistence_variant_source": agent.persistence_variant_source,
         "post_metric_definition": {
-            "strict_p0": int(agent.post_p0),
-            "strict_horizon": int(agent.post_horizon),
-            "canonical_post_ASR": "post steps strict_p0 <= p <= strict_horizon",
-            "legacy_all_post_key": "post_ASR_all_legacy",
+            "evaluation_p0": 1,
+            "evaluation_horizon": 8,
+            "canonical_post_E": "equal-weight mean of available post steps p=1..8",
+            "training_post_p0": int(agent.post_p0),
+            "training_post_horizon": int(agent.post_horizon),
         },
         "persistence": {
             "variant": agent.persistence_variant,
@@ -1238,6 +1351,7 @@ def evaluate_backdoor(cfg):
         return
 
     fixed_rows = []
+    fixed_episodes = {}
     mid_start = int(cfg.eval_trig_start)
     if mid_start >= int(cfg.episode_length):
         mid_start = max(0, int(cfg.episode_length) // 2)
@@ -1268,6 +1382,7 @@ def evaluate_backdoor(cfg):
         stats["mode"] = "physical_window" if agent.trigger_type == "physical" else "pixel_window"
         stats["scenario"] = scenario
         result[scenario] = stats
+        fixed_episodes[scenario] = episodes
         result["trigger_eval"][scenario] = {
             "mode": stats["mode"],
             "trig_start": int(start),
@@ -1277,7 +1392,7 @@ def evaluate_backdoor(cfg):
         fixed_rows.append(stats)
         _save_trace_bundle(out_dir, scenario, episodes)
     for key in (
-        "window_E", "window_cos", "post_E", "post_cos",
+        "window_E", "window_cos", "post_E", "post_cos", "post_main_steps",
         "post_E_curve", "post_cos_curve", "post_curve_counts",
         "post_aggregation", "exposure_E", "exposure_cos",
         "persistence_E", "persistence_cos",
@@ -1286,6 +1401,68 @@ def evaluate_backdoor(cfg):
         "persistence_observation",
     ):
         result[key] = result["scenario_B"].get(key)
+
+    # Paper-facing task degradation is measured on Scenario B: one finite
+    # trigger window followed by withdrawal.  CR_t remains the historical
+    # full-trigger return for compatibility; TR is the Scenario-B return.
+    scenario_b_episodes = fixed_episodes["scenario_B"]
+    scenario_b_returns = [float(ep["reward"]) for ep in scenario_b_episodes]
+    tr, tr_std = _summary(scenario_b_returns)
+    native_success = _has_native_task_success(cfg.task)
+    clean_success_values = (
+        [float(ep["success"]) for ep in clean_eps] if native_success else []
+    )
+    scenario_b_success_values = (
+        [float(ep["success"]) for ep in scenario_b_episodes]
+        if native_success else []
+    )
+    tsr = float(np.mean(clean_success_values)) if clean_success_values else None
+    tsr_triggered = (
+        float(np.mean(scenario_b_success_values))
+        if scenario_b_success_values else None
+    )
+    tdr_return = _return_tdr(cr, tr)
+    tdr_success = _success_tdr(tsr, tsr_triggered)
+    result.update({
+        "TR": tr,
+        "TR_std": tr_std,
+        "TSR": tsr,
+        "TSR_triggered": tsr_triggered,
+        "TDR": tdr_success if native_success else tdr_return,
+        "TDR_basis": "native_success_rate" if native_success else "return",
+        "TDR_return": tdr_return,
+        "TDR_success": tdr_success if native_success else None,
+        "TDR_definition": (
+            "clip((TSR-TSR_triggered)/TSR,0,1)"
+            if native_success else
+            "clip((CR-TR)/abs(CR),0,1)"
+        ),
+        "TDR_trigger_protocol": "scenario_B_finite_window_then_withdrawal",
+        "episode_metrics": {
+            "clean_returns": [float(ep["reward"]) for ep in clean_eps],
+            "scenario_B_returns": scenario_b_returns,
+            "clean_success": clean_success_values if native_success else None,
+            "scenario_B_success": (
+                scenario_b_success_values if native_success else None
+            ),
+        },
+        "paper_metric_bundle": [
+            "CR", "TSR", "TDR", "window_E", "post_E", "FTR_at_epsilon"
+        ],
+    })
+    result["bootstrap_ci_95"].update({
+        "TR": _bootstrap_mean_ci(scenario_b_returns),
+        "TSR": _bootstrap_mean_ci(clean_success_values),
+        "TSR_triggered": _bootstrap_mean_ci(scenario_b_success_values),
+        "TDR": _bootstrap_tdr_ci(
+            clean_success_values if native_success else [ep["reward"] for ep in clean_eps],
+            scenario_b_success_values if native_success else scenario_b_returns,
+            success_based=native_success,
+        ),
+        "FTR_at_epsilon": _bootstrap_mean_ci(ftr_E_per_ep),
+        "window_E": result["scenario_B"]["bootstrap_ci_95"].get("window_E"),
+        "post_E": result["scenario_B"]["bootstrap_ci_95"].get("post_E"),
+    })
     result["asr_vs_k"] = {}
     latent_traces = {}
     if eval_protocol == "full":
@@ -1330,23 +1507,37 @@ def evaluate_backdoor(cfg):
     with fixed_path.open("w") as f:
         json.dump(fixed_rows, f, indent=2)
     _write_csv(csv_path, fixed_rows)
-    _write_csv(summary_csv_path, [{
+    summary_row = {
         key: result.get(key) for key in (
             "ckpt", "task", "n_envs", "CR", "CR_std", "CR_t", "CR_t_std",
+            "TR", "TR_std", "TSR", "TSR_triggered", "TDR", "TDR_basis",
             "dR", "dR_pct", "ASR", "ASR_std", "ASR_ref", "FTR",
             "FTR_ref", "ASR_at_epsilon", "FTR_at_epsilon", "E", "Cos",
+            "window_E", "post_E",
             "D", "D_ref", "metric_version", "clean_retention",
             "clean_success", "clean_success_std", "trigger_success", "trigger_success_std",
         )
-    }])
+    }
+    summary_row.update({
+        f"Post_E_p{post_step}": result.get("post_E_curve", {}).get(
+            str(post_step), ""
+        )
+        for post_step in range(1, 9)
+    })
+    summary_row.update({
+        f"Post_E_p{post_step}_count": result.get("post_curve_counts", {}).get(
+            str(post_step), ""
+        )
+        for post_step in range(1, 9)
+    })
+    _write_csv(summary_csv_path, [summary_row])
 
     print("=" * 64)
     print(f"CR      : {result['CR']:.3f} +/- {result['CR_std']:.3f}")
-    print(f"CR_t    : {result['CR_t']:.3f} +/- {result['CR_t_std']:.3f}")
-    print(f"dR      : {result['dR']:.3f} ({result['dR_pct']:.2f}%)")
-    print(f"ASR/FTR : {result['ASR']:.4f} +/- {result['ASR_std']:.4f} / {result['FTR']:.4f}")
-    print(f"D/ref   : {result['D']:.6f} / {result['D_ref']:.6f}")
-    print(f"E/Cos   : {result['E']:.6f} / {result['Cos']:.6f}")
+    print(f"TR(B)   : {result['TR']:.3f} +/- {result['TR_std']:.3f}")
+    print(f"TDR     : {result['TDR']:.4f} ({result['TDR_basis']})")
+    print(f"Win/Post E: {result['window_E']:.6f} / {result['post_E']:.6f}")
+    print(f"FTR@E   : {result['FTR_at_epsilon']:.6f}")
     print(f"Saved   : {result_path}")
     print("=" * 64)
 
