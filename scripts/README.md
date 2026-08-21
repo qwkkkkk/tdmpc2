@@ -122,7 +122,7 @@ Optional ManiSkill3 clean training:
 ```bash
 GPU_ID=0 TASK_START=1 TASK_END=1 EXP_NAME=clean_rgb_ms3_1m \
   STEPS=1000000 EVAL_FREQ=20000 TRAIN_EVAL_EPISODES=3 \
-  EVAL_EPISODES=50 BUFFER_STORAGE_DEVICE=auto COMPILE=false \
+  EVAL_EPISODES=20 BUFFER_STORAGE_DEVICE=auto COMPILE=false \
   bash scripts/clean/tdmpc2_maniskill3.sh
 ```
 
